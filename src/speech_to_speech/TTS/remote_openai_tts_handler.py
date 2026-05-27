@@ -42,6 +42,7 @@ class RemoteOpenAITTSHandler(BaseHandler[TTSIn, TTSOut]):
         base_url: str = "http://localhost:8880",
         api_key: str = "sk-unused",
         voice: str = "default",
+        model: str = "tts-1",
         timeout: float = 60.0,
         gen_kwargs: dict | None = None,  # accepted for pipeline compatibility, unused
         cancel_scope: CancelScope | None = None,
@@ -49,11 +50,14 @@ class RemoteOpenAITTSHandler(BaseHandler[TTSIn, TTSOut]):
         self.should_listen = should_listen
         self.cancel_scope = cancel_scope
         self.voice = voice
+        self.model = model
         self.stream_endpoint = base_url.rstrip("/") + "/v1/audio/speech/stream"
         self.headers = {"Authorization": f"Bearer {api_key}"}
         self.timeout = timeout
+        self._client = httpx.Client(timeout=self.timeout)
         logger.info(
-            "RemoteOpenAITTSHandler ready → %s (voice=%s)", self.stream_endpoint, self.voice
+            "RemoteOpenAITTSHandler ready → %s (voice=%s, model=%s)",
+            self.stream_endpoint, self.voice, self.model,
         )
 
     def process(self, tts_input: TTSIn) -> Iterator[TTSOut]:
@@ -72,7 +76,7 @@ class RemoteOpenAITTSHandler(BaseHandler[TTSIn, TTSOut]):
         logger.debug("RemoteOpenAITTS: synthesising %d chars", len(text))
 
         payload = {
-            "model": "tts-1",
+            "model": self.model,
             "input": text,
             "voice": self.voice,
         }
@@ -80,43 +84,45 @@ class RemoteOpenAITTSHandler(BaseHandler[TTSIn, TTSOut]):
         first_chunk = True
         remainder = b""
 
-        with httpx.Client(timeout=self.timeout) as client:
-            try:
-                with client.stream(
-                    "POST",
-                    self.stream_endpoint,
-                    headers={**self.headers, "Content-Type": "application/json"},
-                    json=payload,
-                ) as response:
-                    response.raise_for_status()
+        try:
+            with self._client.stream(
+                "POST",
+                self.stream_endpoint,
+                headers={**self.headers, "Content-Type": "application/json"},
+                json=payload,
+            ) as response:
+                response.raise_for_status()
 
-                    for raw in response.iter_bytes():
-                        # Check cancellation before processing each received chunk
-                        if gen is not None and self.cancel_scope is not None and self.cancel_scope.is_stale(gen):
-                            logger.info("RemoteOpenAITTS: cancelled (barge-in), closing upstream stream")
-                            return
+                for raw in response.iter_bytes():
+                    # Check cancellation before processing each received chunk
+                    if gen is not None and self.cancel_scope is not None and self.cancel_scope.is_stale(gen):
+                        logger.info("RemoteOpenAITTS: cancelled (barge-in), closing upstream stream")
+                        return
 
-                        if first_chunk:
-                            logger.debug("RemoteOpenAITTS: time-to-first-byte %.3fs", perf_counter() - pipeline_start)
-                            first_chunk = False
+                    if first_chunk:
+                        logger.debug("RemoteOpenAITTS: time-to-first-byte %.3fs", perf_counter() - pipeline_start)
+                        first_chunk = False
 
-                        remainder += raw
+                    remainder += raw
 
-                        # Yield complete 512-sample chunks
-                        while len(remainder) >= CHUNK_BYTES:
-                            chunk_bytes = remainder[:CHUNK_BYTES]
-                            remainder = remainder[CHUNK_BYTES:]
-                            # The stream is already int16 PCM — wrap in ndarray for the pipeline
-                            audio_chunk = np.frombuffer(chunk_bytes, dtype=np.int16).copy()
-                            yield audio_chunk
+                    # Yield complete 512-sample chunks
+                    while len(remainder) >= CHUNK_BYTES:
+                        chunk_bytes = remainder[:CHUNK_BYTES]
+                        remainder = remainder[CHUNK_BYTES:]
+                        yield np.frombuffer(chunk_bytes, dtype=np.int16).copy()
 
-            except httpx.HTTPError as exc:
-                logger.error("RemoteOpenAITTS request failed: %s", exc)
-                return
+        except httpx.HTTPError as exc:
+            logger.error("RemoteOpenAITTS request failed: %s", exc)
+            return
 
-        # Yield any trailing bytes (pad to even number of samples)
+        # Yield any trailing bytes, zero-padded to exactly CHUNK_SAMPLES for downstream alignment
         if len(remainder) >= BYTES_PER_SAMPLE:
             n_samples = len(remainder) // BYTES_PER_SAMPLE
             usable = remainder[: n_samples * BYTES_PER_SAMPLE]
-            audio_chunk = np.frombuffer(usable, dtype=np.int16).copy()
-            yield audio_chunk
+            chunk = np.frombuffer(usable, dtype=np.int16).copy()
+            if len(chunk) < CHUNK_SAMPLES:
+                chunk = np.pad(chunk, (0, CHUNK_SAMPLES - len(chunk)))
+            yield chunk
+
+    def cleanup(self) -> None:
+        self._client.close()

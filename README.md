@@ -94,6 +94,7 @@ All options can be set via CLI flags or environment variables.  Copy `.env.sampl
 | `--tts_openai_base_url` | `TTS_OPENAI_BASE_URL` | `http://localhost:8880` | F5-TTS server base URL |
 | `--tts_openai_api_key` | `TTS_OPENAI_API_KEY` | `sk-unused` | Auth key |
 | `--tts_openai_voice` | `TTS_OPENAI_VOICE` | `default` | Voice name |
+| `--tts_openai_model` | `TTS_OPENAI_MODEL` | `tts-1` | Model name sent in TTS requests |
 
 ### LLM (`--llm_backend responses-api`)
 

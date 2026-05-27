@@ -26,9 +26,11 @@ from speech_to_speech.pipeline.messages import (
     VADAudio,
 )
 from speech_to_speech.STT.remote_openai_stt_handler import RemoteOpenAISTTHandler
-from speech_to_speech.TTS.remote_openai_tts_handler import RemoteOpenAITTSHandler
+from speech_to_speech.TTS.remote_openai_tts_handler import CHUNK_SAMPLES, RemoteOpenAITTSHandler
 
 # ── helpers ──────────────────────────────────────────────────────────────────
+
+CHUNK_BYTES = CHUNK_SAMPLES * 2  # int16
 
 
 def _make_vad_audio(seconds: float = 0.5, sample_rate: int = 16000) -> VADAudio:
@@ -72,6 +74,23 @@ def _make_tts_handler(cancel_scope: CancelScope | None = None, **kwargs) -> Remo
     )
 
 
+def _make_stream_mock(pcm_chunks: list[bytes]) -> MagicMock:
+    """Build a context-manager mock for handler._client.stream(...)."""
+    mock_response = MagicMock()
+    mock_response.raise_for_status = MagicMock()
+    mock_response.iter_bytes.return_value = iter(pcm_chunks)
+    mock_response.__enter__ = MagicMock(return_value=mock_response)
+    mock_response.__exit__ = MagicMock(return_value=False)
+    return mock_response
+
+
+def _make_raw_pcm(n_samples: int) -> bytes:
+    """Create n_samples of int16 PCM (sine wave)."""
+    t = np.linspace(0, 1, n_samples, dtype=np.float32)
+    audio = np.sin(2 * np.pi * 440 * t)
+    return (audio * 32767).astype(np.int16).tobytes()
+
+
 # ── STT tests ────────────────────────────────────────────────────────────────
 
 
@@ -83,7 +102,7 @@ class TestRemoteOpenAISTTHandler:
 
         mock_response = MagicMock(spec=httpx.Response)
         mock_response.raise_for_status = MagicMock()
-        mock_response.json.return_value = {"text": "Hello world"}
+        mock_response.json.return_value = {"text": "Hello world", "language": "en"}
 
         with patch.object(handler._client, "post", return_value=mock_response) as mock_post:
             results = list(handler.process(vad_audio))
@@ -91,13 +110,20 @@ class TestRemoteOpenAISTTHandler:
         assert len(results) == 1
         assert isinstance(results[0], Transcription)
         assert results[0].text == "Hello world"
+        assert results[0].language_code == "en"
 
-        # Verify correct multipart fields were sent
+        # Verify WAV container and correct multipart fields
         call_kwargs = mock_post.call_args
-        files = call_kwargs.kwargs.get("files") or call_kwargs.args[1] if len(call_kwargs.args) > 1 else {}
         files = call_kwargs.kwargs.get("files", {})
         assert "file" in files
+        filename, file_obj, content_type = files["file"]
+        assert filename == "audio.wav"
+        assert content_type == "audio/wav"
+        wav_bytes = file_obj.read()
+        assert wav_bytes[:4] == b"RIFF"
+        assert wav_bytes[8:12] == b"WAVE"
         assert files.get("model", (None, None))[1] == "whisper-1"
+        assert files.get("response_format", (None, None))[1] == "verbose_json"
 
     def test_empty_transcript_yields_nothing(self):
         """An empty response text should produce no output."""
@@ -123,10 +149,9 @@ class TestRemoteOpenAISTTHandler:
 
         assert results == []
 
-    def test_audio_converted_to_int16_pcm(self):
-        """VADAudio float32 → int16 PCM bytes must be sent, not raw float32."""
+    def test_upload_is_wav_container(self):
+        """Uploaded bytes must be a valid RIFF/WAV container, not raw PCM."""
         handler = _make_stt_handler()
-        # Audio with a known value so we can verify conversion
         audio = np.array([0.5, -0.5, 0.0], dtype=np.float32)
         vad_audio = VADAudio(audio=audio)
 
@@ -134,7 +159,7 @@ class TestRemoteOpenAISTTHandler:
         mock_response.raise_for_status = MagicMock()
         mock_response.json.return_value = {"text": "test"}
 
-        captured_files = {}
+        captured_files: dict = {}
 
         def capture_post(url, **kwargs):
             captured_files.update(kwargs.get("files", {}))
@@ -143,25 +168,55 @@ class TestRemoteOpenAISTTHandler:
         with patch.object(handler._client, "post", side_effect=capture_post):
             list(handler.process(vad_audio))
 
-        # The file field is (filename, file_obj, content_type)
-        _, file_obj, _ = captured_files["file"]
-        sent_bytes = file_obj.read()
-        # Should be 3 int16 samples = 6 bytes
-        assert len(sent_bytes) == 3 * 2
-        sent_int16 = np.frombuffer(sent_bytes, dtype=np.int16)
+        filename, file_obj, content_type = captured_files["file"]
+        wav_bytes = file_obj.read()
+
+        # Must be a RIFF/WAV container
+        assert wav_bytes[:4] == b"RIFF", "Upload must start with RIFF"
+        assert wav_bytes[8:12] == b"WAVE", "Upload must have WAVE at offset 8"
+        assert filename == "audio.wav"
+        assert content_type == "audio/wav"
+
+        # PCM payload starts at offset 44; verify sample sign
+        pcm_data = wav_bytes[44:]
+        assert len(pcm_data) == 3 * 2  # 3 int16 samples
+        sent_int16 = np.frombuffer(pcm_data, dtype=np.int16)
         assert sent_int16[0] > 0   # 0.5 → positive
         assert sent_int16[1] < 0   # -0.5 → negative
         assert sent_int16[2] == 0  # 0.0 → zero
 
+    def test_language_code_propagated(self):
+        """language field from verbose_json response must be passed to Transcription."""
+        handler = _make_stt_handler()
+        vad_audio = _make_vad_audio()
+
+        mock_response = MagicMock(spec=httpx.Response)
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json.return_value = {"text": "Bonjour", "language": "fr"}
+
+        with patch.object(handler._client, "post", return_value=mock_response):
+            results = list(handler.process(vad_audio))
+
+        assert len(results) == 1
+        assert results[0].language_code == "fr"
+
+    def test_missing_language_field_is_none(self):
+        """If the server omits 'language' (non-verbose response), language_code is None."""
+        handler = _make_stt_handler()
+        vad_audio = _make_vad_audio()
+
+        mock_response = MagicMock(spec=httpx.Response)
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json.return_value = {"text": "Hello"}
+
+        with patch.object(handler._client, "post", return_value=mock_response):
+            results = list(handler.process(vad_audio))
+
+        assert len(results) == 1
+        assert results[0].language_code is None
+
 
 # ── TTS tests ─────────────────────────────────────────────────────────────────
-
-
-def _make_raw_pcm(n_samples: int) -> bytes:
-    """Create n_samples of int16 PCM (sine wave)."""
-    t = np.linspace(0, 1, n_samples, dtype=np.float32)
-    audio = np.sin(2 * np.pi * 440 * t)
-    return (audio * 32767).astype(np.int16).tobytes()
 
 
 class TestRemoteOpenAITTSHandler:
@@ -174,18 +229,9 @@ class TestRemoteOpenAITTSHandler:
         raw_pcm = _make_raw_pcm(2048)
         tts_input = TTSInput(text="Hello there", language_code="en")
 
-        mock_stream_response = MagicMock()
-        mock_stream_response.raise_for_status = MagicMock()
-        mock_stream_response.iter_bytes.return_value = iter([raw_pcm])
-        mock_stream_response.__enter__ = MagicMock(return_value=mock_stream_response)
-        mock_stream_response.__exit__ = MagicMock(return_value=False)
+        mock_response = _make_stream_mock([raw_pcm])
 
-        with patch("httpx.Client") as mock_client_cls:
-            mock_client = MagicMock()
-            mock_client_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
-            mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
-            mock_client.stream.return_value = mock_stream_response
-
+        with patch.object(handler._client, "stream", return_value=mock_response):
             results = list(handler.process(tts_input))
 
         assert len(results) >= 4
@@ -200,50 +246,58 @@ class TestRemoteOpenAITTSHandler:
         assert results == [AUDIO_RESPONSE_DONE]
 
     def test_cancellation_stops_stream(self):
-        """When cancel_scope is cancelled mid-stream, yielding should stop."""
+        """cancel_scope.cancel() after chunk 2 must yield exactly 2 chunks."""
         cancel_scope = CancelScope()
         handler = _make_tts_handler(cancel_scope=cancel_scope)
 
-        # Generate enough PCM to exercise the loop
-        raw_pcm = _make_raw_pcm(512 * 10)
-
-        mock_stream_response = MagicMock()
-        mock_stream_response.raise_for_status = MagicMock()
-
-        yielded_count = 0
+        # Ten individual CHUNK_BYTES deliveries
+        single_chunk = _make_raw_pcm(CHUNK_SAMPLES)
+        assert len(single_chunk) == CHUNK_BYTES
 
         def iter_bytes_with_cancel():
-            nonlocal yielded_count
-            # yield first chunk, then cancel
-            yield raw_pcm[:512 * 2 * 2]
-            cancel_scope.cancel()   # signal barge-in
-            yield raw_pcm[512 * 2 * 2:]
+            for i in range(10):
+                yield single_chunk
+                if i == 1:
+                    cancel_scope.cancel()  # cancel after delivering chunk 2
 
-        mock_stream_response.iter_bytes.return_value = iter_bytes_with_cancel()
-        mock_stream_response.__enter__ = MagicMock(return_value=mock_stream_response)
-        mock_stream_response.__exit__ = MagicMock(return_value=False)
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.iter_bytes.return_value = iter_bytes_with_cancel()
+        mock_response.__enter__ = MagicMock(return_value=mock_response)
+        mock_response.__exit__ = MagicMock(return_value=False)
 
         tts_input = TTSInput(text="A fairly long sentence to synthesize.", language_code="en")
 
-        with patch("httpx.Client") as mock_client_cls:
-            mock_client = MagicMock()
-            mock_client_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
-            mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
-            mock_client.stream.return_value = mock_stream_response
-
+        with patch.object(handler._client, "stream", return_value=mock_response):
             results = list(handler.process(tts_input))
 
-        # After cancellation, no further chunks should be emitted for the remainder
-        # (exact count is ≤ chunks from the first delivery)
         assert all(isinstance(r, np.ndarray) for r in results)
-        assert len(results) < 10  # much fewer than the full 10 chunks
+        assert len(results) == 2
+
+    def test_trailing_chunk_padded_to_chunk_samples(self):
+        """A sub-512-sample tail must be zero-padded to exactly CHUNK_SAMPLES."""
+        handler = _make_tts_handler()
+        # 600 samples: one full chunk (512) + 88-sample tail
+        raw_pcm = _make_raw_pcm(600)
+        tts_input = TTSInput(text="Short.", language_code="en")
+
+        mock_response = _make_stream_mock([raw_pcm])
+
+        with patch.object(handler._client, "stream", return_value=mock_response):
+            results = list(handler.process(tts_input))
+
+        # Should have 2 chunks: one full + one padded
+        assert len(results) == 2
+        assert len(results[0]) == CHUNK_SAMPLES
+        assert len(results[1]) == CHUNK_SAMPLES
+        # Padding samples are zero
+        assert np.all(results[1][88:] == 0)
 
     def test_empty_text_yields_nothing(self):
         """Empty or whitespace text should produce no output."""
         handler = _make_tts_handler()
         tts_input = TTSInput(text="   ", language_code="en")
-        with patch("httpx.Client"):
-            results = list(handler.process(tts_input))
+        results = list(handler.process(tts_input))
         assert results == []
 
     def test_http_error_yields_nothing(self):
@@ -251,19 +305,14 @@ class TestRemoteOpenAITTSHandler:
         handler = _make_tts_handler()
         tts_input = TTSInput(text="Hello", language_code="en")
 
-        mock_stream_response = MagicMock()
-        mock_stream_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+        mock_response = MagicMock()
+        mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
             "500", request=MagicMock(), response=MagicMock()
         )
-        mock_stream_response.__enter__ = MagicMock(return_value=mock_stream_response)
-        mock_stream_response.__exit__ = MagicMock(return_value=False)
+        mock_response.__enter__ = MagicMock(return_value=mock_response)
+        mock_response.__exit__ = MagicMock(return_value=False)
 
-        with patch("httpx.Client") as mock_client_cls:
-            mock_client = MagicMock()
-            mock_client_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
-            mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
-            mock_client.stream.return_value = mock_stream_response
-
+        with patch.object(handler._client, "stream", return_value=mock_response):
             results = list(handler.process(tts_input))
 
         assert results == []

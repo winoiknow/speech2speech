@@ -2,8 +2,6 @@
 # Licensed under the Apache License, Version 2.0 (the "License").
 # See the LICENSE file in the repository root for the full license text.
 
-version: "3.9"
-
 services:
   s2s-remote:
     build:
@@ -22,6 +20,7 @@ services:
       TTS_OPENAI_BASE_URL: ${TTS_OPENAI_BASE_URL:-http://host.docker.internal:8880}
       TTS_OPENAI_API_KEY: ${TTS_OPENAI_API_KEY:-sk-unused}
       TTS_OPENAI_VOICE: ${TTS_OPENAI_VOICE:-default}
+      TTS_OPENAI_MODEL: ${TTS_OPENAI_MODEL:-tts-1}
 
       # ── LLM (Hermes /v1/responses or /v1/chat/completions) ─────────────
       RESPONSES_API_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:11434/v1}

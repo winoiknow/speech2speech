@@ -4,6 +4,31 @@ All notable changes to this fork of [huggingface/speech-to-speech](https://githu
 
 ---
 
+## [Unreleased] — 2026-05-27 (QC pass 2)
+
+### Fixed
+
+- **B1 STT upload format** (`remote_openai_stt_handler.py`): raw headerless PCM replaced with a hand-rolled RIFF/WAV container (`_pcm_to_wav`); upload tuple is now `("audio.wav", buf, "audio/wav")`. Added `response_format=verbose_json` to the multipart form so the server returns the `language` field (see N4).
+- **B2 Docker image on start** (`Dockerfile.remote`): added `transformers>=4.57.0`, `pillow>=10.0.0`, and `sounddevice>=0.5.0` to the explicit pip-install block. The image previously failed with `ModuleNotFoundError` because `s2s_pipeline.py` unconditionally imports `HfArgumentParser` from `transformers`.
+- **B3 Compose version key** (`docker-compose.remote.yml`): removed stale `version: "3.9"` line that Compose v2 warns about on every `up`.
+
+### Improved
+
+- **N1 TTS persistent HTTP client** (`remote_openai_tts_handler.py`): `httpx.Client` is now created once in `setup()` and closed in `cleanup()`, matching the STT handler. Eliminates a TCP/TLS handshake per turn.
+- **N2 TTS trailing chunk padding** (`remote_openai_tts_handler.py`): sub-512-sample tail is now zero-padded to `CHUNK_SAMPLES` for downstream alignment.
+- **N3 TTS model configurable** (`remote_openai_tts_handler.py`, `remote_openai_tts_arguments.py`): added `tts_openai_model` arg (`--tts_openai_model` / `TTS_OPENAI_MODEL`, default `tts-1`). Hardcoded `"tts-1"` in the POST payload replaced with `self.model`.
+- **N4 language_code propagation** (`remote_openai_stt_handler.py`): `verbose_json` response `language` field is now forwarded as `Transcription(language_code=...)`.
+- **N5 Cancellation test tightened** (`tests/test_remote_handlers.py`): mock yields ten individual `CHUNK_BYTES` chunks, cancels after chunk 2, asserts exactly 2 results (was `< 10`).
+
+### Tests
+
+- `test_audio_converted_to_int16_pcm` → replaced by `test_upload_is_wav_container` (asserts `RIFF` magic, `WAVE` at offset 8, PCM values at offset 44).
+- Added `test_language_code_propagated` and `test_missing_language_field_is_none`.
+- Added `test_trailing_chunk_padded_to_chunk_samples`.
+- TTS tests updated to patch `handler._client.stream` directly (persistent client pattern).
+
+---
+
 ## [Unreleased] — 2026-05-27
 
 Forked from upstream commit [`99907c8`](https://github.com/huggingface/speech-to-speech/commit/99907c8ce393409ddf1fbc0287c89c2a8a2364ec) (2026-05-26).

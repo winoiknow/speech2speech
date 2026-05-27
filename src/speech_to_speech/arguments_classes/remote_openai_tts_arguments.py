@@ -22,6 +22,10 @@ class RemoteOpenAITTSHandlerArguments:
         default_factory=lambda: os.environ.get("TTS_OPENAI_VOICE", "default"),
         metadata={"help": "Voice name sent to the TTS endpoint. Env: TTS_OPENAI_VOICE."},
     )
+    tts_openai_model: str = field(
+        default_factory=lambda: os.environ.get("TTS_OPENAI_MODEL", "tts-1"),
+        metadata={"help": "Model name sent to the TTS endpoint. Env: TTS_OPENAI_MODEL. Default is 'tts-1'."},
+    )
     tts_openai_timeout: float = field(
         default=60.0,
         metadata={"help": "HTTP timeout in seconds for TTS streaming requests. Default is 60."},

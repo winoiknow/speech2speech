@@ -35,6 +35,7 @@ class RealtimeServer:
         host: str = "0.0.0.0",
         port: int = 8765,
         chat_size: int = 10,
+        server_api_key: str | None = None,
     ) -> None:
         self.stop_event = stop_event
         self.input_queue = input_queue
@@ -47,6 +48,7 @@ class RealtimeServer:
         self.host = host
         self.port = port
         self.chat_size = chat_size
+        self.server_api_key = server_api_key
 
     def run(self) -> None:
         """Start the FastAPI/uvicorn server (called from a ThreadManager thread)."""
@@ -64,7 +66,11 @@ class RealtimeServer:
             response_playing=self.response_playing,
             cancel_scope=self.cancel_scope,
             stop_event=self.stop_event,
+            server_api_key=self.server_api_key,
         )
+
+        if self.server_api_key:
+            logger.info("Server API key authentication enabled")
 
         logger.info(f"OpenAI Realtime API server starting on ws://{self.host}:{self.port}/v1/realtime")
 

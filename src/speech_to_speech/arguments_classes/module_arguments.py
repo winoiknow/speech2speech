@@ -5,6 +5,7 @@
 # Modifications Copyright 2026 winoiknow (Eric Alborn, Anteon Group)
 # Modified: added "openai-remote" to the stt and tts Literal type sets.
 
+import os
 from dataclasses import dataclass, field
 from typing import Literal, Optional
 
@@ -65,5 +66,16 @@ class ModuleArguments:
         default=500,
         metadata={
             "help": "Minimum silence duration (ms) before ending speech when live transcription is enabled (default: 500ms)"
+        },
+    )
+    server_api_key: Optional[str] = field(
+        default_factory=lambda: os.environ.get("SERVER_API_KEY"),
+        metadata={
+            "help": (
+                "Bearer token required for incoming WebSocket connections. "
+                "If set, clients must supply 'Authorization: Bearer <key>'. "
+                "Defaults to the SERVER_API_KEY environment variable; "
+                "if neither is set, authentication is disabled."
+            )
         },
     )

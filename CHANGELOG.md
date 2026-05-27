@@ -38,10 +38,20 @@ Forked from upstream commit [`99907c8`](https://github.com/huggingface/speech-to
 #### `tests/test_remote_handlers.py`
 **Purpose:** Smoke test suite (9 tests) for `RemoteOpenAISTTHandler` and `RemoteOpenAITTSHandler`. Mocks all three external HTTP endpoints and exercises: transcription, empty/whitespace audio, HTTP errors, float32→int16 PCM conversion, PCM chunk streaming, barge-in cancellation mid-stream, and the `EndOfResponse` sentinel path.
 
+#### `.env.sample`
+**Purpose:** Commented template for all environment variables — server API key, STT/TTS/LLM base URLs and credentials, and log level. Copy to `.env` and fill in values before running via Docker Compose.
+
 ### Modified
 
 #### `src/speech_to_speech/arguments_classes/module_arguments.py`
-Added `"openai-remote"` to the `stt` and `tts` `Literal` type sets so the new handlers are valid CLI choices.
+- Added `"openai-remote"` to the `stt` and `tts` `Literal` type sets so the new handlers are valid CLI choices.
+- Added `server_api_key` field (`--server_api_key` / `SERVER_API_KEY` env var). When set, the realtime server requires clients to supply `Authorization: Bearer <key>`; connections with a missing or incorrect token are rejected with WebSocket close code `4001`.
+
+#### `src/speech_to_speech/api/openai_realtime/websocket_router.py`
+Added Bearer token authentication check in `realtime_endpoint()`: if `server_api_key` is configured, the `Authorization` header is validated immediately after the WebSocket handshake, before any session state is created.
+
+#### `src/speech_to_speech/api/openai_realtime/server.py`
+Added `server_api_key` parameter to `RealtimeServer.__init__()` and forwards it to `create_app()`. Logs a startup notice when authentication is enabled.
 
 #### `src/speech_to_speech/s2s_pipeline.py`
 - Imported `RemoteOpenAISTTHandlerArguments` and `RemoteOpenAITTSHandlerArguments`.

@@ -64,6 +64,7 @@ def create_app(
     response_playing: ThreadingEvent | None,
     cancel_scope: CancelScope | None,
     stop_event: ThreadingEvent,
+    server_api_key: Optional[str] = None,
 ) -> FastAPI:
 
     def _flush_queue(q: Queue[QItem], *, preserve: Callable[[QItem], bool] | None = None) -> None:
@@ -130,6 +131,14 @@ def create_app(
     @app.websocket("/v1/realtime")
     async def realtime_endpoint(ws: WebSocket) -> None:
         await ws.accept()
+
+        if server_api_key:
+            auth_header = ws.headers.get("authorization", "")
+            scheme, _, token = auth_header.partition(" ")
+            if scheme.lower() != "bearer" or token != server_api_key:
+                logger.warning("Rejected connection: invalid or missing Bearer token")
+                await ws.close(code=4001, reason="Unauthorized")
+                return
 
         if app.state.websockets:
             logger.warning("Rejected connection: a session is already active")

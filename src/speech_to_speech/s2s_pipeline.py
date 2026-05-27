@@ -449,6 +449,7 @@ def build_pipeline(
             host=websocket_streamer_kwargs.ws_host,
             port=websocket_streamer_kwargs.ws_port,
             chat_size=chat_size,
+            server_api_key=module_kwargs.server_api_key,
         )
         comms_handlers = [realtime_conn]
     else:

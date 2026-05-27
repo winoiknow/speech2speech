@@ -27,6 +27,9 @@ services:
       RESPONSES_API_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:11434/v1}
       RESPONSES_API_API_KEY: ${LLM_API_KEY:-sk-unused}
 
+      # ── Server authentication ──────────────────────────────────────────
+      SERVER_API_KEY: ${SERVER_API_KEY:-}
+
       # ── General ────────────────────────────────────────────────────────
       LOG_LEVEL: ${LOG_LEVEL:-info}
     command:

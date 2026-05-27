@@ -38,13 +38,12 @@ Three services must be reachable on your network:
 git clone git@github.com:winoiknow/speech2speech.git
 cd speech2speech
 
-# 2. Set your service URLs (edit as needed)
-export STT_OPENAI_BASE_URL=http://192.168.1.10:8000
-export TTS_OPENAI_BASE_URL=http://192.168.1.10:8880
-export LLM_BASE_URL=http://192.168.1.10:7860/v1
+# 2. Copy the sample env file and edit for your environment
+cp .env.sample .env
+# Set STT_OPENAI_BASE_URL, TTS_OPENAI_BASE_URL, LLM_BASE_URL, SERVER_API_KEY, etc.
 
 # 3. Build and run
-docker compose -f docker-compose.remote.yml up --build
+docker compose -f docker-compose.remote.yml --env-file .env up --build
 ```
 
 The server starts on `ws://0.0.0.0:8765/v1/realtime`.
@@ -63,14 +62,21 @@ speech-to-speech \
   --stt_openai_model Systran/faster-whisper-large-v3 \
   --tts_openai_base_url http://localhost:8880 \
   --tts_openai_voice default \
-  --responses_api_base_url http://localhost:7860/v1
+  --responses_api_base_url http://localhost:7860/v1 \
+  --server_api_key my-secret-key
 ```
 
 ---
 
 ## Configuration Reference
 
-All options can be set via CLI flags or environment variables.
+All options can be set via CLI flags or environment variables.  Copy `.env.sample` to `.env` and fill in your values.
+
+### Server Authentication
+
+| CLI flag | Env var | Default | Description |
+|---|---|---|---|
+| `--server_api_key` | `SERVER_API_KEY` | *(unset — auth disabled)* | Bearer token clients must supply in `Authorization: Bearer <key>`. Omit or leave empty to run without authentication. |
 
 ### STT (`--stt openai-remote`)
 

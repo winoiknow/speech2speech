@@ -23,6 +23,7 @@ WebSocket client
 
 | Variable | Default | Purpose |
 |---|---|---|
+| `SERVER_API_KEY` | *(unset)* | Bearer token required for incoming WebSocket connections. Leave unset to disable auth. |
 | `STT_OPENAI_BASE_URL` | `http://localhost:8000` | Whisper server base URL |
 | `STT_OPENAI_API_KEY` | `sk-unused` | Auth key for STT endpoint |
 | `STT_OPENAI_MODEL` | `Systran/faster-whisper-large-v3` | Model name sent in transcription requests |
@@ -33,40 +34,24 @@ WebSocket client
 | `LLM_BASE_URL` | `http://localhost:11434/v1` | Hermes base URL |
 | `LLM_API_KEY` | `sk-unused` | Auth key for LLM endpoint |
 
-**Note on API key separation:** These env vars are intentionally separate from
-each other and from `OPENAI_API_KEY`.  Do not mix them — the STT, TTS, and LLM
-services may each use different credentials.
+**Note on API key separation:** `SERVER_API_KEY` gates access to this server.
+The `STT_OPENAI_API_KEY`, `TTS_OPENAI_API_KEY`, and `LLM_API_KEY` are credentials
+for the *external* services.  None falls back to `OPENAI_API_KEY`.
 
 ## Docker Compose
 
 ```bash
 # Copy and edit the env file
-cp .env.remote.example .env.remote
-# edit STT_OPENAI_BASE_URL, TTS_OPENAI_BASE_URL, LLM_BASE_URL, etc.
+cp .env.sample .env
+# Edit STT_OPENAI_BASE_URL, TTS_OPENAI_BASE_URL, LLM_BASE_URL, SERVER_API_KEY, etc.
 
 # Build and start
-docker compose -f docker-compose.remote.yml --env-file .env.remote up --build
+docker compose -f docker-compose.remote.yml --env-file .env up --build
 ```
 
 The server starts on `ws://0.0.0.0:8765/v1/realtime`.
 
-### `.env.remote.example`
-
-```
-STT_OPENAI_BASE_URL=http://192.168.1.10:8000
-STT_OPENAI_API_KEY=sk-unused
-STT_OPENAI_MODEL=Systran/faster-whisper-large-v3
-STT_OPENAI_LANGUAGE=en
-
-TTS_OPENAI_BASE_URL=http://192.168.1.10:8880
-TTS_OPENAI_API_KEY=sk-unused
-TTS_OPENAI_VOICE=default
-
-LLM_BASE_URL=http://192.168.1.10:7860/v1
-LLM_API_KEY=sk-unused
-
-LOG_LEVEL=info
-```
+See `.env.sample` in the repository root for a commented template of all variables.
 
 ## Running Without Docker
 
@@ -78,6 +63,7 @@ speech-to-speech \
   --stt openai-remote \
   --tts openai-remote \
   --llm_backend responses-api \
+  --server_api_key my-secret-key \
   --stt_openai_base_url http://localhost:8000 \
   --stt_openai_api_key sk-unused \
   --stt_openai_model Systran/faster-whisper-large-v3 \
@@ -88,17 +74,22 @@ speech-to-speech \
   --responses_api_api_key sk-unused
 ```
 
+Alternatively, export `SERVER_API_KEY` in your shell and omit the CLI flag — the
+server picks it up automatically.
+
 ## Verifying the Endpoint Is Up
 
 ```bash
-# Should return HTTP 200 with {"message": "WebSocket server running"}
-curl http://localhost:8765/
+# HTTP health check — should return HTTP 200
+curl http://localhost:8765/v1/usage
 
-# Connect with the OpenAI Realtime client
+# Connect with the OpenAI Realtime client (supply the server key in Authorization)
 npx -y @openai/realtime-api-beta \
   --server ws://localhost:8765/v1/realtime \
-  --api-key sk-unused
+  --api-key my-secret-key
 ```
+
+If `SERVER_API_KEY` is set, clients that omit or send the wrong `Authorization: Bearer` header will receive WebSocket close code `4001` immediately after the handshake.
 
 ## What a Successful First Turn Looks Like in the Logs
 

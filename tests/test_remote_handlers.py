@@ -10,22 +10,19 @@ the pipeline: VADAudio → STT → text, text → TTS → PCM chunks.
 """
 from __future__ import annotations
 
-import io
-import json
 from queue import Queue
 from threading import Event
 from unittest.mock import MagicMock, patch
 
 import httpx
 import numpy as np
-import pytest
 
 from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.messages import (
     AUDIO_RESPONSE_DONE,
     EndOfResponse,
-    TTSInput,
     Transcription,
+    TTSInput,
     VADAudio,
 )
 from speech_to_speech.STT.remote_openai_stt_handler import RemoteOpenAISTTHandler
@@ -209,10 +206,6 @@ class TestRemoteOpenAITTSHandler:
 
         # Generate enough PCM to exercise the loop
         raw_pcm = _make_raw_pcm(512 * 10)
-        chunks_iter = iter([raw_pcm[:512 * 2 * 2], raw_pcm[512 * 2 * 2:]])  # split into two deliveries
-
-        # Cancel after the handler captures the generation ID
-        gen_at_start = cancel_scope.generation
 
         mock_stream_response = MagicMock()
         mock_stream_response.raise_for_status = MagicMock()

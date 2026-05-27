@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import io
 import logging
-from typing import Iterator
+from typing import Any, Iterator
 
 import httpx
 import numpy as np
@@ -52,7 +52,7 @@ class RemoteOpenAISTTHandler(BaseHandler[STTIn, STTOut]):
         audio_int16 = (audio_float32 * 32768).clip(-32768, 32767).astype(np.int16)
         pcm_bytes = audio_int16.tobytes()
 
-        files = {
+        files: dict[str, Any] = {
             "file": ("audio.pcm", io.BytesIO(pcm_bytes), "application/octet-stream"),
             "model": (None, self.model),
         }

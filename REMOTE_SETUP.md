@@ -33,6 +33,7 @@ WebSocket client
 | `TTS_OPENAI_VOICE` | `default` | Voice name sent to TTS |
 | `LLM_BASE_URL` | `http://localhost:11434/v1` | Hermes base URL |
 | `LLM_API_KEY` | `sk-unused` | Auth key for LLM endpoint |
+| `LLM_MODEL` | `hermes-agent` | Model name sent in every LLM request — must match the server's expected value |
 
 **Note on API key separation:** `SERVER_API_KEY` gates access to this server.
 The `STT_OPENAI_API_KEY`, `TTS_OPENAI_API_KEY`, and `LLM_API_KEY` are credentials
@@ -71,7 +72,8 @@ speech-to-speech \
   --tts_openai_api_key sk-unused \
   --tts_openai_voice default \
   --responses_api_base_url http://localhost:7860/v1 \
-  --responses_api_api_key sk-unused
+  --responses_api_api_key sk-unused \
+  --model_name hermes-agent
 ```
 
 Alternatively, export `SERVER_API_KEY` in your shell and omit the CLI flag — the

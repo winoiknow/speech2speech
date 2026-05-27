@@ -26,6 +26,7 @@ services:
       # ── LLM (Hermes /v1/responses or /v1/chat/completions) ─────────────
       RESPONSES_API_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:11434/v1}
       RESPONSES_API_API_KEY: ${LLM_API_KEY:-sk-unused}
+      LLM_MODEL: ${LLM_MODEL:-hermes-agent}
 
       # ── Server authentication ──────────────────────────────────────────
       SERVER_API_KEY: ${SERVER_API_KEY:-}
@@ -57,6 +58,8 @@ services:
       - "${LLM_BASE_URL:-http://host.docker.internal:11434/v1}"
       - "--responses_api_api_key"
       - "${LLM_API_KEY:-sk-unused}"
+      - "--model_name"
+      - "${LLM_MODEL:-hermes-agent}"
       - "--log_level"
       - "${LOG_LEVEL:-info}"
     extra_hosts:

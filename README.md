@@ -97,11 +97,11 @@ All options can be set via CLI flags or environment variables.  Copy `.env.sampl
 
 ### LLM (`--llm_backend responses-api`)
 
-| CLI flag | Default | Description |
-|---|---|---|
-| `--responses_api_base_url` | *(OpenAI)* | LLM server base URL |
-| `--responses_api_api_key` | *(none)* | Auth key |
-| `--model_name` | `gpt-5.4-mini` | Model identifier |
+| CLI flag | Env var | Default | Description |
+|---|---|---|---|
+| `--responses_api_base_url` | `LLM_BASE_URL` | *(OpenAI)* | LLM server base URL |
+| `--responses_api_api_key` | `LLM_API_KEY` | *(none)* | Auth key |
+| `--model_name` | `LLM_MODEL` | `hermes-agent` | Model identifier sent in every request — must match what the server expects (e.g. `hermes-agent` for Hermes Agent API) |
 
 > **Note on API key separation:** `STT_OPENAI_API_KEY`, `TTS_OPENAI_API_KEY`, and the LLM key are intentionally independent. None falls back to `OPENAI_API_KEY`.
 

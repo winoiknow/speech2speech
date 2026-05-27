@@ -1,3 +1,11 @@
+# Copyright 2024 The HuggingFace Inc. team
+# Licensed under the Apache License, Version 2.0 (the "License").
+# See the LICENSE file in the repository root for the full license text.
+#
+# Modifications Copyright 2026 winoiknow (Eric Alborn, Anteon Group)
+# Modified: added RemoteOpenAISTTHandlerArguments and RemoteOpenAITTSHandlerArguments
+#           to the ParsedArguments field type registry.
+
 import sys
 from dataclasses import fields
 
@@ -12,6 +20,8 @@ from speech_to_speech.arguments_classes.paraformer_stt_arguments import Paraform
 from speech_to_speech.arguments_classes.parakeet_tdt_arguments import ParakeetTDTSTTHandlerArguments
 from speech_to_speech.arguments_classes.pocket_tts_arguments import PocketTTSHandlerArguments
 from speech_to_speech.arguments_classes.qwen3_tts_arguments import Qwen3TTSHandlerArguments
+from speech_to_speech.arguments_classes.remote_openai_stt_arguments import RemoteOpenAISTTHandlerArguments
+from speech_to_speech.arguments_classes.remote_openai_tts_arguments import RemoteOpenAITTSHandlerArguments
 from speech_to_speech.arguments_classes.responses_api_language_model_arguments import (
     ResponsesApiLanguageModelHandlerArguments,
 )
@@ -68,6 +78,8 @@ EXPECTED_FIELD_TYPES = {
     "pocket_tts_handler_kwargs": PocketTTSHandlerArguments,
     "kokoro_tts_handler_kwargs": KokoroTTSHandlerArguments,
     "qwen3_tts_handler_kwargs": Qwen3TTSHandlerArguments,
+    "remote_openai_stt_handler_kwargs": RemoteOpenAISTTHandlerArguments,
+    "remote_openai_tts_handler_kwargs": RemoteOpenAITTSHandlerArguments,
 }
 
 

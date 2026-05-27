@@ -1,0 +1,62 @@
+# Copyright 2026 winoiknow (Eric Alborn, Anteon Group)
+# Licensed under the Apache License, Version 2.0 (the "License").
+# See the LICENSE file in the repository root for the full license text.
+
+version: "3.9"
+
+services:
+  s2s-remote:
+    build:
+      context: .
+      dockerfile: Dockerfile.remote
+    ports:
+      - "8765:8765"
+    environment:
+      # ── STT (Whisper-compatible /v1/audio/transcriptions) ──────────────
+      STT_OPENAI_BASE_URL: ${STT_OPENAI_BASE_URL:-http://host.docker.internal:8000}
+      STT_OPENAI_API_KEY: ${STT_OPENAI_API_KEY:-sk-unused}
+      STT_OPENAI_MODEL: ${STT_OPENAI_MODEL:-Systran/faster-whisper-large-v3}
+      STT_OPENAI_LANGUAGE: ${STT_OPENAI_LANGUAGE:-en}
+
+      # ── TTS (F5-TTS streaming /v1/audio/speech/stream) ─────────────────
+      TTS_OPENAI_BASE_URL: ${TTS_OPENAI_BASE_URL:-http://host.docker.internal:8880}
+      TTS_OPENAI_API_KEY: ${TTS_OPENAI_API_KEY:-sk-unused}
+      TTS_OPENAI_VOICE: ${TTS_OPENAI_VOICE:-default}
+
+      # ── LLM (Hermes /v1/responses or /v1/chat/completions) ─────────────
+      RESPONSES_API_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:11434/v1}
+      RESPONSES_API_API_KEY: ${LLM_API_KEY:-sk-unused}
+
+      # ── General ────────────────────────────────────────────────────────
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    command:
+      - "--mode"
+      - "realtime"
+      - "--stt"
+      - "openai-remote"
+      - "--tts"
+      - "openai-remote"
+      - "--llm_backend"
+      - "responses-api"
+      - "--stt_openai_base_url"
+      - "${STT_OPENAI_BASE_URL:-http://host.docker.internal:8000}"
+      - "--stt_openai_api_key"
+      - "${STT_OPENAI_API_KEY:-sk-unused}"
+      - "--stt_openai_model"
+      - "${STT_OPENAI_MODEL:-Systran/faster-whisper-large-v3}"
+      - "--tts_openai_base_url"
+      - "${TTS_OPENAI_BASE_URL:-http://host.docker.internal:8880}"
+      - "--tts_openai_api_key"
+      - "${TTS_OPENAI_API_KEY:-sk-unused}"
+      - "--tts_openai_voice"
+      - "${TTS_OPENAI_VOICE:-default}"
+      - "--responses_api_base_url"
+      - "${LLM_BASE_URL:-http://host.docker.internal:11434/v1}"
+      - "--responses_api_api_key"
+      - "${LLM_API_KEY:-sk-unused}"
+      - "--log_level"
+      - "${LOG_LEVEL:-info}"
+    extra_hosts:
+      # Allow container to reach services on the host machine
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped

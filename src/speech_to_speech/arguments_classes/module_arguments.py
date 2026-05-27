@@ -1,3 +1,10 @@
+# Copyright 2024 The HuggingFace Inc. team
+# Licensed under the Apache License, Version 2.0 (the "License").
+# See the LICENSE file in the repository root for the full license text.
+#
+# Modifications Copyright 2026 winoiknow (Eric Alborn, Anteon Group)
+# Modified: added "openai-remote" to the stt and tts Literal type sets.
+
 from dataclasses import dataclass, field
 from typing import Literal, Optional
 
@@ -21,11 +28,11 @@ class ModuleArguments:
         },
     )
     stt: Optional[
-        Literal["whisper", "whisper-mlx", "mlx-audio-whisper", "faster-whisper", "parakeet-tdt", "paraformer"]
+        Literal["whisper", "whisper-mlx", "mlx-audio-whisper", "faster-whisper", "parakeet-tdt", "paraformer", "openai-remote"]
     ] = field(
         default="parakeet-tdt",
         metadata={
-            "help": "The STT to use. Either 'whisper', 'whisper-mlx', 'mlx-audio-whisper', 'faster-whisper', 'parakeet-tdt', or 'paraformer'. Default is 'parakeet-tdt'."
+            "help": "The STT to use. Either 'whisper', 'whisper-mlx', 'mlx-audio-whisper', 'faster-whisper', 'parakeet-tdt', 'paraformer', or 'openai-remote'. Default is 'parakeet-tdt'."
         },
     )
     llm_backend: Optional[Literal["transformers", "mlx-lm", "responses-api"]] = field(
@@ -34,10 +41,10 @@ class ModuleArguments:
             "help": "The LLM backend to use. Either 'transformers', 'mlx-lm', or 'responses-api'. Default is 'responses-api'."
         },
     )
-    tts: Optional[Literal["melo", "chatTTS", "facebookMMS", "pocket", "kokoro", "qwen3"]] = field(
+    tts: Optional[Literal["melo", "chatTTS", "facebookMMS", "pocket", "kokoro", "qwen3", "openai-remote"]] = field(
         default="qwen3",
         metadata={
-            "help": "The TTS to use. Either 'chatTTS', 'facebookMMS', 'pocket', 'kokoro', or 'qwen3'. Default is 'qwen3'."
+            "help": "The TTS to use. Either 'chatTTS', 'facebookMMS', 'pocket', 'kokoro', 'qwen3', or 'openai-remote'. Default is 'qwen3'."
         },
     )
     log_level: str = field(

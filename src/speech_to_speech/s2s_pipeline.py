@@ -1,3 +1,11 @@
+# Copyright 2024 The HuggingFace Inc. team
+# Licensed under the Apache License, Version 2.0 (the "License").
+# See the LICENSE file in the repository root for the full license text.
+#
+# Modifications Copyright 2026 winoiknow (Eric Alborn, Anteon Group)
+# Modified: added RemoteOpenAISTTHandler and RemoteOpenAITTSHandler dispatch,
+#           CLI registration, and cancel_scope injection for remote TTS.
+
 import argparse
 import json
 import logging
@@ -37,6 +45,8 @@ from speech_to_speech.arguments_classes.parakeet_tdt_arguments import (
 )
 from speech_to_speech.arguments_classes.pocket_tts_arguments import PocketTTSHandlerArguments
 from speech_to_speech.arguments_classes.qwen3_tts_arguments import Qwen3TTSHandlerArguments
+from speech_to_speech.arguments_classes.remote_openai_stt_arguments import RemoteOpenAISTTHandlerArguments
+from speech_to_speech.arguments_classes.remote_openai_tts_arguments import RemoteOpenAITTSHandlerArguments
 from speech_to_speech.arguments_classes.responses_api_language_model_arguments import (
     ResponsesApiLanguageModelHandlerArguments,
 )
@@ -102,6 +112,8 @@ class ParsedArguments:
     pocket_tts_handler_kwargs: PocketTTSHandlerArguments
     kokoro_tts_handler_kwargs: KokoroTTSHandlerArguments
     qwen3_tts_handler_kwargs: Qwen3TTSHandlerArguments
+    remote_openai_stt_handler_kwargs: RemoteOpenAISTTHandlerArguments
+    remote_openai_tts_handler_kwargs: RemoteOpenAITTSHandlerArguments
 
 
 def rename_args(args: Any, prefix: str) -> None:
@@ -155,6 +167,8 @@ def parse_arguments() -> ParsedArguments:
             PocketTTSHandlerArguments,
             KokoroTTSHandlerArguments,
             Qwen3TTSHandlerArguments,
+            RemoteOpenAISTTHandlerArguments,
+            RemoteOpenAITTSHandlerArguments,
         )
     )
 
@@ -187,6 +201,8 @@ def parse_arguments() -> ParsedArguments:
         pocket_tts_handler_kwargs=by_type[PocketTTSHandlerArguments],
         kokoro_tts_handler_kwargs=by_type[KokoroTTSHandlerArguments],
         qwen3_tts_handler_kwargs=by_type[Qwen3TTSHandlerArguments],
+        remote_openai_stt_handler_kwargs=by_type[RemoteOpenAISTTHandlerArguments],
+        remote_openai_tts_handler_kwargs=by_type[RemoteOpenAITTSHandlerArguments],
     )
 
 
@@ -260,6 +276,8 @@ def prepare_module_args(module_kwargs: ModuleArguments, *handler_kwargs: Any) ->
     optimal_mac_settings(module_kwargs.local_mac_optimal_settings, module_kwargs, *handler_kwargs)
     if module_kwargs.tts is None:
         module_kwargs.tts = "qwen3"
+    if module_kwargs.stt is None:
+        module_kwargs.stt = "parakeet-tdt"
     if platform == "darwin":
         check_mac_settings(module_kwargs)
     overwrite_device_argument(module_kwargs.device, *handler_kwargs)
@@ -279,6 +297,8 @@ def prepare_all_args(
     pocket_tts_handler_kwargs: PocketTTSHandlerArguments,
     kokoro_tts_handler_kwargs: KokoroTTSHandlerArguments,
     qwen3_tts_handler_kwargs: Qwen3TTSHandlerArguments,
+    remote_openai_stt_handler_kwargs: RemoteOpenAISTTHandlerArguments,
+    remote_openai_tts_handler_kwargs: RemoteOpenAITTSHandlerArguments,
 ) -> None:
     prepare_module_args(
         module_kwargs,
@@ -294,6 +314,8 @@ def prepare_all_args(
         pocket_tts_handler_kwargs,
         kokoro_tts_handler_kwargs,
         qwen3_tts_handler_kwargs,
+        remote_openai_stt_handler_kwargs,
+        remote_openai_tts_handler_kwargs,
     )
 
     rename_args(whisper_stt_handler_kwargs, "stt")
@@ -308,6 +330,8 @@ def prepare_all_args(
     rename_args(pocket_tts_handler_kwargs, "pocket_tts")
     rename_args(kokoro_tts_handler_kwargs, "kokoro")
     rename_args(qwen3_tts_handler_kwargs, "qwen3_tts")
+    rename_args(remote_openai_stt_handler_kwargs, "stt_openai")
+    rename_args(remote_openai_tts_handler_kwargs, "tts_openai")
 
 
 def initialize_queues_and_events() -> dict[str, Any]:
@@ -345,6 +369,8 @@ def build_pipeline(
     pocket_tts_handler_kwargs: PocketTTSHandlerArguments,
     kokoro_tts_handler_kwargs: KokoroTTSHandlerArguments,
     qwen3_tts_handler_kwargs: Qwen3TTSHandlerArguments,
+    remote_openai_stt_handler_kwargs: RemoteOpenAISTTHandlerArguments,
+    remote_openai_tts_handler_kwargs: RemoteOpenAITTSHandlerArguments,
     queues_and_events: dict[str, Any],
 ) -> ThreadManager:
     stop_event = queues_and_events["stop_event"]
@@ -402,6 +428,7 @@ def build_pipeline(
             pocket_tts_handler_kwargs,
             chat_tts_handler_kwargs,
             facebook_mms_tts_handler_kwargs,
+            remote_openai_tts_handler_kwargs,
         ):
             vars(kw)["cancel_scope"] = cancel_scope
 
@@ -500,6 +527,7 @@ def build_pipeline(
         paraformer_stt_handler_kwargs,
         mlx_audio_whisper_stt_handler_kwargs,
         parakeet_tdt_stt_handler_kwargs,
+        remote_openai_stt_handler_kwargs,
     )
 
     lm = get_llm_handler(
@@ -532,6 +560,7 @@ def build_pipeline(
         pocket_tts_handler_kwargs,
         kokoro_tts_handler_kwargs,
         qwen3_tts_handler_kwargs,
+        remote_openai_tts_handler_kwargs,
     )
 
     # Build the handler chain
@@ -550,6 +579,7 @@ def get_stt_handler(
     paraformer_stt_handler_kwargs: ParaformerSTTHandlerArguments,
     mlx_audio_whisper_stt_handler_kwargs: MLXAudioWhisperSTTHandlerArguments,
     parakeet_tdt_stt_handler_kwargs: ParakeetTDTSTTHandlerArguments,
+    remote_openai_stt_handler_kwargs: RemoteOpenAISTTHandlerArguments | None = None,
 ) -> BaseHandler[STTIn, STTOut]:
     if module_kwargs.stt == "whisper":
         from speech_to_speech.STT.whisper_stt_handler import WhisperSTTHandler
@@ -614,9 +644,19 @@ def get_stt_handler(
             queue_out=text_prompt_queue,
             setup_kwargs=setup_kwargs,
         )
+    elif module_kwargs.stt == "openai-remote":
+        from speech_to_speech.STT.remote_openai_stt_handler import RemoteOpenAISTTHandler
+
+        return RemoteOpenAISTTHandler(
+            stop_event,
+            queue_in=spoken_prompt_queue,
+            queue_out=text_prompt_queue,
+            setup_kwargs=vars(remote_openai_stt_handler_kwargs),
+        )
     else:
         raise ValueError(
-            "The STT should be either whisper, whisper-mlx, mlx-audio-whisper, faster-whisper, parakeet-tdt, or paraformer."
+            "The STT should be either whisper, whisper-mlx, mlx-audio-whisper, faster-whisper, "
+            "parakeet-tdt, paraformer, or openai-remote."
         )
 
 
@@ -676,6 +716,7 @@ def get_tts_handler(
     pocket_tts_handler_kwargs: PocketTTSHandlerArguments,
     kokoro_tts_handler_kwargs: KokoroTTSHandlerArguments,
     qwen3_tts_handler_kwargs: Qwen3TTSHandlerArguments,
+    remote_openai_tts_handler_kwargs: RemoteOpenAITTSHandlerArguments | None = None,
 ) -> BaseHandler[TTSIn, TTSOut]:
     if module_kwargs.tts == "chatTTS":
         try:
@@ -738,8 +779,18 @@ def get_tts_handler(
             setup_args=(should_listen,),
             setup_kwargs=vars(qwen3_tts_handler_kwargs),
         )
+    elif module_kwargs.tts == "openai-remote":
+        from speech_to_speech.TTS.remote_openai_tts_handler import RemoteOpenAITTSHandler
+
+        return RemoteOpenAITTSHandler(
+            stop_event,
+            queue_in=lm_response_queue,
+            queue_out=send_audio_chunks_queue,
+            setup_args=(should_listen,),
+            setup_kwargs=vars(remote_openai_tts_handler_kwargs),
+        )
     else:
-        raise ValueError("The TTS should be either chatTTS, facebookMMS, pocket, kokoro, or qwen3")
+        raise ValueError("The TTS should be either chatTTS, facebookMMS, pocket, kokoro, qwen3, or openai-remote")
 
 
 def main() -> None:
@@ -761,6 +812,8 @@ def main() -> None:
         args.pocket_tts_handler_kwargs,
         args.kokoro_tts_handler_kwargs,
         args.qwen3_tts_handler_kwargs,
+        args.remote_openai_stt_handler_kwargs,
+        args.remote_openai_tts_handler_kwargs,
     )
 
     queues_and_events = initialize_queues_and_events()
@@ -783,6 +836,8 @@ def main() -> None:
         args.pocket_tts_handler_kwargs,
         args.kokoro_tts_handler_kwargs,
         args.qwen3_tts_handler_kwargs,
+        args.remote_openai_stt_handler_kwargs,
+        args.remote_openai_tts_handler_kwargs,
         queues_and_events,
     )
 

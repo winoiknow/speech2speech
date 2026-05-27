@@ -1,0 +1,66 @@
+# Copyright 2026 winoiknow (Eric Alborn, Anteon Group)
+# Licensed under the Apache License, Version 2.0 (the "License").
+# See the LICENSE file in the repository root for the full license text.
+
+# CPU-only image for the remote-handler build.
+# No CUDA, no local models, no transformers/mlx/parakeet/qwen3/kokoro/pocket deps.
+# All inference is delegated to external HTTP services (STT, TTS, LLM).
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+# Runtime system deps: libsndfile for soundfile, git for silero-vad torch.hub load
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libsndfile1 \
+        git \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Install a CPU-only torch first so the later package installs don't pull CUDA ──
+# Using the PyTorch CPU index avoids downloading the GPU wheel (~2 GB).
+RUN pip install --index-url https://download.pytorch.org/whl/cpu \
+        torch==2.4.0 \
+        torchaudio==2.4.0
+
+# ── Install the framework's core deps by listing only what we actually need ──
+# We do NOT install the package normally (which would drag in transformers, parakeet,
+# qwen3-tts, mlx-*, kokoro, etc.).  Instead we cherry-pick from the dependency list.
+RUN pip install \
+        fastapi>=0.115.0 \
+        "httpx>=0.28.0" \
+        "nltk==3.9.4" \
+        "numpy>=1.26.0" \
+        "openai==2.28.0" \
+        "pydantic>=2.0" \
+        "rich>=13.0" \
+        "scipy>=1.10.0" \
+        "soundfile>=0.13.0" \
+        "uvicorn>=0.30.0" \
+        "websockets>=12.0"
+
+# ── Copy source and install in no-deps mode (all deps already installed above) ──
+COPY . /app
+
+RUN pip install --no-deps -e .
+
+# ── Download NLTK punkt_tab tokenizer (needed for sentence splitting) ──
+RUN python -c "import nltk; nltk.download('punkt_tab'); nltk.download('averaged_perceptron_tagger_eng')"
+
+# ── Pre-populate the silero-vad model cache ──
+# silero-vad is fetched via torch.hub on first VAD run; cache it at build time
+# so the container starts instantly without an outbound request.
+RUN python -c "import torch; torch.hub.load('snakers4/silero-vad', 'silero_vad', trust_repo=True, skip_validation=True)"
+
+EXPOSE 8765
+
+ENTRYPOINT ["python", "-m", "speech_to_speech.s2s_pipeline"]
+CMD [ \
+    "--mode", "realtime", \
+    "--stt", "openai-remote", \
+    "--tts", "openai-remote", \
+    "--llm_backend", "responses-api" \
+]

@@ -7,12 +7,22 @@ from openai.types.realtime import (
     RealtimeResponse,
     ResponseAudioDoneEvent,
     ResponseAudioTranscriptDoneEvent,
+    ResponseContentPartAddedEvent,
+    ResponseContentPartDoneEvent,
     ResponseCreatedEvent,
     ResponseCreateEvent,
     ResponseDoneEvent,
     ResponseFunctionCallArgumentsDoneEvent,
+    ResponseOutputItemAddedEvent,
+    ResponseOutputItemDoneEvent,
+)
+from openai.types.realtime.realtime_conversation_item_assistant_message import (
+    Content as AssistantContent,
+    RealtimeConversationItemAssistantMessage,
 )
 from openai.types.realtime.realtime_response import Audio, AudioOutput
+from openai.types.realtime.response_content_part_added_event import Part as AddedPart
+from openai.types.realtime.response_content_part_done_event import Part as DonePart
 from openai.types.realtime.realtime_response_status import RealtimeResponseStatus
 from openai.types.realtime.realtime_response_usage import RealtimeResponseUsage
 
@@ -66,6 +76,9 @@ class ResponseHandler(RealtimeBaseHandler):
         st.content_index = 0
         st.in_response = False
         st.current_response_params = None
+        st.response_created_sent = False
+        st.output_item_added = False
+        st.assistant_transcript = ""
 
     def _start_item(self, conn_id: str) -> str:
         """Generate a new item ID, reset content index, and store it."""
@@ -74,6 +87,8 @@ class ResponseHandler(RealtimeBaseHandler):
         st.current_item_id = item_id
         st.content_index = 0
         st.input_audio_duration_s = 0.0
+        st.output_item_added = False
+        st.assistant_transcript = ""
         return item_id
 
     def _current_item_id(self, conn_id: str) -> str:
@@ -124,6 +139,62 @@ class ResponseHandler(RealtimeBaseHandler):
             ),
         )
 
+    def begin_output_item_events(self, conn_id: str) -> list[ServerEvent]:
+        """Emit the response/item/content-part *begin* events, each exactly once
+        per response, before any audio delta or transcript is sent.
+
+        Spec order is ``response.created`` -> ``response.output_item.added`` ->
+        ``response.content_part.added`` -> deltas.  Strict clients build their
+        item/content-part state from these; without them they have nowhere to
+        attach ``response.output_audio.delta`` and silently drop the audio.
+
+        Idempotent: callers (the audio encoder and the transcript handler) may
+        both invoke it; the per-connection flags ensure single emission.
+        """
+        st = self._state(conn_id)
+        events: list[ServerEvent] = []
+        resp_id, item_id = self._ensure_response(conn_id)
+
+        if not st.response_created_sent:
+            st.response_created_sent = True
+            events.append(
+                ResponseCreatedEvent(
+                    type="response.created",
+                    event_id=self._next_event_id(),
+                    response=self._build_response(conn_id, "in_progress"),
+                )
+            )
+
+        if not st.output_item_added:
+            st.output_item_added = True
+            events.append(
+                ResponseOutputItemAddedEvent(
+                    type="response.output_item.added",
+                    event_id=self._next_event_id(),
+                    output_index=0,
+                    response_id=resp_id,
+                    item=RealtimeConversationItemAssistantMessage(
+                        id=item_id,
+                        type="message",
+                        role="assistant",
+                        status="in_progress",
+                        content=[],
+                    ),
+                )
+            )
+            events.append(
+                ResponseContentPartAddedEvent(
+                    type="response.content_part.added",
+                    event_id=self._next_event_id(),
+                    content_index=0,
+                    item_id=item_id,
+                    output_index=0,
+                    response_id=resp_id,
+                    part=AddedPart(type="audio"),
+                )
+            )
+        return events
+
     # ── Public handlers ───────────────────────────
 
     def handle_response_create(self, conn_id: str, event: ResponseCreateEvent) -> ServerEvent | None:
@@ -167,6 +238,7 @@ class ResponseHandler(RealtimeBaseHandler):
                     response=event.response,
                 )
             )
+        st.response_created_sent = True
         logger.debug("response.create received, LLM generation triggered")
         return ResponseCreatedEvent(
             type="response.created",
@@ -204,6 +276,37 @@ class ResponseHandler(RealtimeBaseHandler):
                     response_id=resp_id,
                 )
             )
+            # Close the item/content-part lifecycle opened in
+            # ``begin_output_item_events`` so strict clients finalize the item.
+            if st.output_item_added:
+                transcript = st.assistant_transcript or None
+                item_status = "completed" if status == "completed" else "incomplete"
+                events.append(
+                    ResponseContentPartDoneEvent(
+                        type="response.content_part.done",
+                        event_id=self._next_event_id(),
+                        content_index=0,
+                        item_id=item_id,
+                        output_index=0,
+                        response_id=resp_id,
+                        part=DonePart(type="audio", transcript=transcript),
+                    )
+                )
+                events.append(
+                    ResponseOutputItemDoneEvent(
+                        type="response.output_item.done",
+                        event_id=self._next_event_id(),
+                        output_index=0,
+                        response_id=resp_id,
+                        item=RealtimeConversationItemAssistantMessage(
+                            id=item_id,
+                            type="message",
+                            role="assistant",
+                            status=item_status,
+                            content=[AssistantContent(type="output_audio", transcript=transcript)],
+                        ),
+                    )
+                )
             events.append(
                 ResponseDoneEvent(
                     type="response.done",
@@ -224,6 +327,11 @@ class ResponseHandler(RealtimeBaseHandler):
         st.last_item_id = item_id
         output_idx = 0
         if event.text:
+            # Open the item/content-part lifecycle before the transcript so the
+            # transcript (and the audio deltas that follow) attach to a part the
+            # client has already seen added. Idempotent with the audio encoder.
+            events.extend(self.begin_output_item_events(conn_id))
+            st.assistant_transcript += event.text
             events.append(
                 ResponseAudioTranscriptDoneEvent(
                     type="response.output_audio_transcript.done",

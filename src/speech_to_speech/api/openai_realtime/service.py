@@ -155,6 +155,11 @@ class ConnState(BaseModel):
     content_index: int = 0
     input_audio_duration_s: float = 0.0
     last_item_id: Optional[str] = None
+    # Realtime output lifecycle: emit response.created / output_item.added /
+    # content_part.added exactly once per response, tracked by these flags.
+    response_created_sent: bool = False
+    output_item_added: bool = False
+    assistant_transcript: str = ""
     current_response_params: RealtimeResponseCreateParams | None = None
     response_usage: UsageMetrics = Field(default_factory=UsageMetrics)
 

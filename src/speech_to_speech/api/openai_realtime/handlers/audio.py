@@ -10,7 +10,6 @@ from openai.types.realtime import (
     InputAudioBufferSpeechStoppedEvent,
     RealtimeErrorEvent,
     ResponseAudioDeltaEvent,
-    ResponseCreatedEvent,
 )
 
 from speech_to_speech.api.openai_realtime.handlers.base import RealtimeBaseHandler
@@ -116,28 +115,23 @@ class AudioHandler(RealtimeBaseHandler):
     # ── Outbound audio encoding ──────────────────
 
     def encode_audio_chunk(self, conn_id: str, audio: bytes) -> list[ServerEvent]:
-        """Encode a raw PCM audio chunk, emitting ResponseCreated on the first chunk.
+        """Encode a raw PCM audio chunk into a ``response.output_audio.delta``.
 
-        When ``handle_response_create`` already allocated the response,
-        ``current_response_id`` is set and no duplicate event is emitted.
-        For the implicit-response path (VAD -> STT -> LLM -> TTS, no
-        ``response.create``), ``current_response_id`` is still ``None``
-        and the event is emitted here on the first audio chunk.
+        On the first chunk of a response, ``begin_output_item_events`` emits the
+        ``response.created`` / ``response.output_item.added`` /
+        ``response.content_part.added`` lifecycle (each once, across both this
+        path and the transcript path) so the client has an item/content-part to
+        attach the audio to. All deltas of the single audio content part share
+        ``content_index=0``.
         """
         response = self._service.response
         st = self._state(conn_id)
 
-        events: list[ServerEvent] = []
-        need_created = st.current_response_id is None
-        resp_id, item_id = response._ensure_response(conn_id)
-        if need_created:
-            events.append(
-                ResponseCreatedEvent(
-                    type="response.created",
-                    event_id=self._next_event_id(),
-                    response=response._build_response(conn_id, "in_progress"),
-                )
-            )
+        events: list[ServerEvent] = list(response.begin_output_item_events(conn_id))
+        first_chunk = bool(events)
+        resp_id = st.current_response_id
+        item_id = response._current_item_id(conn_id)
+
         rp = st.current_response_params
         client_out_rate = None
         if rp and rp.audio and rp.audio.output and rp.audio.output.format:
@@ -148,7 +142,7 @@ class AudioHandler(RealtimeBaseHandler):
                 client_out_rate = getattr(audio_cfg.output.format, "rate", None) or PIPELINE_SAMPLE_RATE
             else:
                 client_out_rate = PIPELINE_SAMPLE_RATE
-        if need_created:
+        if first_chunk:
             logger.info(
                 "encode_audio_chunk: client output rate=%s Hz (pipeline=%s Hz); deltas carry "
                 "base64 int16 PCM. If the client declared a non-pcm16 output format, it will not "
@@ -162,7 +156,7 @@ class AudioHandler(RealtimeBaseHandler):
             ResponseAudioDeltaEvent(
                 type="response.output_audio.delta",
                 event_id=self._next_event_id(),
-                content_index=response._next_content_index(conn_id),
+                content_index=0,
                 delta=b64,
                 item_id=item_id,
                 output_index=0,

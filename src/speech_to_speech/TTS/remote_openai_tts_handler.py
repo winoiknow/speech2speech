@@ -83,6 +83,8 @@ class RemoteOpenAITTSHandler(BaseHandler[TTSIn, TTSOut]):
         pipeline_start = perf_counter()
         first_chunk = True
         remainder = b""
+        raw_total = 0  # DEBUG: total bytes read off the socket
+        chunks_yielded = 0  # DEBUG: 512-sample chunks emitted downstream
 
         try:
             with self._client.stream(
@@ -92,15 +94,36 @@ class RemoteOpenAITTSHandler(BaseHandler[TTSIn, TTSOut]):
                 json=payload,
             ) as response:
                 response.raise_for_status()
+                logger.info(
+                    "RemoteOpenAITTS: stream opened (gen=%s, scope_gen=%s, entering iter_bytes loop)",
+                    gen,
+                    self.cancel_scope.generation if self.cancel_scope else None,
+                )
 
                 for raw in response.iter_bytes():
+                    raw_total += len(raw)
                     # Check cancellation before processing each received chunk
                     if gen is not None and self.cancel_scope is not None and self.cancel_scope.is_stale(gen):
-                        logger.info("RemoteOpenAITTS: cancelled (barge-in), closing upstream stream")
+                        logger.info(
+                            "RemoteOpenAITTS: ABORT on is_stale (captured gen=%s, current scope_gen=%s) "
+                            "after %d bytes read, %d chunks yielded — barge-in, closing upstream stream",
+                            gen,
+                            self.cancel_scope.generation,
+                            raw_total,
+                            chunks_yielded,
+                        )
                         return
 
                     if first_chunk:
-                        logger.debug("RemoteOpenAITTS: time-to-first-byte %.3fs", perf_counter() - pipeline_start)
+                        logger.info(
+                            "RemoteOpenAITTS: time-to-first-byte %.3fs (first %d bytes, header=%r) "
+                            "— %r means WAV/RIFF container (NOT raw int16 PCM); frombuffer will "
+                            "mis-parse the 44-byte header as samples",
+                            perf_counter() - pipeline_start,
+                            len(raw),
+                            raw[:4],
+                            b"RIFF",
+                        )
                         first_chunk = False
 
                     remainder += raw
@@ -109,7 +132,14 @@ class RemoteOpenAITTSHandler(BaseHandler[TTSIn, TTSOut]):
                     while len(remainder) >= CHUNK_BYTES:
                         chunk_bytes = remainder[:CHUNK_BYTES]
                         remainder = remainder[CHUNK_BYTES:]
+                        chunks_yielded += 1
                         yield np.frombuffer(chunk_bytes, dtype=np.int16).copy()
+
+                logger.info(
+                    "RemoteOpenAITTS: iter_bytes loop done — %d bytes read, %d chunks yielded",
+                    raw_total,
+                    chunks_yielded,
+                )
 
         except httpx.HTTPError as exc:
             logger.error("RemoteOpenAITTS request failed: %s", exc)

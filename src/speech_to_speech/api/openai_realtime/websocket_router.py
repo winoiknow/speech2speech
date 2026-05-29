@@ -274,7 +274,12 @@ def create_app(
                                 _flush_queue(text_output_queue, preserve=_keep_user_text_event)
                                 if response_playing and response_playing.is_set():
                                     response_playing.clear()
-                                logger.info("Speech during response: cancelled, queue flushed")
+                                logger.warning(
+                                    "BARGE-IN FIRED: SpeechStartedEvent while in_response → cancel_scope.cancel() "
+                                    "(scope_gen now %s, discarding=True). If this fires spuriously every response, "
+                                    "the VAD is likely tripping on echo/tail and this is why audio is dropped.",
+                                    cancel_scope.generation if cancel_scope else None,
+                                )
                             else:
                                 logger.info("Speech during response: interrupt_response disabled, ignoring")
                     except Empty:
@@ -311,6 +316,12 @@ def create_app(
                         continue
 
                     if cancel_scope and cancel_scope.discarding:
+                        logger.info(
+                            "DROP audio chunk in send loop: cancel_scope.discarding=True "
+                            "(scope_gen=%s). Audio will NOT reach client until __RESPONSE_DONE__ "
+                            "clears the discard guard via response_done().",
+                            cancel_scope.generation,
+                        )
                         continue
 
                     audio_chunk = _to_audio_bytes(audio_chunk)

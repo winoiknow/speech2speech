@@ -239,6 +239,8 @@ def create_app(
     async def _send_loop() -> None:
         """Poll pipeline output queues and send to each connected client."""
         pending_output_item = None
+        deltas_sent = 0  # DEBUG: response.output_audio.delta events emitted this response
+        delta_pcm_bytes = 0  # DEBUG: pre-resample PCM bytes encoded into deltas this response
         while not stop_event.is_set():
             try:
                 # Process text events first (speech_started cancels active response)
@@ -309,7 +311,15 @@ def create_app(
                         if cancel_scope:
                             cancel_scope.response_done()
                         should_listen.set()
-                        logger.info("Response complete, listening re-enabled")
+                        logger.info(
+                            "Response complete, listening re-enabled — sent %d audio delta event(s) "
+                            "carrying %d PCM bytes to %d client(s) this response",
+                            deltas_sent,
+                            delta_pcm_bytes,
+                            len(service.connection_ids),
+                        )
+                        deltas_sent = 0
+                        delta_pcm_bytes = 0
                         continue
 
                     if is_control_message(audio_chunk):
@@ -353,6 +363,8 @@ def create_app(
                         ws = app.state.websockets.get(cid)
                         if ws:
                             await _send_events(ws, service.encode_audio_chunk(cid, bytes(audio_batch)))
+                            deltas_sent += 1
+                            delta_pcm_bytes += len(audio_batch)
                 except Empty:
                     pass
 

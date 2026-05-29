@@ -148,6 +148,14 @@ class AudioHandler(RealtimeBaseHandler):
                 client_out_rate = getattr(audio_cfg.output.format, "rate", None) or PIPELINE_SAMPLE_RATE
             else:
                 client_out_rate = PIPELINE_SAMPLE_RATE
+        if need_created:
+            logger.info(
+                "encode_audio_chunk: client output rate=%s Hz (pipeline=%s Hz); deltas carry "
+                "base64 int16 PCM. If the client declared a non-pcm16 output format, it will not "
+                "play these bytes.",
+                client_out_rate,
+                PIPELINE_SAMPLE_RATE,
+            )
         audio = resample(audio, PIPELINE_SAMPLE_RATE, client_out_rate)
         b64 = base64.b64encode(audio).decode("ascii")
         events.append(

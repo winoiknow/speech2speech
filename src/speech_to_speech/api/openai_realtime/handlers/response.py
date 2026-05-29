@@ -193,6 +193,21 @@ class ResponseHandler(RealtimeBaseHandler):
                     part=AddedPart(type="audio"),
                 )
             )
+        if events:
+            rp = st.current_response_params
+            fmt = rp.audio.output.format if (rp and rp.audio and rp.audio.output) else None
+            if fmt is None:
+                ao = st.runtime_config.session.audio
+                fmt = ao.output.format if (ao and ao.output) else None
+            logger.info(
+                "Realtime lifecycle BEGIN emitted: %s | negotiated output audio: format_type=%s "
+                "declared_rate=%s — s2s sends int16 PCM resampled to the client rate (16000 Hz if "
+                "unset). A non-'audio/pcm' format type (e.g. audio/pcmu, audio/pcma) means the "
+                "client will decode these PCM bytes wrong → silence/noise.",
+                [e.type for e in events],
+                getattr(fmt, "type", None) if fmt else None,
+                getattr(fmt, "rate", None) if fmt else None,
+            )
         return events
 
     # ── Public handlers ───────────────────────────
@@ -307,6 +322,7 @@ class ResponseHandler(RealtimeBaseHandler):
                         ),
                     )
                 )
+                logger.info("Realtime lifecycle CLOSE emitted: content_part.done + output_item.done")
             events.append(
                 ResponseDoneEvent(
                     type="response.done",

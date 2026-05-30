@@ -31,9 +31,10 @@ class RemoteOpenAITTSHandlerArguments:
         metadata={"help": "HTTP timeout in seconds for TTS streaming requests. Default is 60."},
     )
     tts_openai_source_sample_rate: int = field(
-        default_factory=lambda: int(os.environ.get("TTS_OPENAI_SOURCE_SAMPLE_RATE", "24000")),
+        default_factory=lambda: int(os.environ.get("TTS_OPENAI_SOURCE_SAMPLE_RATE", "16000")),
         metadata={
-            "help": "Sample rate (Hz) the TTS endpoint actually outputs, resampled to the 16 kHz "
-            "pipeline rate. F5-TTS is natively 24000. Env: TTS_OPENAI_SOURCE_SAMPLE_RATE."
+            "help": "Fallback sample rate (Hz) for the TTS endpoint's output when it doesn't send an "
+            "X-Sample-Rate header. The winoiknow/openai-f5-tts /stream endpoint outputs 16000 and "
+            "advertises it via the header. Env: TTS_OPENAI_SOURCE_SAMPLE_RATE."
         },
     )

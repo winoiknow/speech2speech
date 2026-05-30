@@ -32,10 +32,11 @@ CHUNK_BYTES = CHUNK_SAMPLES * BYTES_PER_SAMPLE
 class RemoteOpenAITTSHandler(BaseHandler[TTSIn, TTSOut]):
     """
     Streams int16 mono PCM from a remote OpenAI-compatible TTS endpoint
-    (e.g. winoiknow/openai-f5-tts with /v1/audio/speech/stream) and resamples it
-    from the endpoint's native rate (``source_sample_rate``, F5-TTS is 24000) to
-    the 16 kHz pipeline rate. Skipping this resample makes the audio play ~1.5x
-    too slow and low-pitched downstream.
+    (e.g. winoiknow/openai-f5-tts with /v1/audio/speech/stream). The endpoint's
+    output rate is taken from its ``X-Sample-Rate`` response header (falling back
+    to ``source_sample_rate``) and resampled to the 16 kHz pipeline rate only if
+    they differ — the F5 /stream endpoint already emits 16 kHz, so assuming a
+    different rate would decimate the audio into noise.
 
     The upstream HTTP connection is closed immediately when a barge-in is detected
     (cancel_scope.is_stale), preventing wasted bandwidth and latency.
@@ -49,7 +50,7 @@ class RemoteOpenAITTSHandler(BaseHandler[TTSIn, TTSOut]):
         voice: str = "default",
         model: str = "tts-1",
         timeout: float = 60.0,
-        source_sample_rate: int = 24000,
+        source_sample_rate: int = 16000,
         gen_kwargs: dict | None = None,  # accepted for pipeline compatibility, unused
         cancel_scope: CancelScope | None = None,
     ) -> None:
@@ -91,6 +92,7 @@ class RemoteOpenAITTSHandler(BaseHandler[TTSIn, TTSOut]):
         first_chunk = True
         body = bytearray()  # full clip; F5-TTS returns it in one shot
         raw_total = 0  # DEBUG: total bytes read off the socket
+        src_rate = self.source_sample_rate  # overridden by the endpoint's X-Sample-Rate header if present
 
         try:
             with self._client.stream(
@@ -100,10 +102,21 @@ class RemoteOpenAITTSHandler(BaseHandler[TTSIn, TTSOut]):
                 json=payload,
             ) as response:
                 response.raise_for_status()
+                # Trust the endpoint's declared rate over our configured default. The
+                # winoiknow/openai-f5-tts /stream endpoint resamples to 16 kHz int16 and
+                # advertises X-Sample-Rate: 16000 — assuming 24 kHz here would decimate
+                # the audio (drop 1 of every 3 samples) and render it unintelligible.
+                hdr_rate = response.headers.get("X-Sample-Rate")
+                if hdr_rate:
+                    try:
+                        src_rate = int(hdr_rate)
+                    except ValueError:
+                        logger.warning("RemoteOpenAITTS: bad X-Sample-Rate header %r; using %d", hdr_rate, src_rate)
                 logger.info(
-                    "RemoteOpenAITTS: stream opened (gen=%s, scope_gen=%s, entering iter_bytes loop)",
+                    "RemoteOpenAITTS: stream opened (gen=%s, scope_gen=%s, src_rate=%d Hz, entering iter_bytes loop)",
                     gen,
                     self.cancel_scope.generation if self.cancel_scope else None,
+                    src_rate,
                 )
 
                 for raw in response.iter_bytes():
@@ -144,22 +157,21 @@ class RemoteOpenAITTSHandler(BaseHandler[TTSIn, TTSOut]):
         if samples.size == 0:
             return
 
-        # Resample from the endpoint's native rate to the 16 kHz pipeline rate.
-        # Done once over the whole clip to avoid per-chunk boundary artifacts.
-        if self.source_sample_rate != SAMPLE_RATE:
-            g = gcd(SAMPLE_RATE, self.source_sample_rate)
-            resampled = resample_poly(
-                samples.astype(np.float32), SAMPLE_RATE // g, self.source_sample_rate // g
-            )
+        # Resample from the endpoint's actual rate to the 16 kHz pipeline rate, only if
+        # they differ. Done once over the whole clip to avoid per-chunk boundary artifacts.
+        if src_rate != SAMPLE_RATE:
+            g = gcd(SAMPLE_RATE, src_rate)
+            resampled = resample_poly(samples.astype(np.float32), SAMPLE_RATE // g, src_rate // g)
             samples = np.clip(np.round(resampled), -32768, 32767).astype(np.int16)
 
         logger.info(
-            "RemoteOpenAITTS: resampled %d samples @ %d Hz → %d samples @ %d Hz (%.2fs audio)",
+            "RemoteOpenAITTS: %d samples @ %d Hz → %d samples @ %d Hz (%.2fs audio, resample=%s)",
             len(usable) // BYTES_PER_SAMPLE,
-            self.source_sample_rate,
+            src_rate,
             samples.size,
             SAMPLE_RATE,
             samples.size / SAMPLE_RATE,
+            src_rate != SAMPLE_RATE,
         )
 
         # Yield fixed CHUNK_SAMPLES chunks, zero-padding the last for downstream alignment.

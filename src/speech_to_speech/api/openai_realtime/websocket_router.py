@@ -1,6 +1,8 @@
 import asyncio
+import base64
 import logging
 import os
+import wave
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from queue import Empty, Queue
@@ -56,6 +58,11 @@ PACING_SLICE_S = 0.01
 # Hold response.done this long after the last audio so a real-time consumer can drain its
 # playout buffer before finalizing (otherwise it drops the buffered tail). Env: S2S_RESPONSE_DONE_TAIL_MS.
 RESPONSE_DONE_TAIL_S = int(os.getenv("S2S_RESPONSE_DONE_TAIL_MS", "400")) / 1000
+# Debug: if set, write each response's exact outbound audio (the base64 PCM deltas the client
+# receives, decoded) to a WAV in this dir, so the real on-wire audio can be auditioned directly.
+TTS_DUMP_DIR = os.getenv("S2S_TTS_DUMP_DIR") or None
+# Sample rate of the dumped WAV — the negotiated client output rate (GA pcm = 24000).
+TTS_DUMP_RATE = int(os.getenv("S2S_TTS_DUMP_RATE", "24000"))
 
 
 async def _send_event(ws: WebSocket, event: ServerEvent) -> None:
@@ -265,6 +272,8 @@ def create_app(
         delta_pcm_bytes = 0  # DEBUG: pre-resample PCM bytes encoded into deltas this response
         loop = asyncio.get_running_loop()
         audio_play_deadline: float | None = None  # wall-clock time current audio should finish playing
+        dump_pcm = bytearray() if TTS_DUMP_DIR else None  # DEBUG: exact outbound PCM for this response
+        dump_seq = 0
         while not stop_event.is_set():
             try:
                 # Process text events first (speech_started cancels active response)
@@ -326,6 +335,23 @@ def create_app(
                         break
 
                     if isinstance(audio_chunk, bytes) and audio_chunk == AUDIO_RESPONSE_DONE:
+                        if dump_pcm is not None and dump_pcm:
+                            try:
+                                os.makedirs(TTS_DUMP_DIR, exist_ok=True)
+                                path = os.path.join(TTS_DUMP_DIR, f"out_{dump_seq:03d}.wav")
+                                with wave.open(path, "wb") as w:
+                                    w.setnchannels(1)
+                                    w.setsampwidth(2)
+                                    w.setframerate(TTS_DUMP_RATE)
+                                    w.writeframes(bytes(dump_pcm))
+                                logger.info(
+                                    "Wrote outbound audio dump %s (%d bytes, %.2fs @ %d Hz)",
+                                    path, len(dump_pcm), len(dump_pcm) / 2 / TTS_DUMP_RATE, TTS_DUMP_RATE,
+                                )
+                            except Exception as e:
+                                logger.error("TTS dump failed: %s", e)
+                            dump_pcm.clear()
+                            dump_seq += 1
                         # Hold response.done briefly so the client can drain its playout
                         # buffer. It plays inbound audio at real-time and ends up ~0.3 s
                         # behind, so a response.done that lands right after the last delta
@@ -397,12 +423,17 @@ def create_app(
                         response_playing.set()
                         should_listen.set()
 
-                    for cid in service.connection_ids:
+                    for idx, cid in enumerate(service.connection_ids):
                         ws = app.state.websockets.get(cid)
                         if ws:
-                            await _send_events(ws, service.encode_audio_chunk(cid, bytes(audio_batch)))
+                            out_events = service.encode_audio_chunk(cid, bytes(audio_batch))
+                            await _send_events(ws, out_events)
                             deltas_sent += 1
                             delta_pcm_bytes += len(audio_batch)
+                            if dump_pcm is not None and idx == 0:
+                                for ev in out_events:
+                                    if getattr(ev, "type", "") == "response.output_audio.delta":
+                                        dump_pcm += base64.b64decode(ev.delta)
 
                     # Pace to wall-clock: hold the next dequeue (and the trailing
                     # __RESPONSE_DONE__) until this batch would have finished playing,

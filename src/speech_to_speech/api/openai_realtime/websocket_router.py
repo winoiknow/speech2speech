@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from queue import Empty, Queue
@@ -33,6 +34,19 @@ from speech_to_speech.pipeline.queue_types import AudioInItem, AudioOutItem, Tex
 logger = logging.getLogger(__name__)
 MAX_AUDIO_BATCH_BYTES = 6400
 QItem = TypeVar("QItem")
+
+# Outbound audio on the queue is int16 PCM at the pipeline rate. Used to pace
+# delta emission to wall-clock so we behave like the real OpenAI Realtime server.
+PIPELINE_SAMPLE_RATE = 16000
+PIPELINE_BYTES_PER_SAMPLE = 2
+# Real-time pacing of outbound audio. F5-TTS returns a whole clip at once, so
+# without this s2s dumps the entire response in ~150 ms then sends response.done
+# immediately; real-time consumers (e.g. AVA over AudioSocket) play ~one frame,
+# then finalize on response.done and drop the rest. Pace so response.done lands
+# after the audio. Disable with S2S_REALTIME_PACING=0.
+REALTIME_PACING_ENABLED = os.getenv("S2S_REALTIME_PACING", "1").lower() not in ("0", "false", "no")
+# Sleep granularity while pacing, so a client-initiated cancel (discarding) breaks out promptly.
+PACING_SLICE_S = 0.05
 
 
 async def _send_event(ws: WebSocket, event: ServerEvent) -> None:
@@ -240,6 +254,8 @@ def create_app(
         pending_output_item = None
         deltas_sent = 0  # DEBUG: response.output_audio.delta events emitted this response
         delta_pcm_bytes = 0  # DEBUG: pre-resample PCM bytes encoded into deltas this response
+        loop = asyncio.get_running_loop()
+        audio_play_deadline: float | None = None  # wall-clock time current audio should finish playing
         while not stop_event.is_set():
             try:
                 # Process text events first (speech_started cancels active response)
@@ -319,6 +335,7 @@ def create_app(
                         )
                         deltas_sent = 0
                         delta_pcm_bytes = 0
+                        audio_play_deadline = None
                         continue
 
                     if is_control_message(audio_chunk):
@@ -331,6 +348,7 @@ def create_app(
                             "clears the discard guard via response_done().",
                             cancel_scope.generation,
                         )
+                        audio_play_deadline = None
                         continue
 
                     audio_chunk = _to_audio_bytes(audio_chunk)
@@ -364,6 +382,25 @@ def create_app(
                             await _send_events(ws, service.encode_audio_chunk(cid, bytes(audio_batch)))
                             deltas_sent += 1
                             delta_pcm_bytes += len(audio_batch)
+
+                    # Pace to wall-clock: hold the next dequeue (and the trailing
+                    # __RESPONSE_DONE__) until this batch would have finished playing,
+                    # so response.done lands after the audio instead of ~2 s early.
+                    if REALTIME_PACING_ENABLED and audio_batch:
+                        batch_seconds = len(audio_batch) / (PIPELINE_BYTES_PER_SAMPLE * PIPELINE_SAMPLE_RATE)
+                        now = loop.time()
+                        if audio_play_deadline is None or audio_play_deadline < now:
+                            audio_play_deadline = now
+                        audio_play_deadline += batch_seconds
+                        while True:
+                            remaining = audio_play_deadline - loop.time()
+                            if remaining <= 0:
+                                break
+                            # A client-initiated cancel sets discarding from another task; bail out fast.
+                            if cancel_scope and cancel_scope.discarding:
+                                audio_play_deadline = None
+                                break
+                            await asyncio.sleep(min(remaining, PACING_SLICE_S))
                 except Empty:
                     pass
 

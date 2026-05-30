@@ -32,13 +32,19 @@ from speech_to_speech.pipeline.messages import AUDIO_RESPONSE_DONE, PIPELINE_END
 from speech_to_speech.pipeline.queue_types import AudioInItem, AudioOutItem, TextEventItem
 
 logger = logging.getLogger(__name__)
-MAX_AUDIO_BATCH_BYTES = 6400
 QItem = TypeVar("QItem")
 
 # Outbound audio on the queue is int16 PCM at the pipeline rate. Used to pace
 # delta emission to wall-clock so we behave like the real OpenAI Realtime server.
 PIPELINE_SAMPLE_RATE = 16000
 PIPELINE_BYTES_PER_SAMPLE = 2
+# Emit small deltas (~20 ms of pipeline audio) rather than big slugs. With the
+# real-time pacer below, "send a batch then sleep its duration" leaves the client
+# holding ~one batch of lead, which it reads as a faster-than-real provider rate
+# (AVA measured 26.9 kHz vs the assumed 24 kHz with 192 ms batches → garbled
+# playout). Small batches keep the measured rate ≈ the true rate, matching how the
+# real OpenAI server streams audio.
+MAX_AUDIO_BATCH_BYTES = PIPELINE_SAMPLE_RATE * PIPELINE_BYTES_PER_SAMPLE * 20 // 1000  # 20 ms = 640 bytes
 # Real-time pacing of outbound audio. F5-TTS returns a whole clip at once, so
 # without this s2s dumps the entire response in ~150 ms then sends response.done
 # immediately; real-time consumers (e.g. AVA over AudioSocket) play ~one frame,
@@ -46,7 +52,7 @@ PIPELINE_BYTES_PER_SAMPLE = 2
 # after the audio. Disable with S2S_REALTIME_PACING=0.
 REALTIME_PACING_ENABLED = os.getenv("S2S_REALTIME_PACING", "1").lower() not in ("0", "false", "no")
 # Sleep granularity while pacing, so a client-initiated cancel (discarding) breaks out promptly.
-PACING_SLICE_S = 0.05
+PACING_SLICE_S = 0.01
 
 
 async def _send_event(ws: WebSocket, event: ServerEvent) -> None:

@@ -25,7 +25,7 @@ console = Console()
 
 SAMPLE_RATE = 16000
 BYTES_PER_SAMPLE = 2  # int16
-CHUNK_SAMPLES = 512
+CHUNK_SAMPLES = 320  # 20 ms @ 16 kHz — small chunks keep outbound pacing smooth
 CHUNK_BYTES = CHUNK_SAMPLES * BYTES_PER_SAMPLE
 
 

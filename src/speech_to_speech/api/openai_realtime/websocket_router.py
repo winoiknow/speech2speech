@@ -395,7 +395,12 @@ def create_app(
                     if REALTIME_PACING_ENABLED and audio_batch:
                         batch_seconds = len(audio_batch) / (PIPELINE_BYTES_PER_SAMPLE * PIPELINE_SAMPLE_RATE)
                         now = loop.time()
-                        if audio_play_deadline is None or audio_play_deadline < now:
+                        # Keep the deadline ABSOLUTE across batches so per-iteration overhead
+                        # (the 10 ms tail sleep, send/encode time) is absorbed by a shorter next
+                        # sleep rather than accumulating — re-anchoring every batch made delivery
+                        # ~0.67x real-time (client measured 15 kHz vs 24 kHz). Only re-anchor on a
+                        # real stall so we don't burst a large backlog to catch up.
+                        if audio_play_deadline is None or now - audio_play_deadline > 0.5:
                             audio_play_deadline = now
                         audio_play_deadline += batch_seconds
                         while True:

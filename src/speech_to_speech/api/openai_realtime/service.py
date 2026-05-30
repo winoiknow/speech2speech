@@ -23,6 +23,7 @@ from openai.types.realtime import (
     ResponseDoneEvent,
     ResponseFunctionCallArgumentsDoneEvent,
     SessionCreatedEvent,
+    SessionUpdatedEvent,
     SessionUpdateEvent,
 )
 from openai.types.realtime.realtime_response_create_params import RealtimeResponseCreateParams
@@ -257,7 +258,9 @@ class RealtimeService:
     def build_session_created(self, conn_id: str) -> SessionCreatedEvent:
         return self.session.build_session_created(conn_id)
 
-    def handle_session_update(self, conn_id: str, event: SessionUpdateEvent) -> Optional[RealtimeErrorEvent]:
+    def handle_session_update(
+        self, conn_id: str, event: SessionUpdateEvent
+    ) -> RealtimeErrorEvent | SessionUpdatedEvent:
         return self.session.handle_session_update(conn_id, event)
 
     def handle_audio_append(self, conn_id: str, event: InputAudioBufferAppendEvent) -> list[bytes]:

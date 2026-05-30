@@ -2,6 +2,7 @@ from openai.types.realtime import RealtimeSessionCreateRequest
 from openai.types.realtime.realtime_audio_config import RealtimeAudioConfig
 from openai.types.realtime.realtime_audio_config_input import RealtimeAudioConfigInput
 from openai.types.realtime.realtime_audio_config_output import RealtimeAudioConfigOutput
+from openai.types.realtime.realtime_audio_formats import AudioPCM
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from speech_to_speech.LLM.chat import Chat
@@ -46,13 +47,24 @@ class RuntimeConfig(BaseModel):
     @field_validator("session", mode="after")
     @classmethod
     def _ensure_audio_structure(cls, v: RealtimeSessionCreateRequest) -> RealtimeSessionCreateRequest:
-        """Guarantee 'audio.input' and 'audio.output' are never None."""
+        """Guarantee 'audio.input' and 'audio.output' are never None, and that the
+        output format is advertised.
+
+        Clients that send ``session.update`` without an output format (e.g. AVA)
+        rely on the ``session.updated`` ACK to learn how to decode our audio. If
+        we leave it ``None`` they fall back to guessing the codec (AVA infers
+        G.711 µ-law and mis-decodes our linear PCM into DC-laden noise). Default
+        to the OpenAI GA standard, ``audio/pcm`` @ 24000 Hz, which is also what
+        ``encode_audio_chunk`` resamples to.
+        """
         if v.audio is None:
             v.audio = RealtimeAudioConfig()
         if v.audio.input is None:
             v.audio.input = RealtimeAudioConfigInput()
         if v.audio.output is None:
             v.audio.output = RealtimeAudioConfigOutput()
+        if v.audio.output.format is None:
+            v.audio.output.format = AudioPCM(type="audio/pcm", rate=24000)
         return v
 
     @property

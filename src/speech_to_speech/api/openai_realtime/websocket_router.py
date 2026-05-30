@@ -190,9 +190,8 @@ def create_app(
                         await _send_event(ws, err)
 
                 elif isinstance(event, SessionUpdateEvent):
-                    err = service.handle_session_update(session_id, event)
-                    if err:
-                        await _send_event(ws, err)
+                    reply = service.handle_session_update(session_id, event)
+                    await _send_event(ws, reply)
 
                 elif isinstance(event, ConversationItemCreateEvent):
                     events = service.handle_conversation_item_create(session_id, event)

@@ -53,6 +53,9 @@ MAX_AUDIO_BATCH_BYTES = PIPELINE_SAMPLE_RATE * PIPELINE_BYTES_PER_SAMPLE * 20 //
 REALTIME_PACING_ENABLED = os.getenv("S2S_REALTIME_PACING", "1").lower() not in ("0", "false", "no")
 # Sleep granularity while pacing, so a client-initiated cancel (discarding) breaks out promptly.
 PACING_SLICE_S = 0.01
+# Hold response.done this long after the last audio so a real-time consumer can drain its
+# playout buffer before finalizing (otherwise it drops the buffered tail). Env: S2S_RESPONSE_DONE_TAIL_MS.
+RESPONSE_DONE_TAIL_S = int(os.getenv("S2S_RESPONSE_DONE_TAIL_MS", "400")) / 1000
 
 
 async def _send_event(ws: WebSocket, event: ServerEvent) -> None:
@@ -323,6 +326,18 @@ def create_app(
                         break
 
                     if isinstance(audio_chunk, bytes) and audio_chunk == AUDIO_RESPONSE_DONE:
+                        # Hold response.done briefly so the client can drain its playout
+                        # buffer. It plays inbound audio at real-time and ends up ~0.3 s
+                        # behind, so a response.done that lands right after the last delta
+                        # makes it finalize and drop the still-buffered tail (AVA played
+                        # 1.06 s of a 1.42 s greeting). Skip the hold on barge-in/cancel.
+                        if REALTIME_PACING_ENABLED and not (cancel_scope and cancel_scope.discarding):
+                            held = 0.0
+                            while held < RESPONSE_DONE_TAIL_S:
+                                if cancel_scope and cancel_scope.discarding:
+                                    break
+                                await asyncio.sleep(PACING_SLICE_S)
+                                held += PACING_SLICE_S
                         for cid in service.connection_ids:
                             ws = app.state.websockets.get(cid)
                             if ws:

@@ -30,3 +30,10 @@ class RemoteOpenAITTSHandlerArguments:
         default=60.0,
         metadata={"help": "HTTP timeout in seconds for TTS streaming requests. Default is 60."},
     )
+    tts_openai_source_sample_rate: int = field(
+        default_factory=lambda: int(os.environ.get("TTS_OPENAI_SOURCE_SAMPLE_RATE", "24000")),
+        metadata={
+            "help": "Sample rate (Hz) the TTS endpoint actually outputs, resampled to the 16 kHz "
+            "pipeline rate. F5-TTS is natively 24000. Env: TTS_OPENAI_SOURCE_SAMPLE_RATE."
+        },
+    )

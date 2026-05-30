@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+from math import gcd
 from threading import Event
 from time import perf_counter
 from typing import Iterator
@@ -12,6 +13,7 @@ from typing import Iterator
 import httpx
 import numpy as np
 from rich.console import Console
+from scipy.signal import resample_poly
 
 from speech_to_speech.baseHandler import BaseHandler
 from speech_to_speech.pipeline.cancel_scope import CancelScope
@@ -29,8 +31,11 @@ CHUNK_BYTES = CHUNK_SAMPLES * BYTES_PER_SAMPLE
 
 class RemoteOpenAITTSHandler(BaseHandler[TTSIn, TTSOut]):
     """
-    Streams 16 kHz int16 mono PCM from a remote OpenAI-compatible TTS endpoint
-    (e.g. winoiknow/openai-f5-tts with /v1/audio/speech/stream).
+    Streams int16 mono PCM from a remote OpenAI-compatible TTS endpoint
+    (e.g. winoiknow/openai-f5-tts with /v1/audio/speech/stream) and resamples it
+    from the endpoint's native rate (``source_sample_rate``, F5-TTS is 24000) to
+    the 16 kHz pipeline rate. Skipping this resample makes the audio play ~1.5x
+    too slow and low-pitched downstream.
 
     The upstream HTTP connection is closed immediately when a barge-in is detected
     (cancel_scope.is_stale), preventing wasted bandwidth and latency.
@@ -44,6 +49,7 @@ class RemoteOpenAITTSHandler(BaseHandler[TTSIn, TTSOut]):
         voice: str = "default",
         model: str = "tts-1",
         timeout: float = 60.0,
+        source_sample_rate: int = 24000,
         gen_kwargs: dict | None = None,  # accepted for pipeline compatibility, unused
         cancel_scope: CancelScope | None = None,
     ) -> None:
@@ -51,13 +57,14 @@ class RemoteOpenAITTSHandler(BaseHandler[TTSIn, TTSOut]):
         self.cancel_scope = cancel_scope
         self.voice = voice
         self.model = model
+        self.source_sample_rate = source_sample_rate
         self.stream_endpoint = base_url.rstrip("/") + "/v1/audio/speech/stream"
         self.headers = {"Authorization": f"Bearer {api_key}"}
         self.timeout = timeout
         self._client = httpx.Client(timeout=self.timeout)
         logger.info(
-            "RemoteOpenAITTSHandler ready → %s (voice=%s, model=%s)",
-            self.stream_endpoint, self.voice, self.model,
+            "RemoteOpenAITTSHandler ready → %s (voice=%s, model=%s, source_rate=%d→%d Hz)",
+            self.stream_endpoint, self.voice, self.model, self.source_sample_rate, SAMPLE_RATE,
         )
 
     def process(self, tts_input: TTSIn) -> Iterator[TTSOut]:
@@ -82,9 +89,8 @@ class RemoteOpenAITTSHandler(BaseHandler[TTSIn, TTSOut]):
         }
         pipeline_start = perf_counter()
         first_chunk = True
-        remainder = b""
+        body = bytearray()  # full clip; F5-TTS returns it in one shot
         raw_total = 0  # DEBUG: total bytes read off the socket
-        chunks_yielded = 0  # DEBUG: 512-sample chunks emitted downstream
 
         try:
             with self._client.stream(
@@ -106,11 +112,10 @@ class RemoteOpenAITTSHandler(BaseHandler[TTSIn, TTSOut]):
                     if gen is not None and self.cancel_scope is not None and self.cancel_scope.is_stale(gen):
                         logger.info(
                             "RemoteOpenAITTS: ABORT on is_stale (captured gen=%s, current scope_gen=%s) "
-                            "after %d bytes read, %d chunks yielded — barge-in, closing upstream stream",
+                            "after %d bytes read — barge-in, closing upstream stream",
                             gen,
                             self.cancel_scope.generation,
                             raw_total,
-                            chunks_yielded,
                         )
                         return
 
@@ -126,33 +131,43 @@ class RemoteOpenAITTSHandler(BaseHandler[TTSIn, TTSOut]):
                         )
                         first_chunk = False
 
-                    remainder += raw
+                    body += raw
 
-                    # Yield complete 512-sample chunks
-                    while len(remainder) >= CHUNK_BYTES:
-                        chunk_bytes = remainder[:CHUNK_BYTES]
-                        remainder = remainder[CHUNK_BYTES:]
-                        chunks_yielded += 1
-                        yield np.frombuffer(chunk_bytes, dtype=np.int16).copy()
-
-                logger.info(
-                    "RemoteOpenAITTS: iter_bytes loop done — %d bytes read, %d chunks yielded",
-                    raw_total,
-                    chunks_yielded,
-                )
+                logger.info("RemoteOpenAITTS: iter_bytes loop done — %d bytes read", raw_total)
 
         except httpx.HTTPError as exc:
             logger.error("RemoteOpenAITTS request failed: %s", exc)
             return
 
-        # Yield any trailing bytes, zero-padded to exactly CHUNK_SAMPLES for downstream alignment
-        if len(remainder) >= BYTES_PER_SAMPLE:
-            n_samples = len(remainder) // BYTES_PER_SAMPLE
-            usable = remainder[: n_samples * BYTES_PER_SAMPLE]
-            chunk = np.frombuffer(usable, dtype=np.int16).copy()
-            if len(chunk) < CHUNK_SAMPLES:
-                chunk = np.pad(chunk, (0, CHUNK_SAMPLES - len(chunk)))
-            yield chunk
+        usable = bytes(body[: (len(body) // BYTES_PER_SAMPLE) * BYTES_PER_SAMPLE])
+        samples = np.frombuffer(usable, dtype=np.int16)
+        if samples.size == 0:
+            return
+
+        # Resample from the endpoint's native rate to the 16 kHz pipeline rate.
+        # Done once over the whole clip to avoid per-chunk boundary artifacts.
+        if self.source_sample_rate != SAMPLE_RATE:
+            g = gcd(SAMPLE_RATE, self.source_sample_rate)
+            resampled = resample_poly(
+                samples.astype(np.float32), SAMPLE_RATE // g, self.source_sample_rate // g
+            )
+            samples = np.clip(np.round(resampled), -32768, 32767).astype(np.int16)
+
+        logger.info(
+            "RemoteOpenAITTS: resampled %d samples @ %d Hz → %d samples @ %d Hz (%.2fs audio)",
+            len(usable) // BYTES_PER_SAMPLE,
+            self.source_sample_rate,
+            samples.size,
+            SAMPLE_RATE,
+            samples.size / SAMPLE_RATE,
+        )
+
+        # Yield fixed CHUNK_SAMPLES chunks, zero-padding the last for downstream alignment.
+        for start in range(0, samples.size, CHUNK_SAMPLES):
+            chunk = samples[start : start + CHUNK_SAMPLES]
+            if chunk.size < CHUNK_SAMPLES:
+                chunk = np.pad(chunk, (0, CHUNK_SAMPLES - chunk.size))
+            yield chunk.copy()
 
     def cleanup(self) -> None:
         self._client.close()

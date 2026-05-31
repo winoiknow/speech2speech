@@ -30,6 +30,13 @@ class RemoteOpenAITTSHandlerArguments:
         default=60.0,
         metadata={"help": "HTTP timeout in seconds for TTS streaming requests. Default is 60."},
     )
+    tts_openai_speed: float = field(
+        default_factory=lambda: float(os.environ.get("TTS_OPENAI_SPEED", "1.0")),
+        metadata={
+            "help": "Speed factor sent to the TTS endpoint (1.0 = normal). Sent explicitly so the "
+            "server's DEFAULT_SPEED can't slow playback. Env: TTS_OPENAI_SPEED."
+        },
+    )
     tts_openai_source_sample_rate: int = field(
         default_factory=lambda: int(os.environ.get("TTS_OPENAI_SOURCE_SAMPLE_RATE", "16000")),
         metadata={

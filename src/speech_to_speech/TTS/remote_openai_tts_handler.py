@@ -51,6 +51,7 @@ class RemoteOpenAITTSHandler(BaseHandler[TTSIn, TTSOut]):
         model: str = "tts-1",
         timeout: float = 60.0,
         source_sample_rate: int = 16000,
+        speed: float = 1.0,
         gen_kwargs: dict | None = None,  # accepted for pipeline compatibility, unused
         cancel_scope: CancelScope | None = None,
     ) -> None:
@@ -59,6 +60,7 @@ class RemoteOpenAITTSHandler(BaseHandler[TTSIn, TTSOut]):
         self.voice = voice
         self.model = model
         self.source_sample_rate = source_sample_rate
+        self.speed = speed
         self.stream_endpoint = base_url.rstrip("/") + "/v1/audio/speech/stream"
         self.headers = {"Authorization": f"Bearer {api_key}"}
         self.timeout = timeout
@@ -87,6 +89,9 @@ class RemoteOpenAITTSHandler(BaseHandler[TTSIn, TTSOut]):
             "model": self.model,
             "input": text,
             "voice": self.voice,
+            # Send speed explicitly so we never inherit the endpoint's DEFAULT_SPEED
+            # (a sub-1.0 value there produced slow, stretched, low-pitched audio).
+            "speed": self.speed,
         }
         pipeline_start = perf_counter()
         first_chunk = True

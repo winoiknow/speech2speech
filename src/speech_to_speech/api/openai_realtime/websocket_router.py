@@ -21,6 +21,7 @@ from openai.types.realtime import (
 )
 
 from speech_to_speech.api.openai_realtime.service import RealtimeService, ServerEvent
+from speech_to_speech.debug import DEBUG_MODE
 from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.control import SESSION_END, PipelineControlMessage, is_control_message
 from speech_to_speech.pipeline.events import (
@@ -389,12 +390,16 @@ def create_app(
                         continue
 
                     if cancel_scope and cancel_scope.discarding:
-                        logger.info(
-                            "DROP audio chunk in send loop: cancel_scope.discarding=True "
-                            "(scope_gen=%s). Audio will NOT reach client until __RESPONSE_DONE__ "
-                            "clears the discard guard via response_done().",
-                            cancel_scope.generation,
-                        )
+                        # A barge-in mid-long-response leaves a big pre-rendered backlog that
+                        # drains here one chunk at a time; log per-chunk only under DEBUG_MODE
+                        # so production doesn't get ~1000 identical lines per interruption.
+                        if DEBUG_MODE:
+                            logger.info(
+                                "DROP audio chunk in send loop: cancel_scope.discarding=True "
+                                "(scope_gen=%s). Audio will NOT reach client until __RESPONSE_DONE__ "
+                                "clears the discard guard via response_done().",
+                                cancel_scope.generation,
+                            )
                         audio_play_deadline = None
                         continue
 

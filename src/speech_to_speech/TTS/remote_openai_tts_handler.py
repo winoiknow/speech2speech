@@ -16,6 +16,7 @@ from rich.console import Console
 from scipy.signal import resample_poly
 
 from speech_to_speech.baseHandler import BaseHandler
+from speech_to_speech.debug import DEBUG_MODE
 from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.handler_types import TTSIn, TTSOut
 from speech_to_speech.pipeline.messages import AUDIO_RESPONSE_DONE, EndOfResponse, TTSInput
@@ -117,12 +118,13 @@ class RemoteOpenAITTSHandler(BaseHandler[TTSIn, TTSOut]):
                         src_rate = int(hdr_rate)
                     except ValueError:
                         logger.warning("RemoteOpenAITTS: bad X-Sample-Rate header %r; using %d", hdr_rate, src_rate)
-                logger.info(
-                    "RemoteOpenAITTS: stream opened (gen=%s, scope_gen=%s, src_rate=%d Hz, entering iter_bytes loop)",
-                    gen,
-                    self.cancel_scope.generation if self.cancel_scope else None,
-                    src_rate,
-                )
+                if DEBUG_MODE:
+                    logger.info(
+                        "RemoteOpenAITTS: stream opened (gen=%s, scope_gen=%s, src_rate=%d Hz, entering iter_bytes loop)",
+                        gen,
+                        self.cancel_scope.generation if self.cancel_scope else None,
+                        src_rate,
+                    )
 
                 for raw in response.iter_bytes():
                     raw_total += len(raw)
@@ -138,20 +140,22 @@ class RemoteOpenAITTSHandler(BaseHandler[TTSIn, TTSOut]):
                         return
 
                     if first_chunk:
-                        logger.info(
-                            "RemoteOpenAITTS: time-to-first-byte %.3fs (first %d bytes, header=%r) "
-                            "— %r means WAV/RIFF container (NOT raw int16 PCM); frombuffer will "
-                            "mis-parse the 44-byte header as samples",
-                            perf_counter() - pipeline_start,
-                            len(raw),
-                            raw[:4],
-                            b"RIFF",
-                        )
+                        if DEBUG_MODE:
+                            logger.info(
+                                "RemoteOpenAITTS: time-to-first-byte %.3fs (first %d bytes, header=%r) "
+                                "— %r means WAV/RIFF container (NOT raw int16 PCM); frombuffer will "
+                                "mis-parse the 44-byte header as samples",
+                                perf_counter() - pipeline_start,
+                                len(raw),
+                                raw[:4],
+                                b"RIFF",
+                            )
                         first_chunk = False
 
                     body += raw
 
-                logger.info("RemoteOpenAITTS: iter_bytes loop done — %d bytes read", raw_total)
+                if DEBUG_MODE:
+                    logger.info("RemoteOpenAITTS: iter_bytes loop done — %d bytes read", raw_total)
 
         except httpx.HTTPError as exc:
             logger.error("RemoteOpenAITTS request failed: %s", exc)
@@ -169,15 +173,16 @@ class RemoteOpenAITTSHandler(BaseHandler[TTSIn, TTSOut]):
             resampled = resample_poly(samples.astype(np.float32), SAMPLE_RATE // g, src_rate // g)
             samples = np.clip(np.round(resampled), -32768, 32767).astype(np.int16)
 
-        logger.info(
-            "RemoteOpenAITTS: %d samples @ %d Hz → %d samples @ %d Hz (%.2fs audio, resample=%s)",
-            len(usable) // BYTES_PER_SAMPLE,
-            src_rate,
-            samples.size,
-            SAMPLE_RATE,
-            samples.size / SAMPLE_RATE,
-            src_rate != SAMPLE_RATE,
-        )
+        if DEBUG_MODE:
+            logger.info(
+                "RemoteOpenAITTS: %d samples @ %d Hz → %d samples @ %d Hz (%.2fs audio, resample=%s)",
+                len(usable) // BYTES_PER_SAMPLE,
+                src_rate,
+                samples.size,
+                SAMPLE_RATE,
+                samples.size / SAMPLE_RATE,
+                src_rate != SAMPLE_RATE,
+            )
 
         # Yield fixed CHUNK_SAMPLES chunks, zero-padding the last for downstream alignment.
         for start in range(0, samples.size, CHUNK_SAMPLES):

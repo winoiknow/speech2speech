@@ -12,6 +12,7 @@ import torch
 
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 from speech_to_speech.baseHandler import BaseHandler
+from speech_to_speech.debug import DEBUG_MODE
 from speech_to_speech.pipeline.events import SpeechStartedEvent, SpeechStoppedEvent
 from speech_to_speech.pipeline.handler_types import VADIn, VADOut
 from speech_to_speech.pipeline.messages import VADAudio
@@ -94,6 +95,13 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         # Throttled logging state (summary once per second)
         self._last_log_time = 0.0
         self._log_chunks = 0
+        # Diagnostic heartbeat: count EVERY chunk arriving at the VAD (before the
+        # should_listen gate) so we can tell, during a TTS response, whether the
+        # client is still streaming mic audio and whether listening is enabled.
+        # This distinguishes "no input reached us" (AVA gated/stopped forwarding)
+        # from "input arrived but should_listen was clear" (s2s-side gate bug).
+        self._hb_chunks_received = 0
+        self._hb_last_time = 0.0
         self._log_speech_starts = 0
         self._log_speech_ends = 0
         self._log_progressive_yields = 0
@@ -140,6 +148,24 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         if isinstance(audio_chunk, tuple):
             audio_chunk, runtime_config = audio_chunk
         self._apply_runtime_turn_detection(runtime_config)
+
+        # Heartbeat BEFORE the gate: every chunk that reaches the VAD is counted,
+        # regardless of should_listen. If chunks/s stays >0 during a TTS response,
+        # the client is still forwarding mic audio (barge-in input is arriving);
+        # if it drops to 0, the client gated it. should_listen tells us whether
+        # the VAD would even act on it. Gated behind DEBUG_MODE (off by default).
+        if DEBUG_MODE:
+            self._hb_chunks_received += 1
+            hb_now = time.time()
+            if hb_now - self._hb_last_time >= 1.0:
+                logger.info(
+                    "VAD heartbeat: %d chunks/s in | should_listen=%s | triggered=%s",
+                    self._hb_chunks_received,
+                    self.should_listen.is_set(),
+                    self.iterator.triggered,
+                )
+                self._hb_chunks_received = 0
+                self._hb_last_time = hb_now
 
         if not self.should_listen.is_set():
             return

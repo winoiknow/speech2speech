@@ -75,6 +75,16 @@ class RemoteOpenAISTTHandler(BaseHandler[STTIn, STTOut]):
         logger.info("RemoteOpenAISTTHandler ready → %s (model=%s)", self.endpoint, self.model)
 
     def process(self, vad_audio: STTIn) -> Iterator[STTOut]:
+        # The VAD emits the growing buffer in "progressive" mode (for live partials) and
+        # once in "final" mode at speech end. This is a remote HTTP endpoint, so a full
+        # transcription per progressive chunk means ~10 calls per utterance — and, worse,
+        # each would yield a final Transcription that the LLM treats as a new user turn
+        # (one utterance → ~10 replies, the runaway loop). Local incremental engines
+        # (parakeet) emit cheap PartialTranscriptions here; over HTTP we just skip
+        # progressive and transcribe only the final segment: one call, one turn.
+        if getattr(vad_audio, "mode", None) == "progressive":
+            return
+
         # vad_audio.audio is float32 at 16 kHz; convert to int16 then wrap in WAV container
         audio_float32: np.ndarray = vad_audio.audio
         audio_int16 = (audio_float32 * 32768).clip(-32768, 32767).astype(np.int16)

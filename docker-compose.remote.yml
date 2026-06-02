@@ -16,11 +16,21 @@ services:
       STT_OPENAI_MODEL: ${STT_OPENAI_MODEL:-Systran/faster-whisper-large-v3}
       STT_OPENAI_LANGUAGE: ${STT_OPENAI_LANGUAGE:-en}
 
-      # ── TTS (F5-TTS streaming /v1/audio/speech/stream) ─────────────────
+      # ── TTS source toggle: "openai-remote" (default, F5 /stream) or "elevenlabs" ──
+      TTS_SOURCE: ${TTS_SOURCE:-openai-remote}
+
+      # ── TTS: openai-remote (F5-TTS streaming /v1/audio/speech/stream) ──
       TTS_OPENAI_BASE_URL: ${TTS_OPENAI_BASE_URL:-http://host.docker.internal:8880}
       TTS_OPENAI_API_KEY: ${TTS_OPENAI_API_KEY:-sk-unused}
       TTS_OPENAI_VOICE: ${TTS_OPENAI_VOICE:-default}
       TTS_OPENAI_MODEL: ${TTS_OPENAI_MODEL:-tts-1}
+
+      # ── TTS: elevenlabs (used when TTS_SOURCE=elevenlabs; read from env) ──
+      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:-}
+      ELEVENLABS_VOICE_ID: ${ELEVENLABS_VOICE_ID:-}
+      ELEVENLABS_MODEL_ID: ${ELEVENLABS_MODEL_ID:-eleven_flash_v2_5}
+      # pcm_16000 (no resample, needs paid tier) or ulaw_8000 (free-tier friendly)
+      ELEVENLABS_OUTPUT_FORMAT: ${ELEVENLABS_OUTPUT_FORMAT:-pcm_16000}
 
       # ── LLM (Hermes /v1/responses or /v1/chat/completions) ─────────────
       RESPONSES_API_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:11434/v1}
@@ -32,13 +42,15 @@ services:
 
       # ── General ────────────────────────────────────────────────────────
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      # Re-enable verbose diagnostics (VAD heartbeat, drop/TTS timing logs)
+      DEBUG_MODE: ${DEBUG_MODE:-off}
     command:
       - "--mode"
       - "realtime"
       - "--stt"
       - "openai-remote"
       - "--tts"
-      - "openai-remote"
+      - "${TTS_SOURCE:-openai-remote}"
       - "--llm_backend"
       - "responses-api"
       - "--stt_openai_base_url"

@@ -42,10 +42,10 @@ class ModuleArguments:
             "help": "The LLM backend to use. Either 'transformers', 'mlx-lm', or 'responses-api'. Default is 'responses-api'."
         },
     )
-    tts: Optional[Literal["melo", "chatTTS", "facebookMMS", "pocket", "kokoro", "qwen3", "openai-remote"]] = field(
+    tts: Optional[Literal["melo", "chatTTS", "facebookMMS", "pocket", "kokoro", "qwen3", "openai-remote", "elevenlabs"]] = field(
         default="qwen3",
         metadata={
-            "help": "The TTS to use. Either 'chatTTS', 'facebookMMS', 'pocket', 'kokoro', 'qwen3', or 'openai-remote'. Default is 'qwen3'."
+            "help": "The TTS to use. Either 'chatTTS', 'facebookMMS', 'pocket', 'kokoro', 'qwen3', 'openai-remote', or 'elevenlabs'. Default is 'qwen3'."
         },
     )
     log_level: str = field(

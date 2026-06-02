@@ -11,7 +11,7 @@ A fork of [huggingface/speech-to-speech](https://github.com/huggingface/speech-t
 | Component | Original | This fork |
 |---|---|---|
 | STT | Loads Whisper / Parakeet / Paraformer locally | `--stt openai-remote` — HTTP POST to any OpenAI-compatible `/v1/audio/transcriptions` endpoint |
-| TTS | Loads Qwen3 / Pocket / Kokoro / ChatTTS locally | `--tts openai-remote` — streams raw 16 kHz int16 PCM from any `/v1/audio/speech/stream` endpoint |
+| TTS | Loads Qwen3 / Pocket / Kokoro / ChatTTS locally | `TTS_SOURCE` toggle: `openai-remote` streams raw 16 kHz int16 PCM from any `/v1/audio/speech/stream` endpoint (F5-TTS), or `elevenlabs` streams from ElevenLabs cloud TTS |
 | LLM | Local transformers or OpenAI Responses API | Unchanged — uses `--llm_backend responses-api` pointed at your Hermes / vLLM / compatible server |
 | Deployment | No Docker target for CPU-only remote mode | `Dockerfile.remote` + `docker-compose.remote.yml` — CPU-only, no CUDA, no model weights in image |
 
@@ -87,7 +87,16 @@ All options can be set via CLI flags or environment variables.  Copy `.env.sampl
 | `--stt_openai_model` | `STT_OPENAI_MODEL` | `Systran/faster-whisper-large-v3` | Model name sent in requests |
 | `--stt_openai_language` | `STT_OPENAI_LANGUAGE` | `en` | Language hint (ISO-639-1) |
 
-### TTS (`--tts openai-remote`)
+### TTS source toggle (`TTS_SOURCE`)
+
+Pick where speech is synthesized. In the Compose file `TTS_SOURCE` drives the `--tts` flag, so a single env var flips the source:
+
+| `TTS_SOURCE` | Handler | Use when |
+|---|---|---|
+| `openai-remote` *(default)* | `RemoteOpenAITTSHandler` → any `/v1/audio/speech/stream` endpoint (F5-TTS) | You run an on-prem / self-hosted TTS server |
+| `elevenlabs` | `ElevenLabsTTSHandler` → ElevenLabs cloud TTS | No on-site TTS server; you have an ElevenLabs subscription |
+
+#### TTS — `openai-remote` (F5-TTS `/v1/audio/speech/stream`)
 
 | CLI flag | Env var | Default | Description |
 |---|---|---|---|
@@ -95,6 +104,27 @@ All options can be set via CLI flags or environment variables.  Copy `.env.sampl
 | `--tts_openai_api_key` | `TTS_OPENAI_API_KEY` | `sk-unused` | Auth key |
 | `--tts_openai_voice` | `TTS_OPENAI_VOICE` | `default` | Voice name |
 | `--tts_openai_model` | `TTS_OPENAI_MODEL` | `tts-1` | Model name sent in TTS requests |
+
+#### TTS — `elevenlabs` (ElevenLabs cloud)
+
+Streams from `POST /v1/text-to-speech/{voice_id}/stream` over `httpx`, decodes to 16 kHz int16 PCM, and honors barge-in exactly like the F5 handler (early-aborts the upstream stream on cancellation). Args are read from the environment — no CLI flags needed; just set `TTS_SOURCE=elevenlabs` and the keys below.
+
+| Env var | Default | Description |
+|---|---|---|
+| `ELEVENLABS_API_KEY` | *(none)* | Your ElevenLabs API key (sent as `xi-api-key`) |
+| `ELEVENLABS_VOICE_ID` | *(none)* | Voice id to synthesize with |
+| `ELEVENLABS_MODEL_ID` | `eleven_flash_v2_5` | Model id — `eleven_flash_v2_5` is the lowest-latency choice; use whatever your plan includes |
+| `ELEVENLABS_OUTPUT_FORMAT` | `pcm_16000` | `pcm_<rate>` or `ulaw_8000` (see caveats) |
+| `ELEVENLABS_STABILITY` | `0.5` | `voice_settings.stability` (0–1) |
+| `ELEVENLABS_SIMILARITY_BOOST` | `0.75` | `voice_settings.similarity_boost` (0–1) |
+
+**Caveats — streaming output format vs. subscription tier:**
+
+- **`pcm_16000` is the cleanest path** — it matches the pipeline rate exactly, so no resampling is done. But **PCM output streaming requires a paid ElevenLabs tier** (Creator and above). On the free tier, requesting a `pcm_*` format will fail.
+- **On the free tier, use `ELEVENLABS_OUTPUT_FORMAT=ulaw_8000`.** It's accepted on all tiers; the handler decodes µ-law and upsamples 8 kHz → 16 kHz. Quality is telephone-grade (fine for the Asterisk/AudioSocket path, which is already 8 kHz-clocked).
+- Other `pcm_*` rates (`pcm_22050`, `pcm_24000`, `pcm_44100`) work too and are resampled to 16 kHz once over the whole clip.
+- **`mp3` formats are intentionally not supported** — they'd need a heavy decoder (ffmpeg); PCM/µ-law cover the realtime path.
+- **Latency / cost:** every assistant turn is a cloud round-trip billed against your ElevenLabs character quota. `eleven_flash_v2_5` keeps time-to-first-byte low; heavier models (e.g. `eleven_multilingual_v2`) sound better but add latency. The handler synthesizes a full sentence per call (it does not use ElevenLabs' websocket *input* streaming, since the pipeline hands it complete sentences).
 
 ### LLM (`--llm_backend responses-api`)
 
@@ -134,10 +164,13 @@ src/speech_to_speech/
     remote_openai_stt_handler.py     ← new: RemoteOpenAISTTHandler
   TTS/
     remote_openai_tts_handler.py     ← new: RemoteOpenAITTSHandler
+    elevenlabs_tts_handler.py        ← new: ElevenLabsTTSHandler
   arguments_classes/
     remote_openai_stt_arguments.py   ← new: CLI args for STT handler
     remote_openai_tts_arguments.py   ← new: CLI args for TTS handler
-    module_arguments.py              ← modified: added "openai-remote" to stt/tts Literals
+    elevenlabs_tts_arguments.py      ← new: env-backed args for ElevenLabs handler
+    module_arguments.py              ← modified: added "openai-remote"/"elevenlabs" to tts Literal
+  debug.py                           ← new: DEBUG_MODE flag for verbose diagnostics
   s2s_pipeline.py                    ← modified: handler dispatch, registration
 
 Dockerfile.remote                    ← new: CPU-only Docker image

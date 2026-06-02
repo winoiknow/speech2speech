@@ -43,6 +43,7 @@ from speech_to_speech.arguments_classes.paraformer_stt_arguments import Paraform
 from speech_to_speech.arguments_classes.parakeet_tdt_arguments import (
     ParakeetTDTSTTHandlerArguments,
 )
+from speech_to_speech.arguments_classes.elevenlabs_tts_arguments import ElevenLabsTTSHandlerArguments
 from speech_to_speech.arguments_classes.pocket_tts_arguments import PocketTTSHandlerArguments
 from speech_to_speech.arguments_classes.qwen3_tts_arguments import Qwen3TTSHandlerArguments
 from speech_to_speech.arguments_classes.remote_openai_stt_arguments import RemoteOpenAISTTHandlerArguments
@@ -114,6 +115,7 @@ class ParsedArguments:
     qwen3_tts_handler_kwargs: Qwen3TTSHandlerArguments
     remote_openai_stt_handler_kwargs: RemoteOpenAISTTHandlerArguments
     remote_openai_tts_handler_kwargs: RemoteOpenAITTSHandlerArguments
+    elevenlabs_tts_handler_kwargs: ElevenLabsTTSHandlerArguments
 
 
 def rename_args(args: Any, prefix: str) -> None:
@@ -169,6 +171,7 @@ def parse_arguments() -> ParsedArguments:
             Qwen3TTSHandlerArguments,
             RemoteOpenAISTTHandlerArguments,
             RemoteOpenAITTSHandlerArguments,
+            ElevenLabsTTSHandlerArguments,
         )
     )
 
@@ -203,6 +206,7 @@ def parse_arguments() -> ParsedArguments:
         qwen3_tts_handler_kwargs=by_type[Qwen3TTSHandlerArguments],
         remote_openai_stt_handler_kwargs=by_type[RemoteOpenAISTTHandlerArguments],
         remote_openai_tts_handler_kwargs=by_type[RemoteOpenAITTSHandlerArguments],
+        elevenlabs_tts_handler_kwargs=by_type[ElevenLabsTTSHandlerArguments],
     )
 
 
@@ -299,6 +303,7 @@ def prepare_all_args(
     qwen3_tts_handler_kwargs: Qwen3TTSHandlerArguments,
     remote_openai_stt_handler_kwargs: RemoteOpenAISTTHandlerArguments,
     remote_openai_tts_handler_kwargs: RemoteOpenAITTSHandlerArguments,
+    elevenlabs_tts_handler_kwargs: ElevenLabsTTSHandlerArguments,
 ) -> None:
     prepare_module_args(
         module_kwargs,
@@ -316,6 +321,7 @@ def prepare_all_args(
         qwen3_tts_handler_kwargs,
         remote_openai_stt_handler_kwargs,
         remote_openai_tts_handler_kwargs,
+        elevenlabs_tts_handler_kwargs,
     )
 
     rename_args(whisper_stt_handler_kwargs, "stt")
@@ -332,6 +338,7 @@ def prepare_all_args(
     rename_args(qwen3_tts_handler_kwargs, "qwen3_tts")
     rename_args(remote_openai_stt_handler_kwargs, "stt_openai")
     rename_args(remote_openai_tts_handler_kwargs, "tts_openai")
+    rename_args(elevenlabs_tts_handler_kwargs, "tts_elevenlabs")
 
 
 def initialize_queues_and_events() -> dict[str, Any]:
@@ -371,6 +378,7 @@ def build_pipeline(
     qwen3_tts_handler_kwargs: Qwen3TTSHandlerArguments,
     remote_openai_stt_handler_kwargs: RemoteOpenAISTTHandlerArguments,
     remote_openai_tts_handler_kwargs: RemoteOpenAITTSHandlerArguments,
+    elevenlabs_tts_handler_kwargs: ElevenLabsTTSHandlerArguments,
     queues_and_events: dict[str, Any],
 ) -> ThreadManager:
     stop_event = queues_and_events["stop_event"]
@@ -429,6 +437,7 @@ def build_pipeline(
             chat_tts_handler_kwargs,
             facebook_mms_tts_handler_kwargs,
             remote_openai_tts_handler_kwargs,
+            elevenlabs_tts_handler_kwargs,
         ):
             vars(kw)["cancel_scope"] = cancel_scope
 
@@ -562,6 +571,7 @@ def build_pipeline(
         kokoro_tts_handler_kwargs,
         qwen3_tts_handler_kwargs,
         remote_openai_tts_handler_kwargs,
+        elevenlabs_tts_handler_kwargs,
     )
 
     # Build the handler chain
@@ -718,6 +728,7 @@ def get_tts_handler(
     kokoro_tts_handler_kwargs: KokoroTTSHandlerArguments,
     qwen3_tts_handler_kwargs: Qwen3TTSHandlerArguments,
     remote_openai_tts_handler_kwargs: RemoteOpenAITTSHandlerArguments | None = None,
+    elevenlabs_tts_handler_kwargs: ElevenLabsTTSHandlerArguments | None = None,
 ) -> BaseHandler[TTSIn, TTSOut]:
     if module_kwargs.tts == "chatTTS":
         try:
@@ -790,8 +801,20 @@ def get_tts_handler(
             setup_args=(should_listen,),
             setup_kwargs=vars(remote_openai_tts_handler_kwargs),
         )
+    elif module_kwargs.tts == "elevenlabs":
+        from speech_to_speech.TTS.elevenlabs_tts_handler import ElevenLabsTTSHandler
+
+        return ElevenLabsTTSHandler(
+            stop_event,
+            queue_in=lm_response_queue,
+            queue_out=send_audio_chunks_queue,
+            setup_args=(should_listen,),
+            setup_kwargs=vars(elevenlabs_tts_handler_kwargs),
+        )
     else:
-        raise ValueError("The TTS should be either chatTTS, facebookMMS, pocket, kokoro, qwen3, or openai-remote")
+        raise ValueError(
+            "The TTS should be either chatTTS, facebookMMS, pocket, kokoro, qwen3, openai-remote, or elevenlabs"
+        )
 
 
 def main() -> None:
@@ -815,6 +838,7 @@ def main() -> None:
         args.qwen3_tts_handler_kwargs,
         args.remote_openai_stt_handler_kwargs,
         args.remote_openai_tts_handler_kwargs,
+        args.elevenlabs_tts_handler_kwargs,
     )
 
     queues_and_events = initialize_queues_and_events()
@@ -839,6 +863,7 @@ def main() -> None:
         args.qwen3_tts_handler_kwargs,
         args.remote_openai_stt_handler_kwargs,
         args.remote_openai_tts_handler_kwargs,
+        args.elevenlabs_tts_handler_kwargs,
         queues_and_events,
     )
 

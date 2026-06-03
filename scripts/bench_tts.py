@@ -7,6 +7,8 @@
 # time-to-first-audio-byte (TTFB); total time and real-time-factor (RTF) are
 # reported too. Run this ON THE SERVER that can reach both endpoints.
 #
+# Standard library only (urllib) — no pip install needed; runs with any python3.
+#
 # Reads the same env vars as the handlers:
 #   F5:         TTS_OPENAI_BASE_URL, TTS_OPENAI_API_KEY, TTS_OPENAI_VOICE, TTS_OPENAI_MODEL, TTS_OPENAI_SPEED
 #   ElevenLabs: ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID, ELEVENLABS_MODEL_ID,
@@ -18,12 +20,13 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import statistics
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
-
-import httpx
 
 # Representative payloads: a short greeting, one sentence, and a 3-sentence batch
 # (the current stream_batch_sentences=3 unit) so you can see how TTFB scales with
@@ -55,25 +58,44 @@ class Result:
         return self.total / self.audio_s if self.audio_s else float("nan")
 
 
-def _bench_stream(method: str, url: str, *, headers: dict, json_body: dict,
+def _read_some(resp, n: int) -> bytes:
+    """Return whatever bytes are available in one underlying read (for true TTFB).
+    read1() avoids blocking until a full n-byte buffer fills."""
+    try:
+        return resp.read1(n)  # http.client.HTTPResponse supports read1
+    except AttributeError:
+        return resp.read(n)
+
+
+def _bench_stream(url: str, *, headers: dict, json_body: dict,
                   rate: int, bytes_per_sample: float) -> Result:
     """POST a streaming TTS request; measure TTFB and total. rate/bytes_per_sample
     convert received bytes → audio seconds (pcm16=2 B/sample; ulaw=1 B/sample)."""
+    data = json.dumps(json_body).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST",
+                                 headers={**headers, "Content-Type": "application/json"})
     t0 = time.perf_counter()
     ttfb = None
     n = 0
-    with httpx.Client(timeout=60.0) as client:
-        with client.stream(method, url, headers=headers, json=json_body) as r:
-            r.raise_for_status()
-            hdr_rate = r.headers.get("X-Sample-Rate")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            hdr_rate = resp.headers.get("X-Sample-Rate")
             if hdr_rate:
                 rate = int(hdr_rate)
-            for chunk in r.iter_bytes():
+            while True:
+                chunk = _read_some(resp, 65536)
                 if not chunk:
-                    continue
+                    break
                 if ttfb is None:
                     ttfb = time.perf_counter() - t0
                 n += len(chunk)
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", "replace")[:300]
+        except Exception:
+            pass
+        raise RuntimeError(f"HTTP {e.code}: {body}") from None
     total = time.perf_counter() - t0
     audio_s = (n / bytes_per_sample) / rate if rate else 0.0
     return Result(ttfb=ttfb or total, total=total, audio_s=audio_s, n_bytes=n)
@@ -82,9 +104,8 @@ def _bench_stream(method: str, url: str, *, headers: dict, json_body: dict,
 def bench_f5(text: str) -> Result:
     base = os.environ.get("TTS_OPENAI_BASE_URL", "http://localhost:8880").rstrip("/")
     return _bench_stream(
-        "POST", base + "/v1/audio/speech/stream",
-        headers={"Authorization": f"Bearer {os.environ.get('TTS_OPENAI_API_KEY','sk-unused')}",
-                 "Content-Type": "application/json"},
+        base + "/v1/audio/speech/stream",
+        headers={"Authorization": f"Bearer {os.environ.get('TTS_OPENAI_API_KEY','sk-unused')}"},
         json_body={"model": os.environ.get("TTS_OPENAI_MODEL", "tts-1"),
                    "input": text,
                    "voice": os.environ.get("TTS_OPENAI_VOICE", "default"),
@@ -105,9 +126,8 @@ def bench_elevenlabs(text: str) -> Result:
     else:
         raise SystemExit(f"unsupported ELEVENLABS_OUTPUT_FORMAT={fmt}")
     return _bench_stream(
-        "POST", f"{base}/v1/text-to-speech/{voice}/stream?output_format={fmt}",
-        headers={"xi-api-key": os.environ["ELEVENLABS_API_KEY"],
-                 "Content-Type": "application/json"},
+        f"{base}/v1/text-to-speech/{voice}/stream?output_format={fmt}",
+        headers={"xi-api-key": os.environ["ELEVENLABS_API_KEY"]},
         json_body={"text": text,
                    "model_id": os.environ.get("ELEVENLABS_MODEL_ID", "eleven_flash_v2_5"),
                    "voice_settings": {"stability": float(os.environ.get("ELEVENLABS_STABILITY", "0.5")),

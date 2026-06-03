@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass, field
 
 
@@ -24,10 +25,12 @@ class LanguageModelBaseArguments:
         metadata={"help": "Number of interactions assistant-user to keep for the chat."},
     )
     stream_batch_sentences: int = field(
-        default=3,
+        default_factory=lambda: int(os.environ.get("STREAM_BATCH_SENTENCES", "3")),
         metadata={
             "help": "Number of sentences to accumulate before yielding a batch during streaming. "
-            "Set to 1 for sentence-by-sentence streaming. Default is 3."
+            "Lower = lower time-to-first-audio (TTS starts sooner) at the cost of more, shorter "
+            "TTS calls; set to 1 for sentence-by-sentence streaming. Env: STREAM_BATCH_SENTENCES. "
+            "Default is 3."
         },
     )
     enable_lang_prompt: bool = field(

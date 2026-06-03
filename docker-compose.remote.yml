@@ -36,6 +36,9 @@ services:
       RESPONSES_API_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:11434/v1}
       RESPONSES_API_API_KEY: ${LLM_API_KEY:-sk-unused}
       LLM_MODEL: ${LLM_MODEL:-hermes-agent}
+      # Sentences accumulated before the first TTS batch fires. Lower = lower
+      # time-to-first-audio. A/B this (1 vs 2 vs 3) for the latency test.
+      STREAM_BATCH_SENTENCES: ${STREAM_BATCH_SENTENCES:-3}
 
       # ── Server authentication ──────────────────────────────────────────
       SERVER_API_KEY: ${SERVER_API_KEY:-}

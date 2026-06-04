@@ -138,6 +138,8 @@ class ElevenLabsTTSHandler(BaseHandler[TTSIn, TTSOut]):
                 json=payload,
             ) as response:
                 response.raise_for_status()
+                if DEBUG_MODE:
+                    logger.info("ElevenLabsTTS: stream opened (gen=%s, format=%s)", gen, self.output_format)
                 for raw in response.iter_bytes():
                     raw_total += len(raw)
                     # Abort promptly on barge-in: closing the context manager tears

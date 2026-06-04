@@ -11,7 +11,7 @@ A fork of [huggingface/speech-to-speech](https://github.com/huggingface/speech-t
 | Component | Original | This fork |
 |---|---|---|
 | STT | Loads Whisper / Parakeet / Paraformer locally | `--stt openai-remote` — HTTP POST to any OpenAI-compatible `/v1/audio/transcriptions` endpoint |
-| TTS | Loads Qwen3 / Pocket / Kokoro / ChatTTS locally | `TTS_SOURCE` toggle: `openai-remote` streams raw 16 kHz int16 PCM from any `/v1/audio/speech/stream` endpoint (F5-TTS), or `elevenlabs` streams from ElevenLabs cloud TTS |
+| TTS | Loads Qwen3 / Pocket / Kokoro / ChatTTS locally | `TTS_SOURCE` toggle: `openai-remote` (F5-TTS `/v1/audio/speech/stream`), `elevenlabs` (cloud), or `minimax` (T2A v2 WebSocket, streaming pcm@16k, voice cloning) |
 | LLM | Local transformers or OpenAI Responses API | Unchanged — uses `--llm_backend responses-api` pointed at your Hermes / vLLM / compatible server |
 | Deployment | No Docker target for CPU-only remote mode | `Dockerfile.remote` + `docker-compose.remote.yml` — CPU-only, no CUDA, no model weights in image |
 
@@ -95,6 +95,7 @@ Pick where speech is synthesized. In the Compose file `TTS_SOURCE` drives the `-
 |---|---|---|
 | `openai-remote` *(default)* | `RemoteOpenAITTSHandler` → any `/v1/audio/speech/stream` endpoint (F5-TTS) | You run an on-prem / self-hosted TTS server |
 | `elevenlabs` | `ElevenLabsTTSHandler` → ElevenLabs cloud TTS | No on-site TTS server; you have an ElevenLabs subscription |
+| `minimax` | `MiniMaxTTSHandler` → MiniMax T2A v2 WebSocket | You need **voice cloning** with low latency (~0.5 s TTFB, streaming pcm@16k) |
 
 #### TTS — `openai-remote` (F5-TTS `/v1/audio/speech/stream`)
 
@@ -125,6 +126,25 @@ Streams from `POST /v1/text-to-speech/{voice_id}/stream` over `httpx`, decodes t
 - Other `pcm_*` rates (`pcm_22050`, `pcm_24000`, `pcm_44100`) work too and are resampled to 16 kHz once over the whole clip.
 - **`mp3` formats are intentionally not supported** — they'd need a heavy decoder (ffmpeg); PCM/µ-law cover the realtime path.
 - **Latency / cost:** every assistant turn is a cloud round-trip billed against your ElevenLabs character quota. `eleven_flash_v2_5` keeps time-to-first-byte low; heavier models (e.g. `eleven_multilingual_v2`) sound better but add latency. The handler synthesizes a full sentence per call (it does not use ElevenLabs' websocket *input* streaming, since the pipeline hands it complete sentences).
+
+#### TTS — `minimax` (MiniMax T2A v2 WebSocket, voice cloning)
+
+Streams over MiniMax's T2A v2 **WebSocket** (stdlib client, no extra dependency), requesting `pcm` at 16 kHz so the audio drops straight onto the pipeline rate (no resample). It is **streaming-first** — each frame is yielded as it arrives (never buffered) — which is what keeps time-to-first-audio ~0.5 s (cold) / ~0.27 s (warm). Barge-in closes the socket immediately, like the other handlers. Args are env-backed; set `TTS_SOURCE=minimax` and the keys below.
+
+| Env var | Default | Description |
+|---|---|---|
+| `MINIMAX_API_KEY` | *(none)* | MiniMax API key (sent as Bearer token) |
+| `MINIMAX_VOICE_ID` | *(none)* | Cloned voice id, or a system voice (e.g. `English_expressive_narrator`) |
+| `MINIMAX_MODEL` | `speech-02-turbo` | Model id (`speech-02-turbo` is low-latency) |
+| `MINIMAX_WS_URL` | `wss://api.minimax.io/ws/v1/t2a_v2` | Use the `api.minimaxi.com` host for the mainland endpoint |
+| `MINIMAX_GROUP_ID` | *(none)* | Optional; appended as `?GroupId=…` if your account requires it |
+| `MINIMAX_SPEED` | `1.0` | `voice_setting.speed` |
+
+**Notes:**
+
+- **The WebSocket path requires a paid MiniMax account** (the free tier rejects the WS handshake). Voice cloning is a paid feature; a **system voice** works for testing the integration before committing to a clone.
+- **Why MiniMax here:** it's the low-latency option that *also* supports voice cloning — `pcm_16000` over WS gives ElevenLabs-class TTFB (measured ~0.27 s warm) with a custom voice, where on-prem F5 buffers to ~3–9 s. See `scripts/probe_minimax.py` to measure TTFB from your network before integrating.
+- **v1 connects per utterance** (~0.5 s cold TTFB, includes the WS handshake). A warm persistent connection (~0.27 s) is a planned optimization.
 
 ### LLM (`--llm_backend responses-api`)
 

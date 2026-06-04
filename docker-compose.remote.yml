@@ -32,6 +32,13 @@ services:
       # pcm_16000 (no resample, needs paid tier) or ulaw_8000 (free-tier friendly)
       ELEVENLABS_OUTPUT_FORMAT: ${ELEVENLABS_OUTPUT_FORMAT:-pcm_16000}
 
+      # ── TTS: minimax (used when TTS_SOURCE=minimax; WebSocket, pcm@16k, voice clone) ──
+      MINIMAX_API_KEY: ${MINIMAX_API_KEY:-}
+      MINIMAX_VOICE_ID: ${MINIMAX_VOICE_ID:-}
+      MINIMAX_MODEL: ${MINIMAX_MODEL:-speech-02-turbo}
+      MINIMAX_WS_URL: ${MINIMAX_WS_URL:-wss://api.minimax.io/ws/v1/t2a_v2}
+      MINIMAX_GROUP_ID: ${MINIMAX_GROUP_ID:-}
+
       # ── LLM (Hermes /v1/responses or /v1/chat/completions) ─────────────
       RESPONSES_API_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:11434/v1}
       RESPONSES_API_API_KEY: ${LLM_API_KEY:-sk-unused}

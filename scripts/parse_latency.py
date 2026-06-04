@@ -58,11 +58,15 @@ def parse(path: str):
                 m = re.search(r"time-to-first-byte\s*([\d.]+)s", line)
                 if m:
                     cur["ttfb_s"] = float(m.group(1))
-            # Only accept the first-audio marker once this turn's TTS stream has
-            # opened, so a prior response still draining can't mis-pair (which
-            # would show up as negative synth time).
+            # First-audio marker. Streaming handlers (MiniMax) emit "first audio
+            # chunk" at the true first frame; buffering handlers (F5/ElevenLabs)
+            # have no progressive marker, so "iter_bytes loop done"/"stream done"
+            # (end of the buffered clip) is the closest proxy. Whichever appears
+            # first wins. Gated on t_stream_open so a prior response still draining
+            # can't mis-pair (which would show up as negative synth time).
             if (cur["t_first_audio"] is None and cur["t_stream_open"] is not None
-                    and ("iter_bytes loop done" in line or "stream done" in line)):
+                    and ("first audio chunk" in line
+                         or "iter_bytes loop done" in line or "stream done" in line)):
                 cur["t_first_audio"] = t
     if cur:
         turns.append(cur)

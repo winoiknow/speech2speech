@@ -66,21 +66,74 @@ Time from "Speech ended" to the first audio delta = the number we're minimizing.
 
 ### 4a. TTS TTFB (from `bench_tts.py`, median of 5)
 
-| Engine / model | greeting | one sentence | three sentences |
-|---|---|---|---|
-| F5 (`openai-remote`) | ___ | ___ | ___ |
-| ElevenLabs `eleven_flash_v2_5` | ___ | ___ | ___ |
-| ElevenLabs `eleven_turbo_v2_5` | ___ | ___ | ___ |
+TTFB = time to first audio byte (the number that drives perceived latency).
+iters=5 (median shown)
+
+=== openai-remote / F5 ===
+text                             TTFB(s)  total(s)  audio(s)    RTF
+greeting (6 words)                 2.346     2.346      2.10   1.18
+one sentence (18 words)            3.058     3.058      6.52   0.47
+three sentences (~45 words)        3.134     8.712     16.52   0.53
+
+=== elevenlabs ===
+text                             TTFB(s)  total(s)  audio(s)    RTF
+greeting (6 words)                 0.261     0.342      1.81   0.19
+one sentence (18 words)            0.266     0.436      5.43   0.08
+three sentences (~45 words)        0.276     0.752     15.05   0.05
 
 ### 4b. Live first-audio by batch size (one fixed test utterance)
 
-| `STREAM_BATCH_SENTENCES` | TTS engine | Speech-ended → first audio | notes (choppiness?) |
-|---|---|---|---|
-| 3 | F5 | ___ | baseline |
-| 2 | F5 | ___ | |
-| 1 | F5 | ___ | |
-| 1 | ElevenLabs | ___ | |
+OpenAI-Remote F5 Endpoint
 
+Batch 3
+turn spch→1st audio spch→TTS-open  LLM(s)  TTFB(s)  synth(s)
+   1         19.653        11.639   5.712    4.002     8.014
+----------------------------------------------------------------
+median speech→first-audio : 19.653 s   (n=1)
+median speech→TTS-open    : 11.639 s   (= STT + LLM first batch + queueing)
+
+Batch 2
+turn spch→1st audio spch→TTS-open  LLM(s)  TTFB(s)  synth(s)
+   1         15.603         9.310   5.078    2.200     6.293
+   2          9.617         7.551   4.605    2.138     2.066
+   3         10.572         8.162   4.668    2.063     2.410
+----------------------------------------------------------------
+median speech→first-audio : 10.572 s   (n=3)
+median speech→TTS-open    : 8.162 s   (= STT + LLM first batch + queueing)
+
+Batch 1
+turn spch→1st audio spch→TTS-open  LLM(s)  TTFB(s)  synth(s)
+   1          9.854         9.854   5.621    2.432     0.000
+   2         10.469        10.469   4.931    2.508     0.000
+----------------------------------------------------------------
+median speech→first-audio : 10.162 s   (n=2)
+median speech→TTS-open    : 10.162 s   (= STT + LLM first batch + queueing)
+
+
+ElevenLabs
+
+Batch 3
+turn spch→1st audio spch→TTS-open  LLM(s)  TTFB(s)  synth(s)
+   1            —             —     5.656    0.282       —  
+----------------------------------------------------------------
+Batch 2
+turn spch→1st audio spch→TTS-open  LLM(s)  TTFB(s)  synth(s)
+   1            —             —     5.670    0.409       —  
+   2            —             —     8.563    0.247       —  
+   3            —             —     5.695    0.274       —  
+   4            —             —     6.142    0.262       —  
+   5            —             —     5.060    0.274       —  
+   6            —             —     5.813    0.291       —  
+   7            —             —     3.809    0.264       —  
+   8            —             —     3.182    0.261       —  
+----------------------------------------------------------------
+
+Minimax Websocket 
+
+text                            connect  ttfb_cold  ttfb_warm    total   audio
+greeting (6 words)                0.227      0.520      0.257    0.779    2.11
+one sentence (18 words)           0.202      0.513      0.270    0.886    4.88
+three sentences (~45 words)       0.198      0.512      0.277    1.308   13.45
 ---
 
 ## 5. Lever catalog (ranked; revisit after §4 numbers)

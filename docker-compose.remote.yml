@@ -54,6 +54,9 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-info}
       # Re-enable verbose diagnostics (VAD heartbeat, drop/TTS timing logs)
       DEBUG_MODE: ${DEBUG_MODE:-off}
+      # Acoustic echo cancellation on the input path (off by default)
+      AEC_ENABLED: ${AEC_ENABLED:-0}
+      AEC_FILTER_LENGTH_MS: ${AEC_FILTER_LENGTH_MS:-250}
     command:
       - "--mode"
       - "realtime"

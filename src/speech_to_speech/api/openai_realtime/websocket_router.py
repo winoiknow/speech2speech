@@ -21,6 +21,7 @@ from openai.types.realtime import (
 )
 
 from speech_to_speech.api.openai_realtime.service import RealtimeService, ServerEvent
+from speech_to_speech.audio.echo_canceller import EchoCanceller
 from speech_to_speech.debug import DEBUG_MODE
 from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.control import SESSION_END, PipelineControlMessage, is_control_message
@@ -64,6 +65,12 @@ RESPONSE_DONE_TAIL_S = int(os.getenv("S2S_RESPONSE_DONE_TAIL_MS", "400")) / 1000
 TTS_DUMP_DIR = os.getenv("S2S_TTS_DUMP_DIR") or None
 # Sample rate of the dumped WAV — the negotiated client output rate (GA pcm = 24000).
 TTS_DUMP_RATE = int(os.getenv("S2S_TTS_DUMP_RATE", "24000"))
+# Acoustic echo cancellation on the input path: subtract the agent's own TTS
+# (far-end) from the caller's mic (near-end) before the VAD sees it, so the VAD
+# stops tripping on echo. Off by default. AEC_FILTER_LENGTH_MS should cover the
+# echo round-trip delay (small on LAN/browser; larger with a client jitter buffer).
+AEC_ENABLED = os.getenv("AEC_ENABLED", "0").lower() in ("1", "true", "on", "yes")
+AEC_FILTER_LENGTH_MS = int(os.getenv("AEC_FILTER_LENGTH_MS", "250"))
 
 
 async def _send_event(ws: WebSocket, event: ServerEvent) -> None:
@@ -97,6 +104,13 @@ def create_app(
     stop_event: ThreadingEvent,
     server_api_key: Optional[str] = None,
 ) -> FastAPI:
+
+    # Shared by the receive loop (near-end mic) and the send loop (far-end TTS).
+    echo_canceller = EchoCanceller(
+        sample_rate=PIPELINE_SAMPLE_RATE,
+        filter_length_ms=AEC_FILTER_LENGTH_MS,
+        enabled=AEC_ENABLED,
+    )
 
     def _flush_queue(q: Queue[QItem], *, preserve: Callable[[QItem], bool] | None = None) -> None:
         """Drain a queue, optionally preserving items matching *preserve*.
@@ -162,6 +176,7 @@ def create_app(
     @app.websocket("/v1/realtime")
     async def realtime_endpoint(ws: WebSocket) -> None:
         await ws.accept()
+        echo_canceller.reset()  # fresh far-end buffer for a new call
 
         if server_api_key:
             auth_header = ws.headers.get("authorization", "")
@@ -213,7 +228,8 @@ def create_app(
                     chunks = service.handle_audio_append(session_id, event)
                     rt_cfg = service._state(session_id).runtime_config
                     for chunk in chunks:
-                        input_queue.put((chunk, rt_cfg))
+                        # Cancel the agent's echo (far-end) out of the mic before the VAD.
+                        input_queue.put((echo_canceller.process(chunk), rt_cfg))
 
                 elif isinstance(event, InputAudioBufferCommitEvent):
                     err = service.handle_audio_commit(session_id)
@@ -439,6 +455,11 @@ def create_app(
                                 for ev in out_events:
                                     if getattr(ev, "type", "") == "response.output_audio.delta":
                                         dump_pcm += base64.b64decode(ev.delta)
+
+                    # Far-end reference for AEC: the 16 kHz pipeline PCM, fed as it is
+                    # sent (≈ when it plays), so the canceller can subtract its echo
+                    # from the inbound mic.
+                    echo_canceller.add_far_end(bytes(audio_batch))
 
                     # Pace to wall-clock: hold the next dequeue (and the trailing
                     # __RESPONSE_DONE__) until this batch would have finished playing,

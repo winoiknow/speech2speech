@@ -161,16 +161,17 @@ class EchoCanceller:
         if self.backend == "aec3":
             if not self._ensure_aec3():
                 return
+            # Buffer only — do NOT feed process_render here. TTS arrives in bursts
+            # (e.g. 1.6 s of audio in ~0.5 s wall-time), seconds ahead of when the
+            # client actually plays it and the echo reaches the mic. AEC3's render
+            # buffer is bounded and expects render fed ~one frame per capture tick,
+            # so the far-end is released in lockstep with the near-end in process()
+            # (paced by the realtime mic clock). Cap so a cancelled/stale burst
+            # can't grow unbounded (~2 s).
             self._far_buf += pcm_int16
-            n = (len(self._far_buf) // self._fb) * self._fb
-            if n:
-                try:
-                    self._aec3.process_render(bytes(self._far_buf[:n]))
-                except Exception:
-                    pass
-                del self._far_buf[:n]
-                if DEBUG_MODE:
-                    self._dbg_far += n // self._fb
+            cap = self.sample_rate * BYTES_PER_SAMPLE * 2
+            if len(self._far_buf) > cap:
+                del self._far_buf[: len(self._far_buf) - cap]
         else:
             self._far += pcm_int16
             if len(self._far) > self._far_cap:
@@ -186,15 +187,25 @@ class EchoCanceller:
         if not self._ensure_aec3():
             return near
         self._near_buf += near
-        n = (len(self._near_buf) // self._fb) * self._fb
-        if n:
-            frames = bytes(self._near_buf[:n]); del self._near_buf[:n]
+        silence = b"\x00" * self._fb
+        # Lockstep: one render frame per capture frame, paced by the realtime mic
+        # clock. The far-end leads the acoustic echo by the (bounded, ~constant)
+        # playback+network delay, which AEC3's delay estimator aligns internally.
+        while len(self._near_buf) >= self._fb:
+            nframe = bytes(self._near_buf[:self._fb]); del self._near_buf[:self._fb]
+            if len(self._far_buf) >= self._fb:
+                rframe = bytes(self._far_buf[:self._fb]); del self._far_buf[:self._fb]
+                if DEBUG_MODE:
+                    self._dbg_far += 1
+            else:
+                rframe = silence
             try:
-                self._clean_buf += self._aec3.process_capture(frames)
+                self._aec3.process_render(rframe)
+                self._clean_buf += self._aec3.process_capture(nframe)
             except Exception:
-                self._clean_buf += frames  # fail-safe: pass through
+                self._clean_buf += nframe  # fail-safe: pass through
             if DEBUG_MODE:
-                self._dbg_tot += n // self._fb
+                self._dbg_tot += 1
         want = len(near)
         if len(self._clean_buf) >= want:
             out = bytes(self._clean_buf[:want]); del self._clean_buf[:want]
@@ -234,6 +245,13 @@ class EchoCanceller:
             self._dbg_tot += total_frames
             self._diag(near, result)
         return result
+
+    def flush_far(self) -> None:
+        """Drop queued far-end (call on barge-in cancel: the client stops playing
+        the queued TTS, so feeding it as render would make AEC3 expect echo that
+        never arrives and subtract it from real user speech)."""
+        self._far.clear()
+        self._far_buf.clear()
 
     def reset(self) -> None:
         """Clear buffers (e.g. on a new session). Backend filter state is kept."""

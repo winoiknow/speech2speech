@@ -326,6 +326,7 @@ def create_app(
                             if active_cfg is None or active_cfg.interrupt_response_enabled:
                                 if cancel_scope:
                                     cancel_scope.cancel()
+                                echo_canceller.flush_far()  # queued TTS won't be played → don't feed it as render
                                 _flush_queue(output_queue, preserve=_keep_audio_sentinel)
                                 _flush_queue(text_output_queue, preserve=_keep_user_text_event)
                                 if response_playing and response_playing.is_set():

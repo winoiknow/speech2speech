@@ -25,7 +25,15 @@ impl Aec3 {
     fn new(sample_rate: u32) -> PyResult<Self> {
         let fmt = AudioFormat::ten_ms(sample_rate, 1);
         let frame = fmt.sample_count();
+        // The linear pipeline's default chain is high-pass -> AEC3 -> noise
+        // suppression -> AGC2. AGC2 auto-gains the post-AEC residual back up to a
+        // target loudness, which re-inflates the very echo tail / room noise the
+        // VAD must ignore (observed: out_rms 25-58 from in_rms 4-8, tracking
+        // far%). We want the *clean echo-cancelled residual* for the VAD/STT, not
+        // an auto-gained one, so disable AGC2. High-pass + noise suppression stay
+        // on (both reduce false VAD triggers).
         let pipeline = linear::builder(fmt, fmt)
+            .enable_gain_controller2(false)
             .build()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("aec3 build: {e:?}")))?;
         Ok(Self { pipeline, frame, cap_f: vec![0.0; frame], ren_f: vec![0.0; frame], out_f: vec![0.0; frame] })

@@ -1,0 +1,203 @@
+<!doctype html>
+<!--
+  Copyright 2026 winoiknow (Eric Alborn, Anteon Group). Apache-2.0.
+
+  Minimal full-duplex browser client for testing the s2s OpenAI-Realtime endpoint
+  directly — no AVA, no Asterisk, no AudioSocket half-duplex. Holds the mic open
+  continuously (true full-duplex) so s2s's own server-VAD / barge-in / cancellation
+  can be validated in isolation, and prints the lifecycle events so you can SEE
+  barge-in fire.
+
+  How to run (Chrome recommended):
+    1. On s2s: run with SERVER_API_KEY unset/empty (browsers can't set the WS
+       Authorization header), and DEBUG_MODE=on if you want the s2s-side heartbeat.
+    2. On your laptop, in this file's folder:  python3 -m http.server 8000
+    3. Open  http://localhost:8000/realtime_test_client.html  (localhost = mic-allowed
+       secure context; plain ws:// to a remote server is fine from an http:// page).
+    4. Enter  ws://<s2s-host>:8765/v1/realtime , Connect, allow the mic, talk.
+       Talk OVER the agent to test barge-in.
+
+  Notes:
+    - Browser echo-cancellation/NS/AGC are turned OFF so you test s2s's raw behavior
+      (use a HEADSET for clean full-duplex; use speakers to reproduce the echo case).
+    - Mic is captured/sent at 16 kHz; agent audio is played at 24 kHz (s2s defaults).
+-->
+<html>
+<head>
+<meta charset="utf-8">
+<title>s2s realtime test client</title>
+<style>
+  body { font: 14px/1.4 system-ui, sans-serif; margin: 1.5rem; max-width: 900px; }
+  input, button { font: inherit; padding: .4rem .6rem; }
+  #url { width: 28rem; }
+  .row { margin: .5rem 0; display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
+  #log { height: 22rem; overflow:auto; background:#111; color:#ddd; padding:.5rem;
+         font: 12px/1.35 ui-monospace, monospace; white-space: pre-wrap; border-radius:6px; }
+  .pill { padding:.1rem .5rem; border-radius:1rem; font-size:12px; }
+  .on { background:#1c7c3a; color:#fff; } .off { background:#777; color:#fff; }
+  .warn { color:#e0a000; } .err { color:#ff6b6b; } .ev { color:#6bd1ff; } .audio { color:#9b9; }
+  meter { width: 12rem; }
+</style>
+</head>
+<body>
+<h2>s2s realtime test client</h2>
+<div class="row">
+  <input id="url" value="ws://localhost:8765/v1/realtime">
+  <button id="connect">Connect</button>
+  <span id="state" class="pill off">disconnected</span>
+</div>
+<div class="row">
+  <button id="mic" disabled>Mute mic</button>
+  <span>mic level <meter id="level" min="0" max="0.3" value="0"></meter></span>
+  <span id="playing" class="pill off">idle</span>
+  <label><input type="checkbox" id="flush" checked> flush playback on speech_started (crisp barge-in)</label>
+</div>
+<div class="row" style="font-size:12px;color:#666">
+  server-VAD mode: just talk — s2s detects turns and replies automatically. Watch the log for
+  <b>input_audio_buffer.speech_started</b> (your barge-in) and <b>response.done status=cancelled</b>.
+</div>
+<div id="log"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const logEl = $("log");
+function log(msg, cls) {
+  const t = new Date().toISOString().substr(11, 12);
+  const span = document.createElement("span");
+  span.className = cls || "";
+  span.textContent = `${t}  ${msg}\n`;
+  logEl.appendChild(span);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+const IN_RATE = 16000, OUT_RATE = 24000;
+let ws = null, micCtx = null, outCtx = null, micStream = null, micNode = null, srcNode = null;
+let muted = false, nextPlay = 0, deltaCount = 0, activeSources = [];
+
+function b64encode(uint8) {
+  let s = ""; const CH = 0x8000;
+  for (let i = 0; i < uint8.length; i += CH) s += String.fromCharCode.apply(null, uint8.subarray(i, i + CH));
+  return btoa(s);
+}
+function b64decode(b64) {
+  const bin = atob(b64), u8 = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  return u8;
+}
+
+// ── playback (24 kHz) ──────────────────────────────────────────────
+function playDelta(b64) {
+  if (!outCtx) return;
+  const bytes = b64decode(b64);
+  const pcm = new Int16Array(bytes.buffer, bytes.byteOffset, bytes.byteLength >> 1);
+  const f32 = new Float32Array(pcm.length);
+  for (let i = 0; i < pcm.length; i++) f32[i] = pcm[i] / 32768;
+  const buf = outCtx.createBuffer(1, f32.length, OUT_RATE);
+  buf.copyToChannel(f32, 0);
+  const src = outCtx.createBufferSource();
+  src.buffer = buf; src.connect(outCtx.destination);
+  const now = outCtx.currentTime;
+  if (nextPlay < now) nextPlay = now;
+  src.start(nextPlay);
+  nextPlay += buf.duration;
+  activeSources.push(src);
+  src.onended = () => { activeSources = activeSources.filter(s => s !== src);
+                        $("playing").className = activeSources.length ? "pill on" : "pill off";
+                        $("playing").textContent = activeSources.length ? "playing" : "idle"; };
+  $("playing").className = "pill on"; $("playing").textContent = "playing";
+}
+function flushPlayback() {
+  activeSources.forEach(s => { try { s.stop(); } catch (e) {} });
+  activeSources = []; nextPlay = 0;
+  $("playing").className = "pill off"; $("playing").textContent = "idle";
+}
+
+// ── mic capture (16 kHz, continuous) ───────────────────────────────
+async function startMic() {
+  micStream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+  micCtx = new AudioContext({ sampleRate: IN_RATE });
+  if (micCtx.sampleRate !== IN_RATE)
+    log(`warning: AudioContext is ${micCtx.sampleRate} Hz, not ${IN_RATE} (browser ignored the rate) — input may be mis-clocked; use Chrome`, "warn");
+  srcNode = micCtx.createMediaStreamSource(micStream);
+  micNode = micCtx.createScriptProcessor(2048, 1, 1);  // ~128 ms @ 16 kHz
+  micNode.onaudioprocess = e => {
+    e.outputBuffer.getChannelData(0).fill(0);  // never monitor the mic → no feedback
+    const f32 = e.inputBuffer.getChannelData(0);
+    let peak = 0;
+    const i16 = new Int16Array(f32.length);
+    for (let i = 0; i < f32.length; i++) {
+      const v = Math.max(-1, Math.min(1, f32[i]));
+      i16[i] = v < 0 ? v * 32768 : v * 32767;
+      const a = Math.abs(v); if (a > peak) peak = a;
+    }
+    $("level").value = peak;
+    if (!muted && ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({ type: "input_audio_buffer.append",
+                               audio: b64encode(new Uint8Array(i16.buffer)) }));
+    }
+  };
+  srcNode.connect(micNode); micNode.connect(micCtx.destination);
+}
+
+// ── connection ─────────────────────────────────────────────────────
+$("connect").onclick = async () => {
+  if (ws) { ws.close(); return; }
+  try { await startMic(); } catch (e) { log("mic error: " + e, "err"); return; }
+  outCtx = new AudioContext({ sampleRate: OUT_RATE });
+  ws = new WebSocket($("url").value.trim());
+  ws.onopen = () => {
+    $("state").className = "pill on"; $("state").textContent = "connected";
+    $("connect").textContent = "Disconnect"; $("mic").disabled = false;
+    log("connected → sending session.update", "ev");
+    ws.send(JSON.stringify({
+      type: "session.update",
+      session: { type: "realtime",
+        audio: {
+          input: { format: { type: "audio/pcm", rate: IN_RATE },
+                   turn_detection: { type: "server_vad", threshold: 0.5,
+                                     silence_duration_ms: 700, prefix_padding_ms: 300 } },
+          output: { format: { type: "audio/pcm", rate: OUT_RATE } } } } }));
+  };
+  ws.onclose = () => {
+    $("state").className = "pill off"; $("state").textContent = "disconnected";
+    $("connect").textContent = "Connect"; $("mic").disabled = true;
+    flushPlayback();
+    if (micNode) micNode.disconnect(); if (srcNode) srcNode.disconnect();
+    if (micStream) micStream.getTracks().forEach(t => t.stop());
+    if (micCtx) micCtx.close(); micCtx = null;
+    ws = null; log("disconnected");
+  };
+  ws.onerror = e => log("ws error", "err");
+  ws.onmessage = ev => {
+    let m; try { m = JSON.parse(ev.data); } catch { return; }
+    const t = m.type;
+    if (t === "response.output_audio.delta") {
+      deltaCount++; if (deltaCount % 25 === 0) log(`… ${deltaCount} audio deltas`, "audio");
+      playDelta(m.delta);
+    } else if (t === "input_audio_buffer.speech_started") {
+      log("▶ speech_started (your turn / BARGE-IN detected by s2s)", "ev");
+      if ($("flush").checked) flushPlayback();
+    } else if (t === "input_audio_buffer.speech_stopped") {
+      log("■ speech_stopped", "ev");
+    } else if (t === "conversation.item.input_audio_transcription.completed") {
+      log("USER: " + (m.transcript || "").trim(), "ev");
+    } else if (t === "response.created") {
+      deltaCount = 0; log("response.created", "ev");
+    } else if (t === "response.done") {
+      const st = m.response && m.response.status;
+      log(`response.done — status=${st} (${deltaCount} deltas)`, st === "cancelled" ? "warn" : "ev");
+    } else if (t === "error") {
+      log("ERROR: " + JSON.stringify(m.error || m), "err");
+    } else if (t === "session.updated") {
+      log("session.updated (formats negotiated)", "ev");
+    }
+  };
+};
+$("mic").onclick = () => {
+  muted = !muted; $("mic").textContent = muted ? "Unmute mic" : "Mute mic";
+  log(muted ? "mic muted (sending silence-gap)" : "mic unmuted", "warn");
+};
+</script>
+</body>
+</html>

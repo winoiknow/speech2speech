@@ -4,10 +4,13 @@
 // internally (no manual FIFO needed on our side).
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use aec3::AudioFormat;
+use aec3::nodes::audio::AudioFormat;
 use aec3::pipelines::linear::{self, LinearPipeline};
 
-#[pyclass]
+// unsendable: LinearPipeline holds Rc/Box<dyn ...> so it is !Send. The canceller
+// is only ever touched from the single asyncio thread, so this is sound; PyO3
+// enforces same-thread access at runtime.
+#[pyclass(unsendable)]
 struct Aec3 {
     pipeline: LinearPipeline,
     frame: usize,        // samples per 10 ms frame (sample_rate/100)

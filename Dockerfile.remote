@@ -16,7 +16,7 @@ WORKDIR /app
 # Runtime system deps: libsndfile for soundfile, git for silero-vad torch.hub load
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libsndfile1 \
-        libspeexdsp-dev \
+        libspeexdsp1 \
         git \
         curl \
     && rm -rf /var/lib/apt/lists/*
@@ -47,10 +47,8 @@ RUN pip install \
         "uvicorn>=0.30.0" \
         "websockets>=12.0"
 
-# ── Optional: speexdsp for acoustic echo cancellation (AEC_ENABLED=1) ──────────
-# Non-fatal: the EchoCanceller is fail-safe and passes the mic through unchanged
-# if this isn't present, so a build-env hiccup here must not break the image.
-RUN pip install Cython speexdsp || echo "WARNING: speexdsp (AEC) not installed; AEC will be unavailable"
+# AEC (AEC_ENABLED=1) calls libspeexdsp1 (installed above) directly via ctypes —
+# no Python package / build step needed. Fail-safe if the lib is absent.
 
 # ── Copy source and install in no-deps mode (all deps already installed above) ──
 COPY . /app

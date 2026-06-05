@@ -147,19 +147,20 @@ async function startMic() {
 }
 
 // ── turn-detection config (applied live; s2s updates its VAD on session.update) ──
-function sendSessionUpdate(includeFormats) {
+function sendSessionUpdate() {
   if (!ws || ws.readyState !== 1) return;
   const sil = parseInt($("silence").value) || 700;
   const th = parseFloat($("thresh").value) || 0.5;
-  const input = { turn_detection: { type: "server_vad", threshold: th,
-                  silence_duration_ms: sil, prefix_padding_ms: 300 } };
-  if (includeFormats) input.format = { type: "audio/pcm", rate: IN_RATE };
-  const session = { type: "realtime", audio: { input } };
-  if (includeFormats) session.audio.output = { format: { type: "audio/pcm", rate: OUT_RATE } };
+  // Only turn_detection: the SDK pins input/output AudioPCM rate to 24000, and
+  // s2s already defaults input→16k / output→24k (which is what we send/play), so
+  // sending an input format of 16000 just gets the whole update rejected.
+  const session = { type: "realtime", audio: { input: {
+      turn_detection: { type: "server_vad", threshold: th,
+                        silence_duration_ms: sil, prefix_padding_ms: 300 } } } };
   ws.send(JSON.stringify({ type: "session.update", session }));
   log(`session.update → silence=${sil}ms threshold=${th}`, "ev");
 }
-$("apply").onclick = () => sendSessionUpdate(false);
+$("apply").onclick = () => sendSessionUpdate();
 
 // ── connection ─────────────────────────────────────────────────────
 $("connect").onclick = async () => {
@@ -171,7 +172,7 @@ $("connect").onclick = async () => {
     $("state").className = "pill on"; $("state").textContent = "connected";
     $("connect").textContent = "Disconnect"; $("mic").disabled = false; $("apply").disabled = false;
     log("connected → sending session.update", "ev");
-    sendSessionUpdate(true);
+    sendSessionUpdate();
   };
   ws.onclose = () => {
     $("state").className = "pill off"; $("state").textContent = "disconnected";

@@ -28,6 +28,9 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import time
+
+from speech_to_speech.debug import DEBUG_MODE
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +82,9 @@ class EchoCanceller:
         self._far_cap = sample_rate * BYTES_PER_SAMPLE * 2   # ~2 s cap
         self._echo = None
         self._pre = None
+        self._dbg_t = 0.0          # diagnostic (DEBUG_MODE): echo-reduction meter
+        self._dbg_far = 0
+        self._dbg_tot = 0
 
         self.enabled = bool(enabled) and _LIB is not None
         if enabled and _LIB is None:
@@ -119,12 +125,15 @@ class EchoCanceller:
         n = len(near_int16)
         out = bytearray()
         off = 0
+        far_frames = total_frames = 0
         while off + self._fb <= n:
             rec = near_int16[off : off + self._fb]
             if len(self._far) >= self._fb:
                 play = bytes(self._far[: self._fb]); del self._far[: self._fb]
+                far_frames += 1
             else:
                 play = self._silence                         # no far-end → nothing to cancel
+            total_frames += 1
             try:
                 _LIB.speex_echo_cancellation(self._echo, rec, play, self._out)
                 if self._pre:
@@ -135,7 +144,33 @@ class EchoCanceller:
             off += self._fb
         if off < n:                                          # trailing partial frame
             out += near_int16[off:]
-        return bytes(out)
+        result = bytes(out)
+        if DEBUG_MODE and total_frames:
+            self._diag(near_int16, result, far_frames, total_frames)
+        return result
+
+    def _diag(self, near_b: bytes, out_b: bytes, far_frames: int, total_frames: int) -> None:
+        """Once/sec under DEBUG_MODE: how much echo energy is actually removed, and
+        whether the far-end reference was present. reduction≈0 dB while far_present
+        is high ⇒ the canceller isn't locking (cross-clock / convergence) → AEC3."""
+        self._dbg_far += far_frames
+        self._dbg_tot += total_frames
+        now = time.time()
+        if now - self._dbg_t < 1.0:
+            return
+        import numpy as np
+        nin = np.frombuffer(near_b, dtype=np.int16).astype(np.float64)
+        m = (len(out_b) // 2) * 2
+        nout = np.frombuffer(out_b[:m], dtype=np.int16).astype(np.float64)
+        rin = float(np.sqrt(np.mean(nin ** 2))) if nin.size else 0.0
+        rout = float(np.sqrt(np.mean(nout ** 2))) if nout.size else 0.0
+        red = 20.0 * np.log10(rin / rout) if (rin > 1 and rout > 1) else 0.0
+        far_pct = 100.0 * self._dbg_far / max(1, self._dbg_tot)
+        logger.info("AEC: in_rms=%.0f out_rms=%.0f reduction=%.1f dB | far_present=%.0f%%",
+                    rin, rout, red, far_pct)
+        self._dbg_t = now
+        self._dbg_far = 0
+        self._dbg_tot = 0
 
     def reset(self) -> None:
         """Clear the far-end buffer (e.g. on a new session)."""

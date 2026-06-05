@@ -70,6 +70,9 @@ TTS_DUMP_RATE = int(os.getenv("S2S_TTS_DUMP_RATE", "24000"))
 # stops tripping on echo. Off by default. AEC_FILTER_LENGTH_MS should cover the
 # echo round-trip delay (small on LAN/browser; larger with a client jitter buffer).
 AEC_ENABLED = os.getenv("AEC_ENABLED", "0").lower() in ("1", "true", "on", "yes")
+# Backend: "aec3" (WebRTC AEC3, Rust wheel — delay-estimating, default) or "speex"
+# (libspeexdsp, adaptive filter only). AEC_FILTER_LENGTH_MS applies to speex.
+AEC_BACKEND = os.getenv("AEC_BACKEND", "aec3")
 AEC_FILTER_LENGTH_MS = int(os.getenv("AEC_FILTER_LENGTH_MS", "250"))
 
 
@@ -110,6 +113,7 @@ def create_app(
         sample_rate=PIPELINE_SAMPLE_RATE,
         filter_length_ms=AEC_FILTER_LENGTH_MS,
         enabled=AEC_ENABLED,
+        backend=AEC_BACKEND,
     )
 
     def _flush_queue(q: Queue[QItem], *, preserve: Callable[[QItem], bool] | None = None) -> None:

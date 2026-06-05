@@ -8,6 +8,8 @@ name = "aec3_py"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.22", features = ["extension-module"] }
-# Pure-Rust WebRTC AEC3 port (RubyBit/aec3-rs). edition 2024 → needs rustc >= 1.85.
+# abi3-py39: one portable wheel for any CPython >= 3.9, so the rust:slim builder
+# stage (newer Python) and the python:3.11-slim runtime don't have to match.
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py39"] }
+# Pure-Rust WebRTC AEC3 port (RubyBit/aec3-rs). edition 2024 -> needs rustc >= 1.85.
 aec3 = "0.2"

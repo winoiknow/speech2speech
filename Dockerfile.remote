@@ -5,6 +5,19 @@
 # CPU-only image for the remote-handler build.
 # No CUDA, no local models, no transformers/mlx/parakeet/qwen3/kokoro/pocket deps.
 # All inference is delegated to external HTTP services (STT, TTS, LLM).
+
+# ── Stage 1: build the WebRTC AEC3 wheel (pure-Rust crate `aec3`, via PyO3/maturin) ──
+# Produces a portable abi3 wheel so this (newer-Python) builder and the 3.11 runtime
+# below don't have to match. Pure Rust → no C++/meson, just cargo.
+FROM rust:slim AS aec3builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-dev python3-pip \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --break-system-packages maturin
+COPY rust/aec3_py /build/aec3_py
+RUN cd /build/aec3_py && maturin build --release --out /wheels
+
+# ── Stage 2: lean CPU runtime ──
 FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -47,8 +60,11 @@ RUN pip install \
         "uvicorn>=0.30.0" \
         "websockets>=12.0"
 
-# AEC (AEC_ENABLED=1) calls libspeexdsp1 (installed above) directly via ctypes —
-# no Python package / build step needed. Fail-safe if the lib is absent.
+# ── AEC backends (AEC_ENABLED=1) ──────────────────────────────────────────────
+# aec3 (default): WebRTC AEC3 via the abi3 wheel built in stage 1.
+# speex (fallback): libspeexdsp (apt above) via ctypes.
+COPY --from=aec3builder /wheels/*.whl /tmp/
+RUN pip install /tmp/*.whl && rm -f /tmp/*.whl
 
 # ── Copy source and install in no-deps mode (all deps already installed above) ──
 COPY . /app

@@ -7,21 +7,20 @@
 s2s holds both signals AEC needs: the **near-end** (caller mic, via
 input_audio_buffer.append) and the **far-end** (the TTS it just sent). This
 canceller subtracts the agent's own audio from the mic *before the VAD sees it*,
-so the VAD stops tripping on echo (the root of both the phantom barge-ins and the
+so the VAD stops tripping on echo (the root of the phantom barge-ins and the
 echo-clears-should_listen deafness).
 
-Backend: **libspeexdsp via ctypes** — the echo canceller plus the preprocessor's
-residual-echo suppressor, called directly against the system shared library. No
-build step / Cython package (that pip package doesn't build on modern Python);
-only the runtime lib (apt ``libspeexdsp1``) is needed. The class is **fail-safe**:
-if the lib can't be loaded, AEC is disabled, or a frame errors, it returns the
-mic unchanged so the pipeline never breaks.
+Two backends, picked by ``AEC_BACKEND``:
+  * **aec3** (default): WebRTC AEC3 via the pure-Rust ``aec3`` crate (PyO3 wheel
+    ``aec3_py``). Has built-in delay estimation + clock-drift handling — the
+    thing speex lacked on the networked, cross-clock echo path. Works on 10 ms
+    (160-sample @ 16 kHz) frames; AEC3 aligns far/near internally, so we just
+    feed render + capture.
+  * **speex** (fallback): libspeexdsp via ctypes. Adaptive filter only — slow to
+    converge on a cross-clock path; kept for comparison.
 
-Alignment: far-end (sent) and near-end (received) are fed in lockstep; the echo
-round-trip delay is absorbed by the adaptive filter as long as it's within
-``filter_length`` (tens of ms on LAN/browser; a client jitter buffer would need a
-much longer filter or a pre-delay). For variable/large delay, WebRTC AEC3 (with
-its built-in delay estimator) is the stronger backend — a planned alternative.
+Fail-safe throughout: if the backend can't load or a frame errors, the mic
+passes through unchanged so the pipeline never breaks.
 """
 
 from __future__ import annotations
@@ -34,14 +33,15 @@ from speech_to_speech.debug import DEBUG_MODE
 
 logger = logging.getLogger(__name__)
 
-FRAME_SAMPLES = 256          # 16 ms @ 16 kHz; 512-sample VAD chunks = 2 frames
 BYTES_PER_SAMPLE = 2
 
+# ── speex backend (libspeexdsp via ctypes) ──────────────────────────────────
+SPEEX_FRAME_SAMPLES = 256
 SPEEX_ECHO_SET_SAMPLING_RATE = 24
 SPEEX_PREPROCESS_SET_ECHO_STATE = 24
 
 
-def _load_lib():
+def _load_speex():
     for name in ("libspeexdsp.so.1", "libspeexdsp.so", "libspeexdsp.so.1.5.0"):
         try:
             lib = ctypes.CDLL(name)
@@ -52,109 +52,198 @@ def _load_lib():
         lib.speex_echo_state_init.argtypes = [ci, ci]
         lib.speex_echo_cancellation.argtypes = [vp, vp, vp, vp]
         lib.speex_echo_ctl.argtypes = [vp, ci, vp]
-        lib.speex_echo_state_destroy.argtypes = [vp]
         lib.speex_preprocess_state_init.restype = vp
         lib.speex_preprocess_state_init.argtypes = [ci, ci]
         lib.speex_preprocess_ctl.argtypes = [vp, ci, vp]
         lib.speex_preprocess_run.argtypes = [vp, vp]
-        lib.speex_preprocess_state_destroy.argtypes = [vp]
         return lib
     return None
 
 
-_LIB = _load_lib()
+_SPEEX = _load_speex()
 
 
 class EchoCanceller:
-    """Per-session AEC. ``add_far_end`` buffers outbound TTS; ``process`` cleans
-    inbound mic bytes (int16 mono @ ``sample_rate``) and returns the same length."""
-
     def __init__(self, sample_rate: int = 16000, filter_length_ms: int = 250,
-                 enabled: bool = True) -> None:
+                 enabled: bool = True, backend: str = "aec3") -> None:
         self.sample_rate = sample_rate
-        self.frame = FRAME_SAMPLES
-        self._fb = self.frame * BYTES_PER_SAMPLE
-        self._silence = b"\x00" * self._fb
-        self._out = ctypes.create_string_buffer(self._fb)   # reusable per-frame output
-        fl = int(sample_rate * filter_length_ms / 1000)
-        self.filter_length = max(self.frame, (fl // self.frame) * self.frame)
-        self._far = bytearray()
-        self._far_cap = sample_rate * BYTES_PER_SAMPLE * 2   # ~2 s cap
-        self._echo = None
-        self._pre = None
-        self._dbg_t = 0.0          # diagnostic (DEBUG_MODE): echo-reduction meter
+        self.backend = (backend or "aec3").strip().lower()
+        self.enabled = bool(enabled)
+        self.frame = 0
+        self._fb = 0
+        # diagnostic (DEBUG_MODE)
+        self._dbg_t = 0.0
         self._dbg_far = 0
         self._dbg_tot = 0
+        # buffers (aec3 reframes 512-sample chunks to 160; output kept length-matched)
+        self._near_buf = bytearray()
+        self._far_buf = bytearray()
+        self._clean_buf = bytearray()
+        # aec3 handles
+        self._aec3_mod = None
+        self._aec3 = None
+        # speex handles
+        self._echo = None
+        self._pre = None
+        self._silence = b""
+        self._far = bytearray()
+        self._far_cap = sample_rate * BYTES_PER_SAMPLE * 2
 
-        self.enabled = bool(enabled) and _LIB is not None
-        if enabled and _LIB is None:
-            logger.warning("AEC requested but libspeexdsp not found — mic passes through unchanged")
-        if self.enabled:
+        if not self.enabled:
+            return
+        if self.backend == "aec3":
+            self._init_aec3()
+        elif self.backend == "speex":
+            self._init_speex(filter_length_ms)
+        else:
+            logger.warning("AEC_BACKEND=%r unknown — mic passes through unchanged", self.backend)
+            self.enabled = False
+
+    # ── aec3 backend ────────────────────────────────────────────────────────
+    def _init_aec3(self) -> None:
+        try:
+            import aec3_py  # the PyO3 wheel
+            self._aec3_mod = aec3_py
+            self.frame = self.sample_rate // 100   # 10 ms frame; confirmed on create
+            self._fb = self.frame * BYTES_PER_SAMPLE
+            logger.info("EchoCanceller backend=aec3 (WebRTC AEC3, pure-Rust) — lazy init on first frame")
+        except Exception as e:
+            logger.warning("AEC backend=aec3 unavailable (%s) — mic passes through unchanged", e)
+            self.enabled = False
+
+    def _ensure_aec3(self) -> bool:
+        # aec3_py.Aec3 is `unsendable` → must be created on the thread that uses it
+        # (the asyncio thread, where add_far_end/process run).
+        if self._aec3 is None:
             try:
-                self._echo = _LIB.speex_echo_state_init(self.frame, self.filter_length)
-                if not self._echo:
-                    raise RuntimeError("speex_echo_state_init returned NULL")
-                rate = ctypes.c_int(sample_rate)
-                _LIB.speex_echo_ctl(self._echo, SPEEX_ECHO_SET_SAMPLING_RATE, ctypes.byref(rate))
-                # Preprocessor linked to the echo state → residual-echo suppression.
-                self._pre = _LIB.speex_preprocess_state_init(self.frame, sample_rate)
-                if self._pre:
-                    _LIB.speex_preprocess_ctl(self._pre, SPEEX_PREPROCESS_SET_ECHO_STATE,
-                                              ctypes.c_void_p(self._echo))
-                logger.info(
-                    "EchoCanceller ready (libspeexdsp/ctypes; frame=%d, filter=%d samples / %d ms @ %d Hz, residual=%s)",
-                    self.frame, self.filter_length,
-                    int(self.filter_length / sample_rate * 1000), sample_rate, bool(self._pre),
-                )
-            except Exception as e:  # pragma: no cover
-                logger.error("AEC init failed (%s) — mic passes through unchanged", e)
+                self._aec3 = self._aec3_mod.Aec3(self.sample_rate)
+                self.frame = self._aec3.frame_samples
+                self._fb = self.frame * BYTES_PER_SAMPLE
+            except Exception as e:
+                logger.error("AEC aec3 init failed (%s) — passing through", e)
                 self.enabled = False
+                return False
+        return True
 
+    # ── speex backend ───────────────────────────────────────────────────────
+    def _init_speex(self, filter_length_ms: int) -> None:
+        self.frame = SPEEX_FRAME_SAMPLES
+        self._fb = self.frame * BYTES_PER_SAMPLE
+        self._silence = b"\x00" * self._fb
+        self._spx_out = ctypes.create_string_buffer(self._fb)  # reusable per-frame output
+        fl = int(self.sample_rate * filter_length_ms / 1000)
+        self.filter_length = max(self.frame, (fl // self.frame) * self.frame)
+        if _SPEEX is None:
+            logger.warning("AEC backend=speex but libspeexdsp not found — mic passes through unchanged")
+            self.enabled = False
+            return
+        try:
+            self._echo = _SPEEX.speex_echo_state_init(self.frame, self.filter_length)
+            if not self._echo:
+                raise RuntimeError("speex_echo_state_init returned NULL")
+            rate = ctypes.c_int(self.sample_rate)
+            _SPEEX.speex_echo_ctl(self._echo, SPEEX_ECHO_SET_SAMPLING_RATE, ctypes.byref(rate))
+            self._pre = _SPEEX.speex_preprocess_state_init(self.frame, self.sample_rate)
+            if self._pre:
+                _SPEEX.speex_preprocess_ctl(self._pre, SPEEX_PREPROCESS_SET_ECHO_STATE,
+                                            ctypes.c_void_p(self._echo))
+            logger.info("EchoCanceller backend=speex (libspeexdsp/ctypes; filter=%d/%d ms, residual=%s)",
+                        self.filter_length, int(self.filter_length / self.sample_rate * 1000), bool(self._pre))
+        except Exception as e:
+            logger.error("AEC speex init failed (%s) — passing through", e)
+            self.enabled = False
+
+    # ── public API ──────────────────────────────────────────────────────────
     def add_far_end(self, pcm_int16: bytes) -> None:
         """Buffer outbound TTS (int16 mono @ sample_rate) as the far-end reference."""
         if not self.enabled or not pcm_int16:
             return
-        self._far += pcm_int16
-        if len(self._far) > self._far_cap:
-            del self._far[: len(self._far) - self._far_cap]
+        if self.backend == "aec3":
+            if not self._ensure_aec3():
+                return
+            self._far_buf += pcm_int16
+            n = (len(self._far_buf) // self._fb) * self._fb
+            if n:
+                try:
+                    self._aec3.process_render(bytes(self._far_buf[:n]))
+                except Exception:
+                    pass
+                del self._far_buf[:n]
+                if DEBUG_MODE:
+                    self._dbg_far += n // self._fb
+        else:
+            self._far += pcm_int16
+            if len(self._far) > self._far_cap:
+                del self._far[: len(self._far) - self._far_cap]
 
     def process(self, near_int16: bytes) -> bytes:
         """Return echo-cancelled mic bytes (same length as input)."""
         if not self.enabled:
             return near_int16
-        n = len(near_int16)
+        return self._process_aec3(near_int16) if self.backend == "aec3" else self._process_speex(near_int16)
+
+    def _process_aec3(self, near: bytes) -> bytes:
+        if not self._ensure_aec3():
+            return near
+        self._near_buf += near
+        n = (len(self._near_buf) // self._fb) * self._fb
+        if n:
+            frames = bytes(self._near_buf[:n]); del self._near_buf[:n]
+            try:
+                self._clean_buf += self._aec3.process_capture(frames)
+            except Exception:
+                self._clean_buf += frames  # fail-safe: pass through
+            if DEBUG_MODE:
+                self._dbg_tot += n // self._fb
+        want = len(near)
+        if len(self._clean_buf) >= want:
+            out = bytes(self._clean_buf[:want]); del self._clean_buf[:want]
+        else:  # startup priming: emit what we have + a little silence to keep lengths matched
+            out = bytes(self._clean_buf) + b"\x00" * (want - len(self._clean_buf))
+            self._clean_buf.clear()
+        if DEBUG_MODE:
+            self._diag(near, out)
+        return out
+
+    def _process_speex(self, near: bytes) -> bytes:
+        n = len(near)
         out = bytearray()
         off = 0
         far_frames = total_frames = 0
         while off + self._fb <= n:
-            rec = near_int16[off : off + self._fb]
+            rec = near[off : off + self._fb]
             if len(self._far) >= self._fb:
                 play = bytes(self._far[: self._fb]); del self._far[: self._fb]
                 far_frames += 1
             else:
-                play = self._silence                         # no far-end → nothing to cancel
+                play = self._silence
             total_frames += 1
             try:
-                _LIB.speex_echo_cancellation(self._echo, rec, play, self._out)
+                _SPEEX.speex_echo_cancellation(self._echo, rec, play, self._spx_out)
                 if self._pre:
-                    _LIB.speex_preprocess_run(self._pre, self._out)
-                out += self._out.raw
+                    _SPEEX.speex_preprocess_run(self._pre, self._spx_out)
+                out += self._spx_out.raw
             except Exception:
-                out += rec                                   # fail-safe per frame
+                out += rec
             off += self._fb
-        if off < n:                                          # trailing partial frame
-            out += near_int16[off:]
+        if off < n:
+            out += near[off:]
         result = bytes(out)
-        if DEBUG_MODE and total_frames:
-            self._diag(near_int16, result, far_frames, total_frames)
+        if DEBUG_MODE:
+            self._dbg_far += far_frames
+            self._dbg_tot += total_frames
+            self._diag(near, result)
         return result
 
-    def _diag(self, near_b: bytes, out_b: bytes, far_frames: int, total_frames: int) -> None:
-        """Once/sec under DEBUG_MODE: how much echo energy is actually removed, and
-        whether the far-end reference was present. reduction≈0 dB while far_present
-        is high ⇒ the canceller isn't locking (cross-clock / convergence) → AEC3."""
-        self._dbg_far += far_frames
-        self._dbg_tot += total_frames
+    def reset(self) -> None:
+        """Clear buffers (e.g. on a new session). Backend filter state is kept."""
+        self._far.clear()
+        self._near_buf.clear()
+        self._far_buf.clear()
+        self._clean_buf.clear()
+
+    # ── diagnostic ──────────────────────────────────────────────────────────
+    def _diag(self, near_b: bytes, out_b: bytes) -> None:
         now = time.time()
         if now - self._dbg_t < 1.0:
             return
@@ -166,12 +255,8 @@ class EchoCanceller:
         rout = float(np.sqrt(np.mean(nout ** 2))) if nout.size else 0.0
         red = 20.0 * np.log10(rin / rout) if (rin > 1 and rout > 1) else 0.0
         far_pct = 100.0 * self._dbg_far / max(1, self._dbg_tot)
-        logger.info("AEC: in_rms=%.0f out_rms=%.0f reduction=%.1f dB | far_present=%.0f%%",
-                    rin, rout, red, far_pct)
+        logger.info("AEC[%s]: in_rms=%.0f out_rms=%.0f reduction=%.1f dB | far=%.0f%%",
+                    self.backend, rin, rout, red, far_pct)
         self._dbg_t = now
         self._dbg_far = 0
         self._dbg_tot = 0
-
-    def reset(self) -> None:
-        """Clear the far-end buffer (e.g. on a new session)."""
-        self._far.clear()

@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass, field
 
 
@@ -53,5 +54,14 @@ class VADHandlerArguments:
         default=0.2,
         metadata={
             "help": "Interval (in seconds) for releasing progressive audio chunks during speech. Default is 0.2s."
+        },
+    )
+    input_rms_gate: float = field(
+        default_factory=lambda: float(os.environ.get("VAD_INPUT_RMS_GATE", "40")),
+        metadata={
+            "help": "Reject mic chunks whose int16 RMS is below this value before the VAD sees them (presented as silence). "
+            "The VAD runs on the AEC-cleaned signal, where echo residual sits at very low RMS (~2-18) while real speech is "
+            "far louder (hundreds+), so this gate kills phantom barge-ins on echo residual without affecting genuine speech. "
+            "Set 0 to disable. Env: VAD_INPUT_RMS_GATE (default 40)."
         },
     )

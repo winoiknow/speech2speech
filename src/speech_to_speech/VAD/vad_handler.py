@@ -52,10 +52,12 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         audio_enhancement: bool = False,
         enable_realtime_transcription: bool = False,
         realtime_processing_pause: float = 0.25,
+        input_rms_gate: float = 0.0,
         text_output_queue: Queue[TextEventItem] | None = None,
     ) -> None:
         self.should_listen = should_listen
         self.sample_rate = sample_rate
+        self.input_rms_gate = float(input_rms_gate)
         self.min_silence_ms = min_silence_ms
         self.min_speech_ms = min_speech_ms
         self.max_speech_ms = max_speech_ms
@@ -101,6 +103,7 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         # This distinguishes "no input reached us" (AVA gated/stopped forwarding)
         # from "input arrived but should_listen was clear" (s2s-side gate bug).
         self._hb_chunks_received = 0
+        self._hb_gated = 0  # chunks suppressed by the RMS gate this heartbeat window
         self._hb_last_time = 0.0
         self._log_speech_starts = 0
         self._log_speech_ends = 0
@@ -159,12 +162,14 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
             hb_now = time.time()
             if hb_now - self._hb_last_time >= 1.0:
                 logger.info(
-                    "VAD heartbeat: %d chunks/s in | should_listen=%s | triggered=%s",
+                    "VAD heartbeat: %d chunks/s in | gated=%d | should_listen=%s | triggered=%s",
                     self._hb_chunks_received,
+                    self._hb_gated,
                     self.should_listen.is_set(),
                     self.iterator.triggered,
                 )
                 self._hb_chunks_received = 0
+                self._hb_gated = 0
                 self._hb_last_time = hb_now
 
         if not self.should_listen.is_set():
@@ -175,6 +180,17 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         audio_int16 = np.frombuffer(audio_chunk, dtype=np.int16)
         self._total_samples += len(audio_int16)
         audio_float32 = int2float(audio_int16)
+
+        # RMS gate: the VAD runs on the AEC-cleaned signal, where echo residual
+        # sits at very low RMS while genuine speech is far louder. Chunks below
+        # the gate are presented to silero as silence so its echo-residual energy
+        # can't accumulate into a phantom barge-in; real speech sails over it.
+        if self.input_rms_gate > 0 and audio_int16.size:
+            rms = float(np.sqrt(np.mean(audio_int16.astype(np.float32) ** 2)))
+            if rms < self.input_rms_gate:
+                audio_float32 = np.zeros_like(audio_float32)
+                if DEBUG_MODE:
+                    self._hb_gated += 1
 
         vad_output = self.iterator(torch.from_numpy(audio_float32))
 

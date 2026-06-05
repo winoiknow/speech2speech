@@ -58,6 +58,9 @@ services:
       AEC_ENABLED: ${AEC_ENABLED:-0}
       AEC_BACKEND: ${AEC_BACKEND:-aec3}
       AEC_FILTER_LENGTH_MS: ${AEC_FILTER_LENGTH_MS:-250}
+      # Reject mic chunks below this int16 RMS before the VAD (kills phantom
+      # barge-ins on low-level AEC echo residual). 0 disables. See vad_arguments.
+      VAD_INPUT_RMS_GATE: ${VAD_INPUT_RMS_GATE:-40}
     command:
       - "--mode"
       - "realtime"

@@ -16,7 +16,7 @@ WORKDIR /app
 # Runtime system deps: libsndfile for soundfile, git for silero-vad torch.hub load
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libsndfile1 \
-        libspeexdsp1 \
+        libspeexdsp-dev \
         git \
         curl \
     && rm -rf /var/lib/apt/lists/*

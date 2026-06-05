@@ -104,13 +104,17 @@ class VADIterator:
         return self._speech_buffer()
 
     @torch.no_grad()
-    def __call__(self, x: torch.Tensor) -> list[torch.Tensor] | None:
+    def __call__(self, x: torch.Tensor, store: torch.Tensor | None = None) -> list[torch.Tensor] | None:
         """
         x: torch.Tensor
-            audio chunk (see examples in repo)
+            audio chunk scored by the model to decide speech/silence.
 
-        return_seconds: bool (default - False)
-            whether return timestamps in seconds (default - samples)
+        store: torch.Tensor | None (default - None)
+            audio chunk actually buffered and returned as the spoken utterance.
+            When None, ``x`` is stored (legacy behaviour). This lets the caller
+            *detect* on an echo-cancelled signal while *keeping* the raw mic audio
+            for STT — AEC over-suppresses the user's voice during double-talk, so
+            the cleaned signal is good for the VAD decision but bad for Whisper.
         """
 
         if not torch.is_tensor(x):
@@ -118,6 +122,8 @@ class VADIterator:
                 x = torch.Tensor(x)
             except Exception:
                 raise TypeError("Audio cannot be casted to tensor. Cast it manually")
+
+        s = store if store is not None else x
 
         window_size_samples = len(x[0]) if x.dim() == 2 else len(x)
         self.current_sample += window_size_samples
@@ -129,15 +135,15 @@ class VADIterator:
             self.prefix_buffer = list(self._pre_speech_buffer)
             self._pre_speech_buffer.clear()
             self._pre_speech_samples = 0
-            self.buffer.append(x)
+            self.buffer.append(s)
             return None
 
         if not self.triggered:
-            self._remember_pre_speech(x)
+            self._remember_pre_speech(s)
             return None
 
         if self.triggered:
-            self.buffer.append(x)
+            self.buffer.append(s)
             if (speech_prob >= self.threshold) and self.temp_end:
                 self.temp_end = 0
                 return None

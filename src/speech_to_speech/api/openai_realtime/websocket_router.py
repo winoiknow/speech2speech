@@ -232,8 +232,12 @@ def create_app(
                     chunks = service.handle_audio_append(session_id, event)
                     rt_cfg = service._state(session_id).runtime_config
                     for chunk in chunks:
-                        # Cancel the agent's echo (far-end) out of the mic before the VAD.
-                        input_queue.put((echo_canceller.process(chunk), rt_cfg))
+                        # Cancel the agent's echo (far-end) out of the mic for the
+                        # VAD *decision*, but keep the raw chunk for STT: AEC
+                        # over-suppresses the user during double-talk, so the
+                        # cleaned signal is good for detection yet bad for Whisper.
+                        # Payload: (raw, cleaned, runtime_config).
+                        input_queue.put((bytes(chunk), echo_canceller.process(chunk), rt_cfg))
 
                 elif isinstance(event, InputAudioBufferCommitEvent):
                     err = service.handle_audio_commit(session_id)

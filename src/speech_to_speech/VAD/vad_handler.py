@@ -22,7 +22,7 @@ from speech_to_speech.VAD.vad_iterator import VADIterator
 
 logger = logging.getLogger(__name__)
 
-VADInput: TypeAlias = bytes | tuple[bytes, RuntimeConfig]
+VADInput: TypeAlias = bytes | tuple[bytes, RuntimeConfig] | tuple[bytes, bytes, RuntimeConfig]
 
 # Optional import for audio enhancement
 try:
@@ -148,8 +148,17 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
 
     def process(self, audio_chunk: VADIn) -> Iterator[VADOut]:
         runtime_config = None
+        detect_chunk = None  # echo-cancelled audio for the VAD decision (may differ from raw)
         if isinstance(audio_chunk, tuple):
-            audio_chunk, runtime_config = audio_chunk
+            if len(audio_chunk) == 3:
+                # (raw_bytes, cleaned_bytes, runtime_config): detect on cleaned,
+                # but buffer/transcribe raw (AEC over-suppresses the user during
+                # double-talk, so cleaned is bad for STT).
+                audio_chunk, detect_chunk, runtime_config = audio_chunk
+            else:
+                audio_chunk, runtime_config = audio_chunk
+        if detect_chunk is None:
+            detect_chunk = audio_chunk
         self._apply_runtime_turn_detection(runtime_config)
 
         # Heartbeat BEFORE the gate: every chunk that reaches the VAD is counted,
@@ -177,22 +186,26 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
 
         # Normal listening mode
         self._log_chunks += 1
-        audio_int16 = np.frombuffer(audio_chunk, dtype=np.int16)
-        self._total_samples += len(audio_int16)
-        audio_float32 = int2float(audio_int16)
+        raw_int16 = np.frombuffer(audio_chunk, dtype=np.int16)        # buffered for STT
+        detect_int16 = np.frombuffer(detect_chunk, dtype=np.int16)    # scored by silero
+        self._total_samples += len(raw_int16)
+        detect_float32 = int2float(detect_int16)
+        raw_float32 = int2float(raw_int16)
 
-        # RMS gate: the VAD runs on the AEC-cleaned signal, where echo residual
+        # RMS gate: the VAD scores the AEC-cleaned signal, where echo residual
         # sits at very low RMS while genuine speech is far louder. Chunks below
         # the gate are presented to silero as silence so its echo-residual energy
         # can't accumulate into a phantom barge-in; real speech sails over it.
-        if self.input_rms_gate > 0 and audio_int16.size:
-            rms = float(np.sqrt(np.mean(audio_int16.astype(np.float32) ** 2)))
+        # The gate only affects detection — the raw audio stored for STT is intact.
+        if self.input_rms_gate > 0 and detect_int16.size:
+            rms = float(np.sqrt(np.mean(detect_int16.astype(np.float32) ** 2)))
             if rms < self.input_rms_gate:
-                audio_float32 = np.zeros_like(audio_float32)
+                detect_float32 = np.zeros_like(detect_float32)
                 if DEBUG_MODE:
                     self._hb_gated += 1
 
-        vad_output = self.iterator(torch.from_numpy(audio_float32))
+        # Score on the (gated) cleaned signal; buffer the raw signal for STT.
+        vad_output = self.iterator(torch.from_numpy(detect_float32), store=torch.from_numpy(raw_float32))
 
         # Deferred speech_started: only emit once buffer >= min_speech_ms
         is_triggered_now = self.iterator.triggered

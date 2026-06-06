@@ -53,6 +53,11 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         enable_realtime_transcription: bool = False,
         realtime_processing_pause: float = 0.25,
         input_rms_gate: float = 0.0,
+        turn_detection: str = "vad",
+        turn_min_silence_ms: int = 300,
+        turn_max_s: float = 30.0,
+        turn_threshold: float = 0.5,
+        smart_turn_model_path: str = "",
         text_output_queue: Queue[TextEventItem] | None = None,
     ) -> None:
         self.should_listen = should_listen
@@ -78,6 +83,29 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
             min_silence_duration_ms=min_silence_ms,
             speech_pad_ms=speech_pad_ms,
         )
+        # ── Semantic end-of-turn (Smart Turn v3) ──────────────────────────────
+        # When enabled, silero just detects the *pause* (use a short silence so we
+        # ask quickly); Smart Turn decides whether the pause is really end-of-turn
+        # or just a breath. _turn_carry accumulates segments across held pauses so
+        # the detector always sees the whole turn-so-far.
+        self.turn_detector = None
+        self.turn_max_s = float(turn_max_s)
+        self._turn_carry: list[np.ndarray] = []
+        if (turn_detection or "vad").strip().lower() == "smart_turn":
+            from speech_to_speech.VAD.smart_turn import SmartTurnDetector
+
+            detector = SmartTurnDetector(smart_turn_model_path, threshold=turn_threshold, sample_rate=sample_rate)
+            if detector.available:
+                self.turn_detector = detector
+                # Finalize on a short pause; Smart Turn makes the real end-of-turn call.
+                self.iterator.min_silence_samples = int(sample_rate * turn_min_silence_ms / 1000)
+                logger.info(
+                    "Semantic end-of-turn ENABLED (Smart Turn v3): pause=%dms, max_turn=%.0fs, threshold=%.2f",
+                    turn_min_silence_ms, self.turn_max_s, turn_threshold,
+                )
+            else:
+                logger.warning("turn_detection=smart_turn requested but model unavailable — using VAD silence timing")
+
         self.audio_enhancement = audio_enhancement
         if audio_enhancement:
             if not HAS_DF:
@@ -144,8 +172,16 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
             self.iterator.threshold = td["threshold"]
             logger.info(f"VAD threshold updated to {td['threshold']}")
         if "silence_duration_ms" in td:
-            self.iterator.min_silence_samples = self.sample_rate * td["silence_duration_ms"] / 1000
-            logger.info(f"VAD silence duration updated to {td['silence_duration_ms']}ms")
+            if self.turn_detector is not None:
+                # Smart Turn owns end-of-turn; keep our short pause so the client's
+                # (often long) silence_duration_ms doesn't make turn-taking laggy.
+                logger.debug(
+                    "Ignoring client silence_duration_ms=%sms (Smart Turn semantic end-of-turn active)",
+                    td["silence_duration_ms"],
+                )
+            else:
+                self.iterator.min_silence_samples = self.sample_rate * td["silence_duration_ms"] / 1000
+                logger.info(f"VAD silence duration updated to {td['silence_duration_ms']}ms")
 
     def process(self, audio_chunk: VADIn) -> Iterator[VADOut]:
         runtime_config = None
@@ -252,6 +288,35 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
             # Original mode: yield only when speech ends
             yield from self._process_normal(vad_output)
 
+    def _should_end_turn(self, array: np.ndarray) -> tuple[bool, np.ndarray]:
+        """Decide whether a silero-detected pause is really end-of-turn.
+
+        Returns (end_turn, audio_to_emit). With no detector this is a pass-through
+        (always end, original audio = legacy VAD behaviour). With Smart Turn, the
+        segment is accumulated into the running turn and the detector scores the
+        whole turn-so-far: complete (or max-turn ceiling) → end and emit the full
+        turn; incomplete → keep listening (caller holds the mic open).
+        """
+        if self.turn_detector is None:
+            return True, array
+
+        self._turn_carry.append(array)
+        combined = np.concatenate(self._turn_carry) if len(self._turn_carry) > 1 else self._turn_carry[0]
+        dur_s = len(combined) / self.sample_rate
+        if dur_s >= self.turn_max_s:
+            logger.info("Smart Turn: max turn length %.1fs reached — ending turn", dur_s)
+            self._turn_carry = []
+            return True, combined
+
+        complete, prob = self.turn_detector.is_complete(combined)
+        if complete:
+            if DEBUG_MODE:
+                logger.info("Smart Turn: complete (p=%.2f, %.1fs) — ending turn", prob, dur_s)
+            self._turn_carry = []
+            return True, combined
+        logger.info("Smart Turn: incomplete (p=%.2f, %.1fs) — pause, keep listening", prob, dur_s)
+        return False, combined
+
     def _process_realtime(self, vad_output: list[torch.Tensor] | None) -> Iterator[VADOut]:
         """Process with real-time progressive audio release."""
         # Check if we're currently in a speech segment
@@ -289,6 +354,14 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
                     self.text_output_queue.put(SpeechStoppedEvent(audio_end_ms=self._audio_ms))
                 self._speech_started_emitted = False
             else:
+                end_turn, array = self._should_end_turn(array)
+                if not end_turn:
+                    # Semantic detector: the user only paused — hold the mic open,
+                    # don't end the turn or emit the utterance yet.
+                    self.last_process_time = 0.0
+                    self._speech_started_emitted = False
+                    return
+                duration_ms = len(array) / self.sample_rate * 1000
                 end_ms = self._audio_ms
                 if not self._speech_started_emitted and self.text_output_queue:
                     self.text_output_queue.put(SpeechStartedEvent(audio_start_ms=max(0, end_ms - int(duration_ms))))
@@ -323,6 +396,12 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
                     self.text_output_queue.put(SpeechStoppedEvent(audio_end_ms=self._audio_ms))
                 self._speech_started_emitted = False
             else:
+                end_turn, array = self._should_end_turn(array)
+                if not end_turn:
+                    # Semantic detector: the user only paused — hold the mic open.
+                    self._speech_started_emitted = False
+                    return
+                duration_ms = len(array) / self.sample_rate * 1000
                 end_ms = self._audio_ms
                 if not self._speech_started_emitted and self.text_output_queue:
                     self.text_output_queue.put(SpeechStartedEvent(audio_start_ms=max(0, end_ms - int(duration_ms))))
@@ -366,6 +445,7 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         self.last_process_time = 0.0
         self._total_samples = 0
         self._speech_started_emitted = False
+        self._turn_carry = []
         self.should_listen.set()
         logger.debug("VAD session state reset")
 

@@ -68,3 +68,41 @@ class VADHandlerArguments:
             "Env: VAD_INPUT_RMS_GATE (default 100)."
         },
     )
+    turn_detection: str = field(
+        default_factory=lambda: os.environ.get("TURN_DETECTION", "vad"),
+        metadata={
+            "help": "End-of-turn strategy: 'vad' (fixed silence_duration_ms timer, default) or 'smart_turn' "
+            "(Pipecat Smart Turn v3 semantic detector — silero finds the pause, the model decides if it's really "
+            "end-of-turn vs a mid-thought breath). Env: TURN_DETECTION."
+        },
+    )
+    turn_min_silence_ms: int = field(
+        default_factory=lambda: int(os.environ.get("TURN_MIN_SILENCE_MS", "300")),
+        metadata={
+            "help": "smart_turn only: how much silence (ms) silero waits before asking Smart Turn whether the turn is "
+            "complete. Short (≈250-400) keeps turn-taking snappy since the model — not this timer — makes the real "
+            "decision. Env: TURN_MIN_SILENCE_MS."
+        },
+    )
+    turn_max_s: float = field(
+        default_factory=lambda: float(os.environ.get("TURN_MAX_S", "30")),
+        metadata={
+            "help": "smart_turn only: ceiling (s) on a single accumulated turn. If the detector keeps saying "
+            "'incomplete', the turn is force-ended at this length so it can never hang. Env: TURN_MAX_S."
+        },
+    )
+    turn_threshold: float = field(
+        default_factory=lambda: float(os.environ.get("SMART_TURN_THRESHOLD", "0.5")),
+        metadata={
+            "help": "smart_turn only: probability threshold above which a turn is considered complete (0-1, default "
+            "0.5). Higher = wait for stronger end-of-turn evidence (fewer early cutoffs, more latency). "
+            "Env: SMART_TURN_THRESHOLD."
+        },
+    )
+    smart_turn_model_path: str = field(
+        default_factory=lambda: os.environ.get("SMART_TURN_MODEL_PATH", "/app/models/smart-turn-v3.2-cpu.onnx"),
+        metadata={
+            "help": "smart_turn only: path to the Smart Turn v3 ONNX model (baked into the image at build time). "
+            "Env: SMART_TURN_MODEL_PATH."
+        },
+    )

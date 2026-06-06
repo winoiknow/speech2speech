@@ -58,7 +58,16 @@ RUN pip install \
         "soundfile>=0.13.0" \
         "transformers>=4.57.0" \
         "uvicorn>=0.30.0" \
-        "websockets>=12.0"
+        "websockets>=12.0" \
+        "onnxruntime>=1.17.0"
+
+# ── Smart Turn v3 semantic end-of-turn model (TURN_DETECTION=smart_turn) ───────
+# Pipecat Smart Turn v3 (BSD-2): Whisper-tiny encoder + linear head, int8 ONNX,
+# ~12 ms CPU inference. Baked in so the container starts offline. Mel features
+# come from transformers' WhisperFeatureExtractor (already installed above).
+RUN mkdir -p /app/models && \
+    curl -fsSL -o /app/models/smart-turn-v3.2-cpu.onnx \
+        https://huggingface.co/pipecat-ai/smart-turn-v3/resolve/main/smart-turn-v3.2-cpu.onnx
 
 # ── AEC backends (AEC_ENABLED=1) ──────────────────────────────────────────────
 # aec3 (default): WebRTC AEC3 via the abi3 wheel built in stage 1.

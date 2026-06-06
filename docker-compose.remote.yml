@@ -62,6 +62,10 @@ services:
       # (kills phantom barge-ins on echo leaks; tune via DEBUG_MODE 'maxpass').
       # 0 disables. See vad_arguments.
       VAD_INPUT_RMS_GATE: ${VAD_INPUT_RMS_GATE:-100}
+      # While the agent is SPEAKING, gate on the AEC residual at this threshold
+      # instead of raw energy (raw echo can exceed the raw gate at high volume;
+      # the residual still separates echo from a real barge-in). 0 disables.
+      VAD_INPUT_RMS_GATE_FAR: ${VAD_INPUT_RMS_GATE_FAR:-120}
 
       # ── End-of-turn: "vad" (silence timer) or "smart_turn" (Smart Turn v3) ──
       # smart_turn = content/prosody-aware semantic endpointing; no mid-thought cutoffs.

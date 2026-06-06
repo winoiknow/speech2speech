@@ -53,6 +53,7 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         enable_realtime_transcription: bool = False,
         realtime_processing_pause: float = 0.25,
         input_rms_gate: float = 0.0,
+        input_rms_gate_far: float = 120.0,
         turn_detection: str = "vad",
         turn_min_silence_ms: int = 300,
         turn_max_s: float = 30.0,
@@ -64,6 +65,7 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         self.should_listen = should_listen
         self.sample_rate = sample_rate
         self.input_rms_gate = float(input_rms_gate)
+        self.input_rms_gate_far = float(input_rms_gate_far)
         self.min_silence_ms = min_silence_ms
         self.min_speech_ms = min_speech_ms
         self.max_speech_ms = max_speech_ms
@@ -194,8 +196,12 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
     def process(self, audio_chunk: VADIn) -> Iterator[VADOut]:
         runtime_config = None
         detect_chunk = None  # echo-cancelled audio for the VAD decision (may differ from raw)
+        far_active = False   # agent currently producing audio (echo present) → residual gate
         if isinstance(audio_chunk, tuple):
-            if len(audio_chunk) == 3:
+            if len(audio_chunk) == 4:
+                # (raw, cleaned, far_active, runtime_config)
+                audio_chunk, detect_chunk, far_active, runtime_config = audio_chunk
+            elif len(audio_chunk) == 3:
                 # (raw_bytes, cleaned_bytes, runtime_config): detect on cleaned,
                 # but buffer/transcribe raw (AEC over-suppresses the user during
                 # double-talk, so cleaned is bad for STT).
@@ -250,25 +256,30 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         detect_float32 = int2float(detect_int16)
         raw_float32 = int2float(raw_int16)
 
-        # RMS gate — keyed on the RAW mic energy, not the cleaned signal.
-        # AEC3's nonlinear suppressor collapses a genuine double-talk barge-in
-        # down to the same low level as echo residual, so the *cleaned* RMS
-        # can't separate "real interruption" from "echo leak". The *raw* mic
-        # keeps the user's voice far above speaker echo (observed ~140-2054 vs
-        # ~6-39), so we gate on raw energy: below the gate, present silence to
-        # silero (zero the cleaned chunk); above it, feed the cleaned chunk
-        # (echo shape already removed) for the decision. The gate never touches
-        # the raw audio stored for STT. `maxpass` logs the loudest raw chunk
-        # that cleared the gate so the threshold can be tuned to the real echo
-        # leak level.
-        if self.input_rms_gate > 0 and raw_int16.size:
-            raw_rms = float(np.sqrt(np.mean(raw_int16.astype(np.float32) ** 2)))
-            if raw_rms < self.input_rms_gate:
+        # Far-aware RMS gate. The signal we gate on depends on whether the agent
+        # is currently producing audio (echo present):
+        #  • far INACTIVE (agent silent): gate on RAW mic energy — it cleanly
+        #    separates speech from silence, and there's no echo to confuse it.
+        #  • far ACTIVE (agent speaking): raw echo can exceed the raw gate at high
+        #    speaker volume, so gate on the AEC *residual* instead. Echo cancels to
+        #    a low residual, but the user's voice survives AEC (it isn't in the far
+        #    reference), so a real barge-in leaves a much higher residual than echo.
+        # Either way, below the gate we present silence to silero (zero the cleaned
+        # chunk); the raw audio stored for STT is never touched. `maxpass` logs the
+        # loudest passing chunk (of whichever signal is gated) for tuning.
+        if far_active:
+            gate_rms = float(np.sqrt(np.mean(detect_int16.astype(np.float32) ** 2))) if detect_int16.size else 0.0
+            gate_threshold = self.input_rms_gate_far
+        else:
+            gate_rms = float(np.sqrt(np.mean(raw_int16.astype(np.float32) ** 2))) if raw_int16.size else 0.0
+            gate_threshold = self.input_rms_gate
+        if gate_threshold > 0:
+            if gate_rms < gate_threshold:
                 detect_float32 = np.zeros_like(detect_float32)
                 if DEBUG_MODE:
                     self._hb_gated += 1
             elif DEBUG_MODE:
-                self._hb_pass_max = max(self._hb_pass_max, raw_rms)
+                self._hb_pass_max = max(self._hb_pass_max, gate_rms)
 
         # Score on the (gated) cleaned signal; buffer the raw signal for STT.
         vad_output = self.iterator(torch.from_numpy(detect_float32), store=torch.from_numpy(raw_float32))

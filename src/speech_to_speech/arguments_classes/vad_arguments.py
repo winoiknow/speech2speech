@@ -68,6 +68,17 @@ class VADHandlerArguments:
             "Env: VAD_INPUT_RMS_GATE (default 100)."
         },
     )
+    input_rms_gate_far: float = field(
+        default_factory=lambda: float(os.environ.get("VAD_INPUT_RMS_GATE_FAR", "120")),
+        metadata={
+            "help": "Gate threshold applied to the AEC RESIDUAL while the agent is speaking (far-end active), instead "
+            "of the raw gate. At higher speaker volume the raw echo can exceed the raw gate, but AEC cancels echo to a "
+            "low residual while the user's voice survives (it isn't in the far reference) — so during playback we gate "
+            "on the residual: echo (low residual) is rejected, a real barge-in (high residual) passes. Tune with the "
+            "DEBUG_MODE 'maxpass' heartbeat during an agent turn (it shows residual levels then): set above echo "
+            "residual, below your barge-in residual. Set 0 to disable far gating. Env: VAD_INPUT_RMS_GATE_FAR (default 120)."
+        },
+    )
     turn_detection: str = field(
         default_factory=lambda: os.environ.get("TURN_DETECTION", "vad"),
         metadata={

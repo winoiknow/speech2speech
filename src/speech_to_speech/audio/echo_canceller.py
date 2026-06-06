@@ -88,6 +88,9 @@ class EchoCanceller:
         self._silence = b""
         self._far = bytearray()
         self._far_cap = sample_rate * BYTES_PER_SAMPLE * 2
+        # far-activity tracking (for the VAD's far-aware gate)
+        self._last_far_t = 0.0
+        self._far_active_tail = 0.5  # keep far_active this long after the last far chunk
 
         if not self.enabled:
             return
@@ -154,10 +157,22 @@ class EchoCanceller:
             self.enabled = False
 
     # ── public API ──────────────────────────────────────────────────────────
+    @property
+    def far_active(self) -> bool:
+        """True when the agent's audio is (or just was) echoing into the mic: there
+        is far-end still buffered to 'play', or far-end arrived within the tail
+        window. The VAD uses this to gate on the AEC residual during playback —
+        raw echo can exceed the raw gate at high volume, but the residual can't."""
+        if not self.enabled:
+            return False
+        buffered = (len(self._far_buf) > 0) if self.backend == "aec3" else (len(self._far) > 0)
+        return buffered or (time.time() - self._last_far_t) < self._far_active_tail
+
     def add_far_end(self, pcm_int16: bytes) -> None:
         """Buffer outbound TTS (int16 mono @ sample_rate) as the far-end reference."""
         if not self.enabled or not pcm_int16:
             return
+        self._last_far_t = time.time()
         if self.backend == "aec3":
             if not self._ensure_aec3():
                 return

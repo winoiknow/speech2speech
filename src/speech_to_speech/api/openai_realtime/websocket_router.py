@@ -236,8 +236,11 @@ def create_app(
                         # VAD *decision*, but keep the raw chunk for STT: AEC
                         # over-suppresses the user during double-talk, so the
                         # cleaned signal is good for detection yet bad for Whisper.
-                        # Payload: (raw, cleaned, runtime_config).
-                        input_queue.put((bytes(chunk), echo_canceller.process(chunk), rt_cfg))
+                        # far_active drives the VAD's far-aware gate (raw gate when
+                        # the agent is silent, residual gate while it's speaking).
+                        # Payload: (raw, cleaned, far_active, runtime_config).
+                        cleaned = echo_canceller.process(chunk)
+                        input_queue.put((bytes(chunk), cleaned, echo_canceller.far_active, rt_cfg))
 
                 elif isinstance(event, InputAudioBufferCommitEvent):
                     err = service.handle_audio_commit(session_id)

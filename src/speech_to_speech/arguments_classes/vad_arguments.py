@@ -57,11 +57,14 @@ class VADHandlerArguments:
         },
     )
     input_rms_gate: float = field(
-        default_factory=lambda: float(os.environ.get("VAD_INPUT_RMS_GATE", "40")),
+        default_factory=lambda: float(os.environ.get("VAD_INPUT_RMS_GATE", "100")),
         metadata={
-            "help": "Reject mic chunks whose int16 RMS is below this value before the VAD sees them (presented as silence). "
-            "The VAD runs on the AEC-cleaned signal, where echo residual sits at very low RMS (~2-18) while real speech is "
-            "far louder (hundreds+), so this gate kills phantom barge-ins on echo residual without affecting genuine speech. "
-            "Set 0 to disable. Env: VAD_INPUT_RMS_GATE (default 40)."
+            "help": "Reject mic chunks whose RAW int16 RMS is below this value before the VAD decides (the chunk is "
+            "presented to silero as silence). Keyed on raw mic energy, not the AEC-cleaned signal: AEC's nonlinear "
+            "suppressor collapses a real double-talk barge-in to the same low level as echo residual, so only the raw "
+            "mic keeps the user's voice (~140-2000+) above speaker echo (~6-40). This kills phantom barge-ins on echo "
+            "leaks while genuine speech sails over. Tune with the DEBUG_MODE 'maxpass' heartbeat (loudest raw chunk that "
+            "cleared the gate): set it above the echo maxpass, below your speech level. Set 0 to disable. "
+            "Env: VAD_INPUT_RMS_GATE (default 100)."
         },
     )

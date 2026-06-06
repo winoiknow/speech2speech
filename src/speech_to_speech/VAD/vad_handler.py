@@ -104,6 +104,7 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         # from "input arrived but should_listen was clear" (s2s-side gate bug).
         self._hb_chunks_received = 0
         self._hb_gated = 0  # chunks suppressed by the RMS gate this heartbeat window
+        self._hb_pass_max = 0.0  # loudest raw RMS that cleared the gate this window
         self._hb_last_time = 0.0
         self._log_speech_starts = 0
         self._log_speech_ends = 0
@@ -171,14 +172,16 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
             hb_now = time.time()
             if hb_now - self._hb_last_time >= 1.0:
                 logger.info(
-                    "VAD heartbeat: %d chunks/s in | gated=%d | should_listen=%s | triggered=%s",
+                    "VAD heartbeat: %d chunks/s in | gated=%d maxpass=%.0f | should_listen=%s | triggered=%s",
                     self._hb_chunks_received,
                     self._hb_gated,
+                    self._hb_pass_max,
                     self.should_listen.is_set(),
                     self.iterator.triggered,
                 )
                 self._hb_chunks_received = 0
                 self._hb_gated = 0
+                self._hb_pass_max = 0.0
                 self._hb_last_time = hb_now
 
         if not self.should_listen.is_set():
@@ -192,17 +195,25 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         detect_float32 = int2float(detect_int16)
         raw_float32 = int2float(raw_int16)
 
-        # RMS gate: the VAD scores the AEC-cleaned signal, where echo residual
-        # sits at very low RMS while genuine speech is far louder. Chunks below
-        # the gate are presented to silero as silence so its echo-residual energy
-        # can't accumulate into a phantom barge-in; real speech sails over it.
-        # The gate only affects detection — the raw audio stored for STT is intact.
-        if self.input_rms_gate > 0 and detect_int16.size:
-            rms = float(np.sqrt(np.mean(detect_int16.astype(np.float32) ** 2)))
-            if rms < self.input_rms_gate:
+        # RMS gate — keyed on the RAW mic energy, not the cleaned signal.
+        # AEC3's nonlinear suppressor collapses a genuine double-talk barge-in
+        # down to the same low level as echo residual, so the *cleaned* RMS
+        # can't separate "real interruption" from "echo leak". The *raw* mic
+        # keeps the user's voice far above speaker echo (observed ~140-2054 vs
+        # ~6-39), so we gate on raw energy: below the gate, present silence to
+        # silero (zero the cleaned chunk); above it, feed the cleaned chunk
+        # (echo shape already removed) for the decision. The gate never touches
+        # the raw audio stored for STT. `maxpass` logs the loudest raw chunk
+        # that cleared the gate so the threshold can be tuned to the real echo
+        # leak level.
+        if self.input_rms_gate > 0 and raw_int16.size:
+            raw_rms = float(np.sqrt(np.mean(raw_int16.astype(np.float32) ** 2)))
+            if raw_rms < self.input_rms_gate:
                 detect_float32 = np.zeros_like(detect_float32)
                 if DEBUG_MODE:
                     self._hb_gated += 1
+            elif DEBUG_MODE:
+                self._hb_pass_max = max(self._hb_pass_max, raw_rms)
 
         # Score on the (gated) cleaned signal; buffer the raw signal for STT.
         vad_output = self.iterator(torch.from_numpy(detect_float32), store=torch.from_numpy(raw_float32))

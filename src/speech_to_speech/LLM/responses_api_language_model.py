@@ -213,7 +213,7 @@ class ResponsesApiModelHandler(BaseHandler[LLMIn, LLMOut]):
                                     type="output_text",
                                     text=c.text if c.type == "output_text" else c.refusal,
                                 )
-                                for c in raw_event.item.content
+                                for c in (raw_event.item.content or [])
                             ]
                             original_chat.add_item(
                                 RealtimeConversationItemAssistantMessage(
@@ -267,14 +267,14 @@ class ResponsesApiModelHandler(BaseHandler[LLMIn, LLMOut]):
                                     type="output_text",
                                     text=c.text if c.type == "output_text" else c.refusal,
                                 )
-                                for c in message.content
+                                for c in (message.content or [])
                             ]
                             original_chat.add_item(
                                 RealtimeConversationItemAssistantMessage(
                                     type="message", role="assistant", content=content
                                 )
                             )
-                            for chunk in message.content:
+                            for chunk in (message.content or []):
                                 if chunk.type == "output_text":
                                     clean_text += remove_unspeechable(chunk.text)
                         else:
@@ -299,6 +299,14 @@ class ResponsesApiModelHandler(BaseHandler[LLMIn, LLMOut]):
                 runtime_config=runtime_config,
                 response=response,
             )
+        except Exception:
+            # Swallow ANY generation error so execution falls through to the
+            # cleanup + EndOfResponse below. If this propagated, the response
+            # pipeline would never emit EndOfResponse -> no AUDIO_RESPONSE_DONE
+            # -> cancel_scope.discarding (set by any barge-in) would stay stuck
+            # True and every subsequent response's audio would be silently
+            # dropped. A transient LLM hiccup must not permanently mute the agent.
+            logger.error("LLM generation failed; ending response cleanly", exc_info=True)
         finally:
             if api_response is not None and hasattr(api_response, "close"):
                 try:

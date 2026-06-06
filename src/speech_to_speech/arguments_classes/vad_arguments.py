@@ -69,7 +69,7 @@ class VADHandlerArguments:
         },
     )
     input_rms_gate_far: float = field(
-        default_factory=lambda: float(os.environ.get("VAD_INPUT_RMS_GATE_FAR", "120")),
+        default_factory=lambda: float(os.environ.get("VAD_INPUT_RMS_GATE_FAR", "400")),
         metadata={
             "help": "Gate threshold applied to the AEC RESIDUAL while the agent is speaking (far-end active), instead "
             "of the raw gate. At higher speaker volume the raw echo can exceed the raw gate, but AEC cancels echo to a "

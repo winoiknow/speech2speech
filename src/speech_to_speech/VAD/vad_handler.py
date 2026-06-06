@@ -53,7 +53,7 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         enable_realtime_transcription: bool = False,
         realtime_processing_pause: float = 0.25,
         input_rms_gate: float = 0.0,
-        input_rms_gate_far: float = 120.0,
+        input_rms_gate_far: float = 400.0,
         turn_detection: str = "vad",
         turn_min_silence_ms: int = 300,
         turn_max_s: float = 30.0,
@@ -142,7 +142,8 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         # from "input arrived but should_listen was clear" (s2s-side gate bug).
         self._hb_chunks_received = 0
         self._hb_gated = 0  # chunks suppressed by the RMS gate this heartbeat window
-        self._hb_pass_max = 0.0  # loudest raw RMS that cleared the gate this window
+        self._hb_far = 0  # chunks seen while the agent was speaking (residual gate active)
+        self._hb_pass_max = 0.0  # loudest gated-signal RMS that cleared the gate this window
         self._hb_last_time = 0.0
         self._log_speech_starts = 0
         self._log_speech_ends = 0
@@ -219,18 +220,24 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         # the VAD would even act on it. Gated behind DEBUG_MODE (off by default).
         if DEBUG_MODE:
             self._hb_chunks_received += 1
+            if far_active:
+                self._hb_far += 1
             hb_now = time.time()
             if hb_now - self._hb_last_time >= 1.0:
+                # far>0 means maxpass reflects the RESIDUAL (tune VAD_INPUT_RMS_GATE_FAR);
+                # far=0 means maxpass reflects RAW (tune VAD_INPUT_RMS_GATE).
                 logger.info(
-                    "VAD heartbeat: %d chunks/s in | gated=%d maxpass=%.0f | should_listen=%s | triggered=%s",
+                    "VAD heartbeat: %d chunks/s in | gated=%d far=%d maxpass=%.0f | should_listen=%s | triggered=%s",
                     self._hb_chunks_received,
                     self._hb_gated,
+                    self._hb_far,
                     self._hb_pass_max,
                     self.should_listen.is_set(),
                     self.iterator.triggered,
                 )
                 self._hb_chunks_received = 0
                 self._hb_gated = 0
+                self._hb_far = 0
                 self._hb_pass_max = 0.0
                 self._hb_last_time = hb_now
 

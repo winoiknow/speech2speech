@@ -99,6 +99,15 @@ class VADHandlerArguments:
             "Env: SMART_TURN_THRESHOLD."
         },
     )
+    turn_hold_grace_ms: int = field(
+        default_factory=lambda: int(os.environ.get("TURN_HOLD_GRACE_MS", "1200")),
+        metadata={
+            "help": "smart_turn only: after an 'incomplete' verdict, if the user stays silent this long (ms) the turn "
+            "is finalized anyway — the safety net so a held turn can never hang waiting for speech that never comes "
+            "(silero only re-checks on speech-then-pause; a user who just stops would otherwise be stuck). Set it "
+            "above a natural thinking pause but low enough to feel responsive. Env: TURN_HOLD_GRACE_MS."
+        },
+    )
     smart_turn_model_path: str = field(
         default_factory=lambda: os.environ.get("SMART_TURN_MODEL_PATH", "/app/models/smart-turn-v3.2-cpu.onnx"),
         metadata={

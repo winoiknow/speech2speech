@@ -57,6 +57,7 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         turn_min_silence_ms: int = 300,
         turn_max_s: float = 30.0,
         turn_threshold: float = 0.5,
+        turn_hold_grace_ms: int = 1200,
         smart_turn_model_path: str = "",
         text_output_queue: Queue[TextEventItem] | None = None,
     ) -> None:
@@ -90,6 +91,12 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         # the detector always sees the whole turn-so-far.
         self.turn_detector = None
         self.turn_max_s = float(turn_max_s)
+        # Grace fallback: after an "incomplete" verdict, if the user goes silent
+        # this long they're done — finalize so a held turn can never hang waiting
+        # for speech that never comes. _hold_deadline is a wall-clock time set when
+        # we hold; force-finalize once it passes with no resumed speech.
+        self.turn_hold_grace_s = max(0.0, turn_hold_grace_ms / 1000.0)
+        self._hold_deadline: float | None = None
         self._turn_carry: list[np.ndarray] = []
         if (turn_detection or "vad").strip().lower() == "smart_turn":
             from speech_to_speech.VAD.smart_turn import SmartTurnDetector
@@ -100,8 +107,9 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
                 # Finalize on a short pause; Smart Turn makes the real end-of-turn call.
                 self.iterator.min_silence_samples = int(sample_rate * turn_min_silence_ms / 1000)
                 logger.info(
-                    "Semantic end-of-turn ENABLED (Smart Turn v3): pause=%dms, max_turn=%.0fs, threshold=%.2f",
-                    turn_min_silence_ms, self.turn_max_s, turn_threshold,
+                    "Semantic end-of-turn ENABLED (Smart Turn v3): pause=%dms, hold_grace=%.0fms, "
+                    "max_turn=%.0fs, threshold=%.2f",
+                    turn_min_silence_ms, self.turn_hold_grace_s * 1000, self.turn_max_s, turn_threshold,
                 )
             else:
                 logger.warning("turn_detection=smart_turn requested but model unavailable — using VAD silence timing")
@@ -223,6 +231,17 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         if not self.should_listen.is_set():
             return
 
+        # Smart Turn hold fallback: we're holding an "incomplete" turn. If the user
+        # resumed speaking, cancel the fallback (the normal pause path will re-check).
+        # If they've stayed silent past the grace window, they're done — finalize the
+        # held turn now so it can't hang waiting for a pause that never comes.
+        if self._turn_carry and self._hold_deadline is not None:
+            if self.iterator.triggered:
+                self._hold_deadline = None
+            elif time.time() >= self._hold_deadline:
+                yield from self._force_finalize_turn()
+                return
+
         # Normal listening mode
         self._log_chunks += 1
         raw_int16 = np.frombuffer(audio_chunk, dtype=np.int16)        # buffered for STT
@@ -317,6 +336,43 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         logger.info("Smart Turn: incomplete (p=%.2f, %.1fs) — pause, keep listening", prob, dur_s)
         return False, combined
 
+    def _finalize_emit(self, array: np.ndarray) -> Iterator[VADOut]:
+        """Common end-of-turn side effects + emit: SpeechStarted (if not already),
+        stop listening, SpeechStopped, optional enhancement, yield the utterance."""
+        duration_ms = len(array) / self.sample_rate * 1000
+        end_ms = self._audio_ms
+        if not self._speech_started_emitted and self.text_output_queue:
+            self.text_output_queue.put(SpeechStartedEvent(audio_start_ms=max(0, end_ms - int(duration_ms))))
+        self._log_speech_ends += 1
+        self.should_listen.clear()
+        self._hold_deadline = None
+        logger.info(f"Speech ended ({duration_ms:.0f}ms), stop listening")
+        if self.text_output_queue:
+            self.text_output_queue.put(SpeechStoppedEvent(duration_s=duration_ms / 1000.0, audio_end_ms=end_ms))
+        if self.audio_enhancement:
+            array = self._apply_audio_enhancement(array)
+        if self.enable_realtime_transcription:
+            yield VADAudio(audio=array, mode="final")
+        else:
+            yield VADAudio(audio=array)
+        self.last_process_time = 0.0
+        self._speech_started_emitted = False
+
+    def _force_finalize_turn(self) -> Iterator[VADOut]:
+        """End a held (incomplete) turn after the grace window — the user went
+        silent, so emit the accumulated turn rather than wait forever."""
+        if not self._turn_carry:
+            self._hold_deadline = None
+            return
+        array = np.concatenate(self._turn_carry) if len(self._turn_carry) > 1 else self._turn_carry[0]
+        self._turn_carry = []
+        logger.info(
+            "Smart Turn: %.0fms silence after 'incomplete' — user done, finalizing held turn (%.1fs)",
+            self.turn_hold_grace_s * 1000, len(array) / self.sample_rate,
+        )
+        self.iterator.reset_states()
+        yield from self._finalize_emit(array)
+
     def _process_realtime(self, vad_output: list[torch.Tensor] | None) -> Iterator[VADOut]:
         """Process with real-time progressive audio release."""
         # Check if we're currently in a speech segment
@@ -356,25 +412,14 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
             else:
                 end_turn, array = self._should_end_turn(array)
                 if not end_turn:
-                    # Semantic detector: the user only paused — hold the mic open,
-                    # don't end the turn or emit the utterance yet.
+                    # Semantic detector: the user only paused — hold the mic open.
+                    # Arm the grace fallback so the turn can't hang if they stop, and
+                    # keep _speech_started_emitted so the whole held turn is one
+                    # Start/Stop bracket (no duplicate SpeechStarted per segment).
+                    self._hold_deadline = time.time() + self.turn_hold_grace_s
                     self.last_process_time = 0.0
-                    self._speech_started_emitted = False
                     return
-                duration_ms = len(array) / self.sample_rate * 1000
-                end_ms = self._audio_ms
-                if not self._speech_started_emitted and self.text_output_queue:
-                    self.text_output_queue.put(SpeechStartedEvent(audio_start_ms=max(0, end_ms - int(duration_ms))))
-                self._log_speech_ends += 1
-                self.should_listen.clear()
-                logger.info(f"Speech ended ({duration_ms:.0f}ms), stop listening")
-                if self.text_output_queue:
-                    self.text_output_queue.put(SpeechStoppedEvent(duration_s=duration_ms / 1000.0, audio_end_ms=end_ms))
-                if self.audio_enhancement:
-                    array = self._apply_audio_enhancement(array)
-                yield VADAudio(audio=array, mode="final")
-                self.last_process_time = 0.0
-                self._speech_started_emitted = False
+                yield from self._finalize_emit(array)
 
     def _process_normal(self, vad_output: list[torch.Tensor] | None) -> Iterator[VADOut]:
         """Original processing: yield only when speech ends."""
@@ -398,22 +443,11 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
             else:
                 end_turn, array = self._should_end_turn(array)
                 if not end_turn:
-                    # Semantic detector: the user only paused — hold the mic open.
-                    self._speech_started_emitted = False
+                    # Semantic detector: the user only paused — hold the mic open
+                    # and arm the grace fallback so a held turn can't hang.
+                    self._hold_deadline = time.time() + self.turn_hold_grace_s
                     return
-                duration_ms = len(array) / self.sample_rate * 1000
-                end_ms = self._audio_ms
-                if not self._speech_started_emitted and self.text_output_queue:
-                    self.text_output_queue.put(SpeechStartedEvent(audio_start_ms=max(0, end_ms - int(duration_ms))))
-                self._log_speech_ends += 1
-                self.should_listen.clear()
-                logger.info(f"Speech ended ({duration_ms:.0f}ms), stop listening")
-                if self.text_output_queue:
-                    self.text_output_queue.put(SpeechStoppedEvent(duration_s=duration_ms / 1000.0, audio_end_ms=end_ms))
-                if self.audio_enhancement:
-                    array = self._apply_audio_enhancement(array)
-                yield VADAudio(audio=array)
-                self._speech_started_emitted = False
+                yield from self._finalize_emit(array)
 
     def _apply_audio_enhancement(self, array: np.ndarray) -> np.ndarray:
         """Apply audio enhancement if enabled."""
@@ -446,6 +480,7 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         self._total_samples = 0
         self._speech_started_emitted = False
         self._turn_carry = []
+        self._hold_deadline = None
         self.should_listen.set()
         logger.debug("VAD session state reset")
 

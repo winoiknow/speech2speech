@@ -69,6 +69,9 @@ services:
       TURN_MIN_SILENCE_MS: ${TURN_MIN_SILENCE_MS:-300}
       TURN_MAX_S: ${TURN_MAX_S:-30}
       SMART_TURN_THRESHOLD: ${SMART_TURN_THRESHOLD:-0.5}
+      # Finalize a held "incomplete" turn after this much silence (safety net so
+      # a turn can't hang if the user stops after an incomplete verdict).
+      TURN_HOLD_GRACE_MS: ${TURN_HOLD_GRACE_MS:-1200}
       SMART_TURN_MODEL_PATH: ${SMART_TURN_MODEL_PATH:-/app/models/smart-turn-v3.2-cpu.onnx}
       # Explicit ONNX intra-op threads (avoids container-cpuset affinity errors).
       SMART_TURN_NUM_THREADS: ${SMART_TURN_NUM_THREADS:-2}

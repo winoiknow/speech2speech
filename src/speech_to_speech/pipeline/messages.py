@@ -53,12 +53,30 @@ class PartialTranscription(PipelineMessage):
     text: str
 
 
+class SpeakerLabel(PipelineMessage):
+    """Speaker-identity verdict for a turn segment (speaker-id service, Phase 0+).
+
+    ``decision`` is a first-class enum, not a bare ``known`` bool, so ``ambiguous``
+    can be a distinct outcome: the notifier chooses NOT to label rather than guess.
+    Scores travel for observability. ``None``/``unknown`` everywhere when the
+    feature is off, so this is a no-op until SPEAKER_ID_ENABLED is wired (Phase 3).
+    """
+
+    tag: Literal["speaker_label"] = "speaker_label"
+    decision: Literal["known", "unknown", "ambiguous"] = "unknown"
+    speaker_id: Optional[str] = None  # set when decision == "known"
+    name: Optional[str] = None  # display name when known
+    score: float = 0.0  # top cosine similarity
+    runner_up_score: float = 0.0  # second-best, for ambiguity/observability
+
+
 class Transcription(PipelineMessage):
     """Final transcription result."""
 
     tag: Literal["transcription"] = "transcription"
     text: str
     language_code: Optional[str] = None
+    speaker: Optional[SpeakerLabel] = None  # None when speaker-id is off (default)
 
 
 # ── LLM → LMOutputProcessor ──────────────────────────────────────────

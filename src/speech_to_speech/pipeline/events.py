@@ -50,6 +50,9 @@ class TranscriptionCompletedEvent(PipelineEvent):
     type: Literal["transcription_completed"] = "transcription_completed"
     transcript: str
     language_code: Optional[str] = None
+    # SpeakerLabel.model_dump() or None (speaker-id, Phase 0+). None when off,
+    # so the client-facing transcript event is unchanged until Phase 3 wiring.
+    speaker: Optional[dict] = None
 
 
 # ── LLM output events (LMOutputProcessor) ────────────────────────────

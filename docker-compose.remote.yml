@@ -66,6 +66,11 @@ services:
       # instead of raw energy (raw echo can exceed the raw gate at high volume;
       # the residual still separates echo from a real barge-in). 0 disables.
       VAD_INPUT_RMS_GATE_FAR: ${VAD_INPUT_RMS_GATE_FAR:-400}
+      # While the agent speaks, require sustained energy (>= MIN of the last
+      # WINDOW chunks above the residual gate) to pass — rejects sparse transient
+      # echo spikes that a level gate alone lets through, passes dense real speech.
+      VAD_FAR_SUSTAIN_MIN: ${VAD_FAR_SUSTAIN_MIN:-6}
+      VAD_FAR_SUSTAIN_WINDOW: ${VAD_FAR_SUSTAIN_WINDOW:-12}
 
       # ── End-of-turn: "vad" (silence timer) or "smart_turn" (Smart Turn v3) ──
       # smart_turn = content/prosody-aware semantic endpointing; no mid-thought cutoffs.

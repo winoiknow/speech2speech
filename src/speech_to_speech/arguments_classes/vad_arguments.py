@@ -76,7 +76,24 @@ class VADHandlerArguments:
             "low residual while the user's voice survives (it isn't in the far reference) — so during playback we gate "
             "on the residual: echo (low residual) is rejected, a real barge-in (high residual) passes. Tune with the "
             "DEBUG_MODE 'maxpass' heartbeat during an agent turn (it shows residual levels then): set above echo "
-            "residual, below your barge-in residual. Set 0 to disable far gating. Env: VAD_INPUT_RMS_GATE_FAR (default 120)."
+            "residual, below your barge-in residual. Set 0 to disable far gating. Env: VAD_INPUT_RMS_GATE_FAR (default 400)."
+        },
+    )
+    far_sustain_min: int = field(
+        default_factory=lambda: int(os.environ.get("VAD_FAR_SUSTAIN_MIN", "6")),
+        metadata={
+            "help": "While the agent speaks, a chunk only passes the far gate if at least this many of the recent "
+            "far_sustain_window chunks cleared the residual gate. Echo-residual leaks are sparse transient spikes "
+            "(a level gate alone can't tell a 533 echo spike from a 533 speech onset); real speech is dense. This "
+            "rejects the transient and passes sustained speech. Higher = stricter (fewer phantoms, slower/possibly "
+            "missed brief barge-ins). Env: VAD_FAR_SUSTAIN_MIN (default 6 of 12)."
+        },
+    )
+    far_sustain_window: int = field(
+        default_factory=lambda: int(os.environ.get("VAD_FAR_SUSTAIN_WINDOW", "12")),
+        metadata={
+            "help": "Rolling window (chunks, ~32ms each) over which far_sustain_min is counted. Env: "
+            "VAD_FAR_SUSTAIN_WINDOW (default 12 ≈ 384ms)."
         },
     )
     turn_detection: str = field(

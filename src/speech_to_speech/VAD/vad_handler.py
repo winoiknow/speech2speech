@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import deque
 from collections.abc import Iterator
 from queue import Queue
 from threading import Event
@@ -54,6 +55,8 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         realtime_processing_pause: float = 0.25,
         input_rms_gate: float = 0.0,
         input_rms_gate_far: float = 400.0,
+        far_sustain_min: int = 6,
+        far_sustain_window: int = 12,
         turn_detection: str = "vad",
         turn_min_silence_ms: int = 300,
         turn_max_s: float = 30.0,
@@ -66,6 +69,10 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         self.sample_rate = sample_rate
         self.input_rms_gate = float(input_rms_gate)
         self.input_rms_gate_far = float(input_rms_gate_far)
+        # sustained-energy filter for the far (residual) gate: reject sparse
+        # transient echo spikes, pass dense real speech.
+        self._far_sustain_min = max(1, int(far_sustain_min))
+        self._far_run: deque[int] = deque(maxlen=max(self._far_sustain_min, int(far_sustain_window)))
         self.min_silence_ms = min_silence_ms
         self.min_speech_ms = min_speech_ms
         self.max_speech_ms = max_speech_ms
@@ -271,22 +278,40 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         #    speaker volume, so gate on the AEC *residual* instead. Echo cancels to
         #    a low residual, but the user's voice survives AEC (it isn't in the far
         #    reference), so a real barge-in leaves a much higher residual than echo.
-        # Either way, below the gate we present silence to silero (zero the cleaned
-        # chunk); the raw audio stored for STT is never touched. `maxpass` logs the
-        # loudest passing chunk (of whichever signal is gated) for tuning.
+        # Below the gate we present silence to silero (zero the cleaned chunk); the
+        # raw audio stored for STT is never touched. `maxpass` logs the loudest
+        # above-threshold chunk for tuning.
         if far_active:
             gate_rms = float(np.sqrt(np.mean(detect_int16.astype(np.float32) ** 2))) if detect_int16.size else 0.0
             gate_threshold = self.input_rms_gate_far
         else:
+            self._far_run.clear()
             gate_rms = float(np.sqrt(np.mean(raw_int16.astype(np.float32) ** 2))) if raw_int16.size else 0.0
             gate_threshold = self.input_rms_gate
-        if gate_threshold > 0:
-            if gate_rms < gate_threshold:
-                detect_float32 = np.zeros_like(detect_float32)
-                if DEBUG_MODE:
-                    self._hb_gated += 1
-            elif DEBUG_MODE:
-                self._hb_pass_max = max(self._hb_pass_max, gate_rms)
+        above = (gate_threshold <= 0) or (gate_rms >= gate_threshold)
+
+        # Sustained-energy requirement during playback: echo-residual leaks are
+        # sparse TRANSIENT spikes (a level gate alone can't tell a 533 echo spike
+        # from a 533 speech onset), but real speech is DENSE — most chunks above
+        # the gate. So while far is active, a chunk only passes if the energy has
+        # been sustained (>= _far_sustain_min above-gate chunks in the recent
+        # window). A brief spike that clears the level gate but isn't sustained is
+        # rejected as echo. Observed: phantom ~5/32 chunks (sparse) vs real
+        # barge-in ~8/9 (dense).
+        if far_active and gate_threshold > 0:
+            self._far_run.append(1 if above else 0)
+            passed = above and (sum(self._far_run) >= self._far_sustain_min)
+        else:
+            passed = above
+
+        if not passed:
+            detect_float32 = np.zeros_like(detect_float32)
+            if DEBUG_MODE:
+                self._hb_gated += 1
+        if DEBUG_MODE and above:
+            # ceiling of above-threshold chunks (residual when far, raw otherwise),
+            # so the level gate stays tunable even when a spike is sustain-rejected.
+            self._hb_pass_max = max(self._hb_pass_max, gate_rms)
 
         # Score on the (gated) cleaned signal; buffer the raw signal for STT.
         vad_output = self.iterator(torch.from_numpy(detect_float32), store=torch.from_numpy(raw_float32))
@@ -499,6 +524,7 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         self._speech_started_emitted = False
         self._turn_carry = []
         self._hold_deadline = None
+        self._far_run.clear()
         self.should_listen.set()
         logger.debug("VAD session state reset")
 

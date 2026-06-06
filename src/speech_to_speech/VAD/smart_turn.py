@@ -60,6 +60,13 @@ class SmartTurnDetector:
             so = ort.SessionOptions()
             so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
             so.inter_op_num_threads = 1
+            # Set intra-op threads EXPLICITLY: onnxruntime otherwise spawns one
+            # thread per core and pins each with pthread_setaffinity_np, which
+            # fails (EINVAL) under a container cpuset and spams the log. An
+            # explicit count disables the affinity pinning. Tiny model run only
+            # at pause boundaries, so a small count is ample. Env override:
+            # SMART_TURN_NUM_THREADS.
+            so.intra_op_num_threads = max(1, int(os.environ.get("SMART_TURN_NUM_THREADS", "2")))
             so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
             self._sess = ort.InferenceSession(self.model_path, sess_options=so, providers=["CPUExecutionProvider"])
             # Direct constructor (no from_pretrained) → builds mel filters in-process, no network.

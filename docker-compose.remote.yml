@@ -70,6 +70,8 @@ services:
       TURN_MAX_S: ${TURN_MAX_S:-30}
       SMART_TURN_THRESHOLD: ${SMART_TURN_THRESHOLD:-0.5}
       SMART_TURN_MODEL_PATH: ${SMART_TURN_MODEL_PATH:-/app/models/smart-turn-v3.2-cpu.onnx}
+      # Explicit ONNX intra-op threads (avoids container-cpuset affinity errors).
+      SMART_TURN_NUM_THREADS: ${SMART_TURN_NUM_THREADS:-2}
     command:
       - "--mode"
       - "realtime"

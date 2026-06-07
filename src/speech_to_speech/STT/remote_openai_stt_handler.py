@@ -7,6 +7,7 @@ from __future__ import annotations
 import io
 import logging
 import struct
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Iterator
 
 import httpx
@@ -64,6 +65,8 @@ class RemoteOpenAISTTHandler(BaseHandler[STTIn, STTOut]):
         model: str = "Systran/faster-whisper-large-v3",
         language: str = "en",
         timeout: float = 30.0,
+        speaker_client: Any | None = None,  # RemoteSpeakerClient when SPEAKER_ID_ENABLED
+        speaker_timeout: float = 0.8,
         gen_kwargs: dict | None = None,  # accepted for pipeline compatibility, unused
     ) -> None:
         self.model = model
@@ -72,7 +75,13 @@ class RemoteOpenAISTTHandler(BaseHandler[STTIn, STTOut]):
         self.headers = {"Authorization": f"Bearer {api_key}"}
         self.timeout = timeout
         self._client = httpx.Client(timeout=self.timeout)
-        logger.info("RemoteOpenAISTTHandler ready → %s (model=%s)", self.endpoint, self.model)
+        # Speaker identification runs concurrently with the transcribe round-trip
+        # (both network-bound → overlap → ~0 added latency). None → disabled.
+        self.speaker_client = speaker_client
+        self.speaker_timeout = speaker_timeout
+        self._spk_pool = ThreadPoolExecutor(max_workers=1) if speaker_client is not None else None
+        logger.info("RemoteOpenAISTTHandler ready → %s (model=%s, speaker_id=%s)",
+                    self.endpoint, self.model, "on" if speaker_client is not None else "off")
 
     def process(self, vad_audio: STTIn) -> Iterator[STTOut]:
         # The VAD emits the growing buffer in "progressive" mode (for live partials) and
@@ -89,6 +98,12 @@ class RemoteOpenAISTTHandler(BaseHandler[STTIn, STTOut]):
         audio_float32: np.ndarray = vad_audio.audio
         audio_int16 = (audio_float32 * 32768).clip(-32768, 32767).astype(np.int16)
         wav_bytes = _pcm_to_wav(audio_int16.tobytes())
+
+        # Fire speaker identify CONCURRENTLY (same wav_bytes = raw user voice) so it
+        # overlaps the transcribe round-trip; joined below with a hard bound.
+        spk_future = None
+        if self.speaker_client is not None and self._spk_pool is not None:
+            spk_future = self._spk_pool.submit(self.speaker_client.identify, wav_bytes)
 
         files: dict[str, Any] = {
             "file": ("audio.wav", io.BytesIO(wav_bytes), "audio/wav"),
@@ -113,8 +128,23 @@ class RemoteOpenAISTTHandler(BaseHandler[STTIn, STTOut]):
             logger.debug("RemoteOpenAISTT: empty transcript, skipping")
             return
 
+        # Join identify (already overlapped with transcribe → usually instant).
+        # Bounded by the client timeout + a small grace; any failure → unknown.
+        speaker = None
+        if spk_future is not None:
+            try:
+                speaker = spk_future.result(timeout=self.speaker_timeout + 0.2)
+            except Exception:
+                speaker = None
+            if speaker is not None:
+                logger.debug("speaker: decision=%s id=%s score=%.3f", speaker.decision, speaker.speaker_id, speaker.score)
+
         console.print(f"[yellow]USER: {pred_text}")
-        yield Transcription(text=pred_text, language_code=language_code)
+        yield Transcription(text=pred_text, language_code=language_code, speaker=speaker)
 
     def cleanup(self) -> None:
         self._client.close()
+        if self._spk_pool is not None:
+            self._spk_pool.shutdown(wait=False)
+        if self.speaker_client is not None:
+            self.speaker_client.close()

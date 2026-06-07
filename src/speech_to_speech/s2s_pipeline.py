@@ -505,9 +505,25 @@ def build_pipeline(
         setup_kwargs=vars(vad_handler_kwargs),
     )
 
+    # ── Speaker-id (Phase 3, env-backed, off by default) ──────────────────────
+    # Build the client once here; inject it into the remote STT handler (concurrent
+    # identify) and the label format into the notifier. Flag off → None → no-op.
+    from speech_to_speech.arguments_classes.speaker_id_arguments import SpeakerIdHandlerArguments
+
+    speaker_args = SpeakerIdHandlerArguments()
+    speaker_client = None
+    if speaker_args.speaker_id_enabled:
+        from speech_to_speech.speaker_id.remote_speaker_client import RemoteSpeakerClient
+
+        speaker_client = RemoteSpeakerClient(
+            speaker_args.speaker_id_base_url, speaker_args.speaker_id_api_key, speaker_args.speaker_id_timeout
+        )
+        logger.info("Speaker-id ENABLED → %s", speaker_args.speaker_id_base_url)
+
     transcription_notifier_kwargs: dict[str, Any] = {
         "text_output_queue": text_output_queue,
         "should_listen": should_listen,
+        "label_format": speaker_args.speaker_id_label_format if speaker_client is not None else "",
     }
     if module_kwargs.mode != "realtime":
         if module_kwargs.llm_backend == "responses-api":
@@ -547,6 +563,8 @@ def build_pipeline(
         mlx_audio_whisper_stt_handler_kwargs,
         parakeet_tdt_stt_handler_kwargs,
         remote_openai_stt_handler_kwargs,
+        speaker_client=speaker_client,
+        speaker_timeout=speaker_args.speaker_id_timeout,
     )
 
     lm = get_llm_handler(
@@ -601,6 +619,8 @@ def get_stt_handler(
     mlx_audio_whisper_stt_handler_kwargs: MLXAudioWhisperSTTHandlerArguments,
     parakeet_tdt_stt_handler_kwargs: ParakeetTDTSTTHandlerArguments,
     remote_openai_stt_handler_kwargs: RemoteOpenAISTTHandlerArguments | None = None,
+    speaker_client: Any | None = None,
+    speaker_timeout: float = 0.8,
 ) -> BaseHandler[STTIn, STTOut]:
     if module_kwargs.stt == "whisper":
         from speech_to_speech.STT.whisper_stt_handler import WhisperSTTHandler
@@ -668,11 +688,14 @@ def get_stt_handler(
     elif module_kwargs.stt == "openai-remote":
         from speech_to_speech.STT.remote_openai_stt_handler import RemoteOpenAISTTHandler
 
+        setup_kwargs = vars(remote_openai_stt_handler_kwargs)
+        if speaker_client is not None:  # concurrent speaker identify (Phase 3)
+            setup_kwargs = {**setup_kwargs, "speaker_client": speaker_client, "speaker_timeout": speaker_timeout}
         return RemoteOpenAISTTHandler(
             stop_event,
             queue_in=spoken_prompt_queue,
             queue_out=text_prompt_queue,
-            setup_kwargs=vars(remote_openai_stt_handler_kwargs),
+            setup_kwargs=setup_kwargs,
         )
     else:
         raise ValueError(

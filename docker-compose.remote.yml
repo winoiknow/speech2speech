@@ -84,6 +84,16 @@ services:
       SMART_TURN_MODEL_PATH: ${SMART_TURN_MODEL_PATH:-/app/models/smart-turn-v3.2-cpu.onnx}
       # Explicit ONNX intra-op threads (avoids container-cpuset affinity errors).
       SMART_TURN_NUM_THREADS: ${SMART_TURN_NUM_THREADS:-2}
+
+      # ── Speaker identification (off by default) ─────────────────────────
+      # When on, fires /v1/identify concurrently with STT and tags the dialogue
+      # [name] on a confident match. Run the speaker-id service (below profile,
+      # or its own compose) and point SPEAKER_ID_BASE_URL at it.
+      SPEAKER_ID_ENABLED: ${SPEAKER_ID_ENABLED:-0}
+      SPEAKER_ID_BASE_URL: ${SPEAKER_ID_BASE_URL:-http://speaker-id:9100}
+      SPEAKER_ID_API_KEY: ${SPEAKER_ID_API_KEY:-}
+      SPEAKER_ID_TIMEOUT: ${SPEAKER_ID_TIMEOUT:-0.8}
+      SPEAKER_ID_LABEL_FORMAT: ${SPEAKER_ID_LABEL_FORMAT:-[{name}] }
     command:
       - "--mode"
       - "realtime"
@@ -117,3 +127,31 @@ services:
       # Allow container to reach services on the host machine
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
+
+  # ── Adjacent speaker-id service (opt-in) ──────────────────────────────────
+  # Owns the embedding model + speaker store + enrollment UI (kept out of the lean
+  # s2s-remote image). Opt-in so the default `docker compose up` is unchanged:
+  #   docker compose --profile speaker-id up   (then set SPEAKER_ID_ENABLED=1)
+  # Source repo (sibling layout): ~/workspace/diarization/speaker-id. Override the
+  # build context with SPEAKER_ID_BUILD_CONTEXT if your checkout differs. It also
+  # runs standalone from its own compose; if you do that, just point
+  # SPEAKER_ID_BASE_URL at it and skip this service.
+  speaker-id:
+    profiles: ["speaker-id"]
+    build:
+      context: ${SPEAKER_ID_BUILD_CONTEXT:-../../diarization/speaker-id}
+    ports:
+      - "9100:9100"
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-speechbrain/spkrec-ecapa-voxceleb}
+      STORE_BACKEND: ${STORE_BACKEND:-sqlite}
+      STORE_PATH: ${STORE_PATH:-/data/speakers.db}
+      SIMILARITY_THRESHOLD: ${SIMILARITY_THRESHOLD:-0.65}
+      AMBIGUOUS_MARGIN: ${AMBIGUOUS_MARGIN:-0.08}
+    volumes:
+      - speaker_data:/data
+    restart: unless-stopped
+
+volumes:
+  speaker_data:

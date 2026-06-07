@@ -53,6 +53,29 @@ class TranscriptionCompletedEvent(PipelineEvent):
     # SpeakerLabel.model_dump() or None (speaker-id, Phase 0+). None when off,
     # so the client-facing transcript event is unchanged until Phase 3 wiring.
     speaker: Optional[dict] = None
+    # Turn id a later TranscriptionCorrectedEvent can reference (Phase 4). None
+    # unless diarization is on, so the event is unchanged when the feature is off.
+    item_id: Optional[str] = None
+
+
+class TranscriptionCorrectedEvent(PipelineEvent):
+    """Async diarization correction for a prior transcript (Phase 4, Tier 2).
+
+    Replaces the speaker label(s) for ``item_id``'s spans after the turn was
+    already emitted. Idempotent and ``revision``-versioned (a consumer ignores a
+    revision ≤ the last it applied for this ``item_id``). Dropped-safe: a consumer
+    with no support simply ignores it and the Tier-1 transcript stands. Only
+    produced when SPEAKER_DIARIZE_ENABLED is on — never emitted otherwise.
+    """
+
+    type: Literal["transcription_corrected"] = "transcription_corrected"
+    item_id: str
+    revision: int = 1
+    # SpeakerSpan.model_dump() list — time-ordered spans with per-span labels.
+    segments: list[dict] = Field(default_factory=list)
+    # Optional re-rendered transcript with span labels applied; None = consumer
+    # re-renders from segments itself.
+    transcript: Optional[str] = None
 
 
 # ── LLM output events (LMOutputProcessor) ────────────────────────────

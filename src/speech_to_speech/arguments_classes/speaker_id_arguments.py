@@ -29,3 +29,13 @@ class SpeakerIdHandlerArguments:
     speaker_id_label_format: str = field(
         default_factory=lambda: os.environ.get("SPEAKER_ID_LABEL_FORMAT", "[{name}] ")
     )
+    # ── Phase 4 (Tier 2): async conference diarization, OFF the hot path ──
+    # Separate flag from recognition: identify can run without diarization. When
+    # off, no /v1/diarize call is made and no correction event is ever emitted.
+    speaker_diarize_enabled: bool = field(
+        default_factory=lambda: _env_bool("SPEAKER_DIARIZE_ENABLED", False)
+    )
+    # Looser than the identify timeout — diarization is off the turn's hot path.
+    speaker_diarize_timeout: float = field(
+        default_factory=lambda: float(os.environ.get("SPEAKER_DIARIZE_TIMEOUT", "5.0"))
+    )

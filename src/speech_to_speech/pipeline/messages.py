@@ -79,6 +79,47 @@ class Transcription(PipelineMessage):
     speaker: Optional[SpeakerLabel] = None  # None when speaker-id is off (default)
 
 
+class SpeakerSpan(PipelineMessage):
+    """One diarized speaker span of a turn (speaker-id /v1/diarize, Phase 4).
+
+    ``label`` is what a consumer displays: the enrolled ``name`` when ``known``,
+    else an **ephemeral per-call** tag (``S1``, ``S2`` …) — stable within the turn
+    only, never an identity claim. Times are seconds from the turn's start.
+    """
+
+    tag: Literal["speaker_span"] = "speaker_span"
+    start: float = 0.0
+    end: float = 0.0
+    decision: Literal["known", "unknown", "ambiguous"] = "unknown"
+    speaker_id: Optional[str] = None
+    name: Optional[str] = None
+    label: str = ""
+    score: float = 0.0
+    runner_up_score: float = 0.0
+
+
+class SpeakerCorrection(PipelineMessage):
+    """Async diarization correction for an already-emitted turn (Phase 4, Tier 2).
+
+    Diarization runs *off the hot path*; when ready it supersedes the Tier-1
+    speaker label for ``item_id``'s spans. Protocol (see IMPLEMENTATION_PLAN.md):
+
+      * keyed by the original ``item_id`` + per-span offsets;
+      * **idempotent** — applying the same correction twice is a no-op;
+      * **versioned** by ``revision`` — a late/out-of-order correction is ignored
+        once a newer ``revision`` for the same ``item_id`` has applied;
+      * **dropped-safe** — if no consumer applies it, the Tier-1 transcript stands;
+        a correction never re-opens or blocks a completed turn.
+
+    Inert unless SPEAKER_DIARIZE_ENABLED is set; never produced when off.
+    """
+
+    tag: Literal["speaker_correction"] = "speaker_correction"
+    item_id: str
+    revision: int = 1
+    segments: list[SpeakerSpan] = Field(default_factory=list)
+
+
 # ── LLM → LMOutputProcessor ──────────────────────────────────────────
 
 

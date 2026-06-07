@@ -94,6 +94,10 @@ services:
       SPEAKER_ID_API_KEY: ${SPEAKER_ID_API_KEY:-}
       SPEAKER_ID_TIMEOUT: ${SPEAKER_ID_TIMEOUT:-0.8}
       SPEAKER_ID_LABEL_FORMAT: ${SPEAKER_ID_LABEL_FORMAT:-[{name}] }
+      # Phase 4 (Tier 2): async conference diarization, OFF the hot path. Separate
+      # flag from recognition — the corrective-event contract is inert until on.
+      SPEAKER_DIARIZE_ENABLED: ${SPEAKER_DIARIZE_ENABLED:-0}
+      SPEAKER_DIARIZE_TIMEOUT: ${SPEAKER_DIARIZE_TIMEOUT:-5.0}
     command:
       - "--mode"
       - "realtime"

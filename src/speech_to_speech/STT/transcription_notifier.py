@@ -50,10 +50,12 @@ class TranscriptionNotifier(BaseHandler[STTOut, Union[STTOut, LLMIn]]):
             return
 
         speaker = None
+        audio_wav = None
         if isinstance(transcription, Transcription):
             text = transcription.text
             language_code = transcription.language_code
             speaker = transcription.speaker
+            audio_wav = transcription.audio_wav  # set only when diarization is on
         else:
             text = transcription
             language_code = None
@@ -77,6 +79,7 @@ class TranscriptionNotifier(BaseHandler[STTOut, Union[STTOut, LLMIn]]):
                 transcript=transcript,
                 language_code=language_code,
                 speaker=(speaker.model_dump() if speaker is not None else None),
+                audio_wav=audio_wav,  # forwarded to the service for off-hot-path diarize
             ))
 
         if not raw:

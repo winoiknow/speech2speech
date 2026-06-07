@@ -67,6 +67,7 @@ class RemoteOpenAISTTHandler(BaseHandler[STTIn, STTOut]):
         timeout: float = 30.0,
         speaker_client: Any | None = None,  # RemoteSpeakerClient when SPEAKER_ID_ENABLED
         speaker_timeout: float = 0.8,
+        diarize_enabled: bool = False,  # SPEAKER_DIARIZE_ENABLED — carry audio forward
         gen_kwargs: dict | None = None,  # accepted for pipeline compatibility, unused
     ) -> None:
         self.model = model
@@ -79,6 +80,9 @@ class RemoteOpenAISTTHandler(BaseHandler[STTIn, STTOut]):
         # (both network-bound → overlap → ~0 added latency). None → disabled.
         self.speaker_client = speaker_client
         self.speaker_timeout = speaker_timeout
+        # When diarization is on, attach the raw turn WAV to the Transcription so
+        # the service layer can run the off-hot-path diarize + emit a correction.
+        self.diarize_enabled = diarize_enabled
         self._spk_pool = ThreadPoolExecutor(max_workers=1) if speaker_client is not None else None
         logger.info("RemoteOpenAISTTHandler ready → %s (model=%s, speaker_id=%s)",
                     self.endpoint, self.model, "on" if speaker_client is not None else "off")
@@ -140,7 +144,10 @@ class RemoteOpenAISTTHandler(BaseHandler[STTIn, STTOut]):
                 logger.debug("speaker: decision=%s id=%s score=%.3f", speaker.decision, speaker.speaker_id, speaker.score)
 
         console.print(f"[yellow]USER: {pred_text}")
-        yield Transcription(text=pred_text, language_code=language_code, speaker=speaker)
+        # Carry the raw turn WAV forward only when diarization is on, so the service
+        # layer can diarize off the hot path and emit a correction. None otherwise.
+        audio_wav = wav_bytes if self.diarize_enabled else None
+        yield Transcription(text=pred_text, language_code=language_code, speaker=speaker, audio_wav=audio_wav)
 
     def cleanup(self) -> None:
         self._client.close()

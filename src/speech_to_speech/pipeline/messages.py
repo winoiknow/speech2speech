@@ -77,6 +77,11 @@ class Transcription(PipelineMessage):
     text: str
     language_code: Optional[str] = None
     speaker: Optional[SpeakerLabel] = None  # None when speaker-id is off (default)
+    # Raw turn WAV carried forward ONLY when diarization is on (Phase 4), so the
+    # service layer — where the client item_id is minted — can run the off-hot-path
+    # diarize and emit a correction keyed to that id. By-reference, in-process;
+    # excluded from model_dump so it never serializes onto the wire. None when off.
+    audio_wav: Optional[bytes] = Field(default=None, exclude=True, repr=False)
 
 
 class SpeakerSpan(PipelineMessage):

@@ -1,5 +1,6 @@
 import logging
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
 from threading import Event as ThreadingEvent
 from typing import Any, Callable, Literal, Optional, TypeVar, Union
@@ -45,9 +46,10 @@ from speech_to_speech.pipeline.events import (
     SpeechStoppedEvent,
     TokenUsageEvent,
     TranscriptionCompletedEvent,
+    TranscriptionCorrectedEvent,
 )
 from speech_to_speech.pipeline.messages import GenerateResponseRequest
-from speech_to_speech.pipeline.queue_types import TextPromptItem
+from speech_to_speech.pipeline.queue_types import TextEventItem, TextPromptItem
 from speech_to_speech.utils.utils import _generate_id
 
 logger = logging.getLogger(__name__)
@@ -178,12 +180,25 @@ class RealtimeService:
         text_prompt_queue: Queue[TextPromptItem] | None = None,
         should_listen: ThreadingEvent | None = None,
         chat_size: int = 10,
+        text_output_queue: Queue[TextEventItem] | None = None,
+        speaker_client: Any | None = None,
+        diarize_enabled: bool = False,
     ) -> None:
         self.text_prompt_queue = text_prompt_queue
         self.should_listen = should_listen
         self._chat_size = chat_size
         self._conns: dict[str, ConnState] = {}
         self.total_usage = GlobalUsageMetrics()
+
+        # Phase 4 (Tier 2): async diarization correction, OFF the hot path. The
+        # corrected event is emitted onto text_output_queue from a worker thread;
+        # the router drops it until a consumer handler is registered (emit-and-drop).
+        self.text_output_queue = text_output_queue
+        self.speaker_client = speaker_client
+        self.diarize_enabled = bool(diarize_enabled and speaker_client is not None and text_output_queue is not None)
+        self._diarize_pool = ThreadPoolExecutor(max_workers=2) if self.diarize_enabled else None
+        if self.diarize_enabled:
+            logger.info("Diarization correction ENABLED (async, off hot path)")
 
         self.audio = AudioHandler(self)
         self.session = SessionHandler(self)
@@ -318,7 +333,40 @@ class RealtimeService:
                 )
             )
 
+        # Phase 4: kick off async diarization AFTER the LLM is already triggered, so
+        # it never touches the turn's hot path. Keyed to the SAME item_id the client
+        # just received in the completed event. Submit-and-forget; the worker emits
+        # a correction (or drops on any failure).
+        if self.diarize_enabled and event.audio_wav and self._diarize_pool is not None:
+            item_id = self.response._current_item_id(conn_id)
+            self._diarize_pool.submit(self._diarize_and_emit, item_id, event.audio_wav)
+
         return events
+
+    def _diarize_and_emit(self, item_id: str, wav: bytes) -> None:
+        """Worker: diarize off the hot path and emit a correction for ``item_id``.
+
+        Runs in the diarize pool thread. Never raises (the client never raises and
+        we guard the emit) so a failure can't take down the pool or the turn. The
+        corrected event goes on text_output_queue; with no dispatch handler yet it's
+        logged and dropped (emit-and-drop) — a consumer is a one-line follow-up.
+        """
+        try:
+            corr = self.speaker_client.diarize(wav, item_id=item_id, revision=1)
+            logger.info("diarize correction for %s: rev=%d, %d span(s) %s",
+                        item_id, corr.revision, len(corr.segments),
+                        [f"{s.label}:{s.decision}" for s in corr.segments])
+            if not corr.segments:
+                return  # nothing to correct → don't emit a no-op
+            event = TranscriptionCorrectedEvent(
+                item_id=corr.item_id,
+                revision=corr.revision,
+                segments=[s.model_dump() for s in corr.segments],
+            )
+            if self.text_output_queue is not None:
+                self.text_output_queue.put(event)
+        except Exception as e:  # never let a background failure escape
+            logger.debug("diarize correction for %s failed (%s) → dropped", item_id, e)
 
     # ── Metrics ────────────────────────────────────
 

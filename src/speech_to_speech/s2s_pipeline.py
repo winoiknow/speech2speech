@@ -404,6 +404,26 @@ def build_pipeline(
         None  # Only set for websocket/realtime modes; kept None otherwise to avoid unbounded queue growth
     )
 
+    # ── Speaker-id client (Phase 3 identify + Phase 4 diarize), env-backed, off by
+    # default. Built once here so it can flow into BOTH the STT handler (concurrent
+    # identify) and the realtime service (off-hot-path diarize correction). Flag(s)
+    # off → None → byte-for-byte today's pipeline.
+    from speech_to_speech.arguments_classes.speaker_id_arguments import SpeakerIdHandlerArguments
+
+    speaker_args = SpeakerIdHandlerArguments()
+    speaker_client = None
+    if speaker_args.speaker_id_enabled or speaker_args.speaker_diarize_enabled:
+        from speech_to_speech.speaker_id.remote_speaker_client import RemoteSpeakerClient
+
+        speaker_client = RemoteSpeakerClient(
+            speaker_args.speaker_id_base_url,
+            speaker_args.speaker_id_api_key,
+            speaker_args.speaker_id_timeout,
+            diarize_timeout=speaker_args.speaker_diarize_timeout,
+        )
+        logger.info("Speaker-id client → %s (identify=%s, diarize=%s)", speaker_args.speaker_id_base_url,
+                    speaker_args.speaker_id_enabled, speaker_args.speaker_diarize_enabled)
+
     comms_handlers: list[Any] = []
     if module_kwargs.mode == "local":
         from speech_to_speech.connections.local_audio_streamer import LocalAudioStreamer
@@ -468,6 +488,8 @@ def build_pipeline(
             port=websocket_streamer_kwargs.ws_port,
             chat_size=chat_size,
             server_api_key=module_kwargs.server_api_key,
+            speaker_client=speaker_client,
+            speaker_diarize_enabled=speaker_args.speaker_diarize_enabled,
         )
         comms_handlers = [realtime_conn]
     else:
@@ -505,25 +527,12 @@ def build_pipeline(
         setup_kwargs=vars(vad_handler_kwargs),
     )
 
-    # ── Speaker-id (Phase 3, env-backed, off by default) ──────────────────────
-    # Build the client once here; inject it into the remote STT handler (concurrent
-    # identify) and the label format into the notifier. Flag off → None → no-op.
-    from speech_to_speech.arguments_classes.speaker_id_arguments import SpeakerIdHandlerArguments
-
-    speaker_args = SpeakerIdHandlerArguments()
-    speaker_client = None
-    if speaker_args.speaker_id_enabled:
-        from speech_to_speech.speaker_id.remote_speaker_client import RemoteSpeakerClient
-
-        speaker_client = RemoteSpeakerClient(
-            speaker_args.speaker_id_base_url, speaker_args.speaker_id_api_key, speaker_args.speaker_id_timeout
-        )
-        logger.info("Speaker-id ENABLED → %s", speaker_args.speaker_id_base_url)
-
+    # ── Speaker-id notifier wiring (client built earlier). Inline identify labels
+    # only when SPEAKER_ID_ENABLED; diarize-only deployments add no inline prefix.
     transcription_notifier_kwargs: dict[str, Any] = {
         "text_output_queue": text_output_queue,
         "should_listen": should_listen,
-        "label_format": speaker_args.speaker_id_label_format if speaker_client is not None else "",
+        "label_format": speaker_args.speaker_id_label_format if speaker_args.speaker_id_enabled else "",
     }
     if module_kwargs.mode != "realtime":
         if module_kwargs.llm_backend == "responses-api":
@@ -563,8 +572,11 @@ def build_pipeline(
         mlx_audio_whisper_stt_handler_kwargs,
         parakeet_tdt_stt_handler_kwargs,
         remote_openai_stt_handler_kwargs,
-        speaker_client=speaker_client,
+        # Concurrent identify only when SPEAKER_ID_ENABLED; a diarize-only deploy
+        # still attaches the turn audio (diarize_enabled) but runs no per-turn identify.
+        speaker_client=speaker_client if speaker_args.speaker_id_enabled else None,
         speaker_timeout=speaker_args.speaker_id_timeout,
+        diarize_enabled=speaker_args.speaker_diarize_enabled,
     )
 
     lm = get_llm_handler(
@@ -621,6 +633,7 @@ def get_stt_handler(
     remote_openai_stt_handler_kwargs: RemoteOpenAISTTHandlerArguments | None = None,
     speaker_client: Any | None = None,
     speaker_timeout: float = 0.8,
+    diarize_enabled: bool = False,
 ) -> BaseHandler[STTIn, STTOut]:
     if module_kwargs.stt == "whisper":
         from speech_to_speech.STT.whisper_stt_handler import WhisperSTTHandler
@@ -691,6 +704,8 @@ def get_stt_handler(
         setup_kwargs = vars(remote_openai_stt_handler_kwargs)
         if speaker_client is not None:  # concurrent speaker identify (Phase 3)
             setup_kwargs = {**setup_kwargs, "speaker_client": speaker_client, "speaker_timeout": speaker_timeout}
+        if diarize_enabled:  # carry the turn audio forward for off-hot-path diarize (Phase 4)
+            setup_kwargs = {**setup_kwargs, "diarize_enabled": True}
         return RemoteOpenAISTTHandler(
             stop_event,
             queue_in=spoken_prompt_queue,

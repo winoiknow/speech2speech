@@ -36,6 +36,8 @@ class RealtimeServer:
         port: int = 8765,
         chat_size: int = 10,
         server_api_key: str | None = None,
+        speaker_client: object | None = None,
+        speaker_diarize_enabled: bool = False,
     ) -> None:
         self.stop_event = stop_event
         self.input_queue = input_queue
@@ -49,6 +51,10 @@ class RealtimeServer:
         self.port = port
         self.chat_size = chat_size
         self.server_api_key = server_api_key
+        # Phase 4: the same speaker-id client + flag the service uses to run the
+        # off-hot-path diarize and emit corrections. None/False → no-op.
+        self.speaker_client = speaker_client
+        self.speaker_diarize_enabled = speaker_diarize_enabled
 
     def run(self) -> None:
         """Start the FastAPI/uvicorn server (called from a ThreadManager thread)."""
@@ -56,6 +62,9 @@ class RealtimeServer:
             text_prompt_queue=self.text_prompt_queue,
             should_listen=self.should_listen,
             chat_size=self.chat_size,
+            text_output_queue=self.text_output_queue,
+            speaker_client=self.speaker_client,
+            diarize_enabled=self.speaker_diarize_enabled,
         )
         app = create_app(
             service=service,

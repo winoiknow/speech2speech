@@ -56,6 +56,10 @@ class TranscriptionCompletedEvent(PipelineEvent):
     # Turn id a later TranscriptionCorrectedEvent can reference (Phase 4). None
     # unless diarization is on, so the event is unchanged when the feature is off.
     item_id: Optional[str] = None
+    # Raw turn WAV carried to the service layer for off-hot-path diarize (Phase 4).
+    # By-reference, in-process; excluded from model_dump so it never serializes.
+    # None unless diarization is on.
+    audio_wav: Optional[bytes] = Field(default=None, exclude=True, repr=False)
 
 
 class TranscriptionCorrectedEvent(PipelineEvent):

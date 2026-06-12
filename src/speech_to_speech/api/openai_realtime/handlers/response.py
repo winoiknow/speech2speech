@@ -18,13 +18,15 @@ from openai.types.realtime import (
 )
 from openai.types.realtime.realtime_conversation_item_assistant_message import (
     Content as AssistantContent,
+)
+from openai.types.realtime.realtime_conversation_item_assistant_message import (
     RealtimeConversationItemAssistantMessage,
 )
 from openai.types.realtime.realtime_response import Audio, AudioOutput
-from openai.types.realtime.response_content_part_added_event import Part as AddedPart
-from openai.types.realtime.response_content_part_done_event import Part as DonePart
 from openai.types.realtime.realtime_response_status import RealtimeResponseStatus
 from openai.types.realtime.realtime_response_usage import RealtimeResponseUsage
+from openai.types.realtime.response_content_part_added_event import Part as AddedPart
+from openai.types.realtime.response_content_part_done_event import Part as DonePart
 
 from speech_to_speech.api.openai_realtime.handlers.base import RealtimeBaseHandler
 from speech_to_speech.LLM.chat import ChatItemError
@@ -209,6 +211,41 @@ class ResponseHandler(RealtimeBaseHandler):
                 getattr(fmt, "rate", None) if fmt else None,
             )
         return events
+
+    def begin_turn_response(self, conn_id: str) -> list[ServerEvent]:
+        """Open the response lifecycle the moment the server starts working on a
+        turn (server-VAD path), instead of waiting for the first audio chunk.
+
+        Everything between end-of-speech and first audio — STT hand-off, the
+        agent's LLM + tool loop, TTS — is otherwise silent on the wire, so a
+        slow turn is indistinguishable from a dead connection. Emitting
+        ``response.created`` (in_progress) here gives any client an immediate
+        signal to show "working" feedback and arm/refresh a turn watchdog.
+
+        ``begin_output_item_events`` stays idempotent via
+        ``response_created_sent``; ``output_item.added`` / ``content_part.added``
+        still fire with the first audio or transcript.
+
+        Setting ``in_response`` here also arms barge-in for the thinking gap:
+        speech detected while the LLM is in flight cancels this response
+        instead of silently stacking a second generation behind it.
+        """
+        st = self._state(conn_id)
+        if st.in_response:
+            return []
+        st.in_response = True
+        st.current_response_params = None
+        st.current_response_id = _generate_id("resp")
+        self._start_item(conn_id)
+        st.response_created_sent = True
+        logger.debug("Turn response opened early (response.created at turn start)")
+        return [
+            ResponseCreatedEvent(
+                type="response.created",
+                event_id=self._next_event_id(),
+                response=self._build_response(conn_id, "in_progress"),
+            )
+        ]
 
     # ── Public handlers ───────────────────────────
 

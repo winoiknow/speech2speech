@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -23,6 +24,14 @@ class ResponsesApiLanguageModelHandlerArguments(LanguageModelBaseArguments):
         metadata={
             "help": "The stream parameter typically indicates whether data should be transmitted in a continuous flow rather"
             " than in a single, complete response, often used for handling large or real-time data.Default is True"
+        },
+    )
+    responses_api_request_timeout_s: float = field(
+        default_factory=lambda: float(os.environ.get("LLM_REQUEST_TIMEOUT_S", "60")),
+        metadata={
+            "help": "Read timeout in seconds for the OpenAI-compatible API (between stream chunks when "
+            "streaming). Agent backends that run tool loops can stream nothing for tens of seconds, so "
+            "keep this above the slowest expected turn. Env: LLM_REQUEST_TIMEOUT_S. Default is 60."
         },
     )
     responses_api_disable_thinking: bool = field(

@@ -527,26 +527,32 @@ class TestHandleResponseCancel:
 
 
 class TestEncodeAudioChunk:
-    def test_first_chunk_emits_response_created_and_delta(self, service, conn_id):
+    def test_first_chunk_emits_lifecycle_and_delta(self, service, conn_id):
         audio = _pcm_bytes(256)
         events = service.encode_audio_chunk(conn_id, audio)
-        assert len(events) == 2
+        assert [e.type for e in events] == [
+            "response.created",
+            "response.output_item.added",
+            "response.content_part.added",
+            "response.output_audio.delta",
+        ]
         assert isinstance(events[0], ResponseCreatedEvent)
         resp = events[0].response
         assert resp.status == "in_progress"
         assert resp.object == "realtime.response"
         assert resp.conversation_id is not None
-        assert isinstance(events[1], ResponseAudioDeltaEvent)
-        assert events[1].content_index == 0
-        assert events[1].output_index == 0
-        assert events[1].delta == base64.b64encode(audio).decode("ascii")
+        assert isinstance(events[3], ResponseAudioDeltaEvent)
+        assert events[3].content_index == 0
+        assert events[3].output_index == 0
+        assert events[3].delta == base64.b64encode(audio).decode("ascii")
 
-    def test_subsequent_chunks_increment_content_index(self, service, conn_id):
+    def test_subsequent_chunks_emit_delta_only(self, service, conn_id):
         service.encode_audio_chunk(conn_id, _pcm_bytes(256))  # first
         events = service.encode_audio_chunk(conn_id, _pcm_bytes(256))  # second
         assert len(events) == 1
         assert isinstance(events[0], ResponseAudioDeltaEvent)
-        assert events[0].content_index == 1
+        # All deltas of the single audio content part share content_index=0.
+        assert events[0].content_index == 0
 
     def test_response_created_includes_metadata(self, service, conn_id):
         from openai.types.realtime.realtime_response_create_params import RealtimeResponseCreateParams
@@ -714,13 +720,20 @@ class TestDispatchPipelineEvent:
 
     # -- assistant_text --
 
-    def test_assistant_text_emits_transcript_done(self, service, conn_id):
+    def test_assistant_text_emits_lifecycle_and_transcript_done(self, service, conn_id):
         events = service.dispatch_pipeline_event(
             conn_id,
             AssistantTextEvent(text="Hello there"),
         )
-        assert len(events) == 1
-        evt = events[0]
+        # Opens the item/content-part lifecycle (idempotent with the audio
+        # encoder) before the transcript.
+        assert [e.type for e in events] == [
+            "response.created",
+            "response.output_item.added",
+            "response.content_part.added",
+            "response.output_audio_transcript.done",
+        ]
+        evt = events[3]
         assert isinstance(evt, ResponseAudioTranscriptDoneEvent)
         assert evt.content_index == 0
         assert evt.output_index == 0
@@ -737,16 +750,17 @@ class TestDispatchPipelineEvent:
                 ],
             ),
         )
-        assert len(events) == 3
-        assert isinstance(events[0], ResponseAudioTranscriptDoneEvent)
-        assert events[0].output_index == 0
-        assert isinstance(events[1], ResponseFunctionCallArgumentsDoneEvent)
-        assert events[1].output_index == 1
-        assert events[1].name == "get_weather"
-        assert events[1].call_id == "c1"
-        assert json.loads(events[1].arguments) == {"city": "Paris"}
-        assert isinstance(events[2], ResponseFunctionCallArgumentsDoneEvent)
-        assert events[2].output_index == 2
+        # 3 lifecycle-begin events, then transcript, then the two tool calls.
+        assert len(events) == 6
+        assert isinstance(events[3], ResponseAudioTranscriptDoneEvent)
+        assert events[3].output_index == 0
+        assert isinstance(events[4], ResponseFunctionCallArgumentsDoneEvent)
+        assert events[4].output_index == 1
+        assert events[4].name == "get_weather"
+        assert events[4].call_id == "c1"
+        assert json.loads(events[4].arguments) == {"city": "Paris"}
+        assert isinstance(events[5], ResponseFunctionCallArgumentsDoneEvent)
+        assert events[5].output_index == 2
 
     def test_assistant_text_tools_only(self, service, conn_id):
         events = service.dispatch_pipeline_event(
@@ -790,13 +804,19 @@ class TestDispatchPipelineEvent:
             conn_id,
             TranscriptionCompletedEvent(transcript="hello world"),
         )
-        assert len(events) == 1
+        # transcription completed + the early response.created that opens the
+        # response lifecycle at turn start (before any audio exists).
+        assert len(events) == 2
         evt = events[0]
         assert isinstance(evt, ConversationItemInputAudioTranscriptionCompletedEvent)
         assert evt.content_index == 0
         assert evt.transcript == "hello world"
         assert evt.usage.seconds == 3.2
         assert evt.usage.type == "duration"
+        created = events[1]
+        assert isinstance(created, ResponseCreatedEvent)
+        assert created.response.status == "in_progress"
+        assert service._state(conn_id).in_response
 
     def test_empty_transcription_completed_emits_event_without_response(
         self,
@@ -1085,11 +1105,15 @@ class TestUsageMetricsTracking:
         service.dispatch_pipeline_event(conn_id, SpeechStoppedEvent(duration_s=1.0))
         service.dispatch_pipeline_event(conn_id, TranscriptionCompletedEvent(transcript="a"))
 
+        # Turn 2's speech_started cancels the response opened at turn 1's
+        # transcription (barge-in during the thinking gap), rolling turn 1's
+        # usage into the global total before turn 2 accumulates its own.
         service.dispatch_pipeline_event(conn_id, SpeechStartedEvent())
         service.dispatch_pipeline_event(conn_id, SpeechStoppedEvent(duration_s=2.0))
         service.dispatch_pipeline_event(conn_id, TranscriptionCompletedEvent(transcript="b"))
 
-        assert service._state(conn_id).response_usage.audio_duration_s == 3.0
+        assert service.total_usage.audio_duration_s == 1.0
+        assert service._state(conn_id).response_usage.audio_duration_s == 2.0
 
     def test_end_response_rolls_duration_into_global(self, service, conn_id):
         service.dispatch_pipeline_event(conn_id, SpeechStartedEvent())

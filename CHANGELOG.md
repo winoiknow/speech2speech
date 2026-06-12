@@ -4,6 +4,34 @@ All notable changes to this fork of [huggingface/speech-to-speech](https://githu
 
 ---
 
+## [Unreleased] — 2026-06-12 (thinking-gap UX)
+
+s2s is a client-agnostic realtime backend; these changes are designed for any OpenAI-Realtime-compatible client (voice assistants, smart speakers, Matrix/Element Call bridges, …), not any single one.
+
+### Added
+
+- **Early `response.created` at turn start** (`service.py`, `handlers/response.py` — `begin_turn_response`): the response lifecycle now opens the moment a turn's transcription completes and the LLM is triggered, instead of on the first audio chunk. Clients get an immediate "working" signal at the start of the otherwise-silent STT→LLM→TTS gap (measured 25–30 s on tool-free agent turns). `output_item.added` / `content_part.added` still fire with the first audio or transcript (idempotent lifecycle flags unchanged).
+- **`s2s.keepalive` event** (`websocket_router.py`): while a response is `in_progress` and nothing has been sent for `S2S_HEARTBEAT_S` seconds (default 5; `0` disables), the server emits `{"type": "s2s.keepalive", "event_id": ..., "response_id": ...}`. Lets clients distinguish a slow agent turn (LLM/tool loop in flight) from a dead connection and refresh turn watchdogs — downstream watchdogs can be tightened back down. Verified the official OpenAI Python SDK parses the unknown event type without error; strict clients can disable with `S2S_HEARTBEAT_S=0`.
+- **`--responses_api_request_timeout_s` / `LLM_REQUEST_TIMEOUT_S`** (`responses_api_language_model_arguments.py`): the LLM read timeout is now configurable; default raised 20 → 60 s. The old hardcoded 20 s was a streaming *read* timeout that could fire mid-turn on agent backends running tool loops (which stream nothing for tens of seconds), cutting off legitimate turns with the "slow today" apology.
+
+### Fixed
+
+- **Barge-in during the thinking gap**: with `in_response` now set at turn start, speech detected while the LLM is in flight cancels the in-flight response (via `cancel_scope`) instead of silently stacking a second generation behind it (previously produced back-to-back responses).
+- **Stale `__RESPONSE_DONE__` race** (`websocket_router.py`): a cancelled generation's done-sentinel arriving while `discarding` no longer closes the *next* (already-created) response; it only clears the discard guard. Its `response.done(cancelled)` was already emitted at barge-in time.
+- **Silent LLM failures now speak** (`responses_api_language_model.py`): a generic generation error yields a spoken apology (like the existing timeout path) instead of leaving the user in dead silence. Suppressed when the generation was cancelled.
+- **`X-Sample-Rate` parse hardening** (`remote_openai_tts_handler.py`): non-numeric or implausible (outside 4 kHz–192 kHz) header values are rejected instead of triggering absurd resample ratios.
+
+### Changed
+
+- **Send loop routes to the owning session** (`websocket_router.py`): pipeline output (text events, audio deltas, finish events) is sent to the active session's websocket instead of broadcast over all connection ids. Behavior-identical with the single-session guard in place; removes one blocker on the multi-session path (TODO #2).
+
+### Tests
+
+- Repaired 23 rotted tests across `tests/openai_realtime/` (lifecycle `output_item.added`/`content_part.added` events, 4-tuple AEC input queue payload, 24 kHz default client rate, 20 ms audio batching), `tests/test_cli_defaults.py` (missing elevenlabs/minimax kwargs), and `tests/test_remote_handlers.py` (MagicMock headers parsed as sample rate 1 Hz; whole-clip TTS cancellation semantics).
+- New coverage: `TestThinkingGap` (early created, keepalive emission/suppression, barge-in during gap, stale-done race) and `TestSDKKeepalive` (official SDK tolerates `s2s.keepalive`).
+
+---
+
 ## [Unreleased] — 2026-05-27 (QC pass 2)
 
 ### Fixed

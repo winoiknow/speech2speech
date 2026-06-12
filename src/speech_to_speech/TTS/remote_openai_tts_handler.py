@@ -115,8 +115,16 @@ class RemoteOpenAITTSHandler(BaseHandler[TTSIn, TTSOut]):
                 hdr_rate = response.headers.get("X-Sample-Rate")
                 if hdr_rate:
                     try:
-                        src_rate = int(hdr_rate)
-                    except ValueError:
+                        parsed_rate = int(hdr_rate)
+                        # Sanity-bound: a corrupt header must not trigger an
+                        # absurd resample ratio that turns the clip into noise.
+                        if 4000 <= parsed_rate <= 192000:
+                            src_rate = parsed_rate
+                        else:
+                            logger.warning(
+                                "RemoteOpenAITTS: implausible X-Sample-Rate %r; using %d", hdr_rate, src_rate
+                            )
+                    except (ValueError, TypeError):
                         logger.warning("RemoteOpenAITTS: bad X-Sample-Rate header %r; using %d", hdr_rate, src_rate)
                 if DEBUG_MODE:
                     logger.info(

@@ -34,6 +34,7 @@ from speech_to_speech.pipeline.events import (
 )
 from speech_to_speech.pipeline.messages import AUDIO_RESPONSE_DONE, PIPELINE_END
 from speech_to_speech.pipeline.queue_types import AudioInItem, AudioOutItem, TextEventItem
+from speech_to_speech.utils.utils import _generate_id
 
 logger = logging.getLogger(__name__)
 QItem = TypeVar("QItem")
@@ -60,6 +61,12 @@ PACING_SLICE_S = 0.01
 # Hold response.done this long after the last audio so a real-time consumer can drain its
 # playout buffer before finalizing (otherwise it drops the buffered tail). Env: S2S_RESPONSE_DONE_TAIL_MS.
 RESPONSE_DONE_TAIL_S = int(os.getenv("S2S_RESPONSE_DONE_TAIL_MS", "400")) / 1000
+# Keepalive during the silent "thinking" gap: while a response is in_progress and
+# nothing has been sent to the client for this long (LLM thinking, agent tool loop,
+# TTS synth), emit a {"type": "s2s.keepalive"} event so any client can distinguish
+# a slow turn from a dead connection and refresh its turn watchdog. Clients ignore
+# unknown event types per Realtime convention; set 0 to disable for strict clients.
+HEARTBEAT_S = float(os.getenv("S2S_HEARTBEAT_S", "5"))
 # Debug: if set, write each response's exact outbound audio (the base64 PCM deltas the client
 # receives, decoded) to a WAV in this dir, so the real on-wire audio can be auditioned directly.
 TTS_DUMP_DIR = os.getenv("S2S_TTS_DUMP_DIR") or None
@@ -300,6 +307,7 @@ def create_app(
         delta_pcm_bytes = 0  # DEBUG: pre-resample PCM bytes encoded into deltas this response
         loop = asyncio.get_running_loop()
         audio_play_deadline: float | None = None  # wall-clock time current audio should finish playing
+        last_client_send_t = loop.time()  # last time anything was sent to the client (drives keepalive)
         dump_pcm = bytearray() if TTS_DUMP_DIR else None  # DEBUG: exact outbound PCM for this response
         dump_seq = 0
         while not stop_event.is_set():
@@ -316,13 +324,16 @@ def create_app(
 
                         if cancel_scope and cancel_scope.discarding and isinstance(text_msg, AssistantTextEvent):
                             pass
-                        else:
-                            for cid in service.connection_ids:
-                                ws = app.state.websockets.get(cid)
-                                if ws and isinstance(text_msg, PipelineEvent):
-                                    events = service.dispatch_pipeline_event(cid, text_msg)
-                                    if events:
-                                        await _send_events(ws, events)
+                        elif isinstance(text_msg, PipelineEvent):
+                            # Route to the session that owns the pipeline (the single
+                            # active session today) rather than broadcasting.
+                            sid = app.state.active_session
+                            ws = app.state.websockets.get(sid) if sid else None
+                            if ws:
+                                events = service.dispatch_pipeline_event(sid, text_msg)
+                                if events:
+                                    await _send_events(ws, events)
+                                    last_client_send_t = loop.time()
 
                         if is_speech_start and was_in_response:
                             active_cfg = (
@@ -357,10 +368,10 @@ def create_app(
                         audio_chunk = output_queue.get_nowait()
 
                     if isinstance(audio_chunk, bytes) and audio_chunk == PIPELINE_END:
-                        for cid in service.connection_ids:
-                            ws = app.state.websockets.get(cid)
-                            if ws:
-                                await _send_events(ws, service.finish_audio_response(cid))
+                        sid = app.state.active_session
+                        ws = app.state.websockets.get(sid) if sid else None
+                        if ws:
+                            await _send_events(ws, service.finish_audio_response(sid))
                         break
 
                     if isinstance(audio_chunk, bytes) and audio_chunk == AUDIO_RESPONSE_DONE:
@@ -381,22 +392,33 @@ def create_app(
                                 logger.error("TTS dump failed: %s", e)
                             dump_pcm.clear()
                             dump_seq += 1
-                        # Hold response.done briefly so the client can drain its playout
-                        # buffer. It plays inbound audio at real-time and ends up ~0.3 s
-                        # behind, so a response.done that lands right after the last delta
-                        # makes it finalize and drop the still-buffered tail (AVA played
-                        # 1.06 s of a 1.42 s greeting). Skip the hold on barge-in/cancel.
-                        if REALTIME_PACING_ENABLED and not (cancel_scope and cancel_scope.discarding):
-                            held = 0.0
-                            while held < RESPONSE_DONE_TAIL_S:
-                                if cancel_scope and cancel_scope.discarding:
-                                    break
-                                await asyncio.sleep(PACING_SLICE_S)
-                                held += PACING_SLICE_S
-                        for cid in service.connection_ids:
-                            ws = app.state.websockets.get(cid)
+                        # A done sentinel arriving while discarding belongs to a CANCELLED
+                        # generation: its response.done(cancelled) was already emitted at
+                        # barge-in/cancel time. The response lifecycle now opens at turn
+                        # start, so a NEW response may already be in_progress here —
+                        # finishing on the stale sentinel would close it before it produced
+                        # any audio. Skip the finish events; still clear the discard guard
+                        # and playback state below.
+                        stale_done = bool(cancel_scope and cancel_scope.discarding)
+                        if not stale_done:
+                            # Hold response.done briefly so the client can drain its playout
+                            # buffer. It plays inbound audio at real-time and ends up ~0.3 s
+                            # behind, so a response.done that lands right after the last delta
+                            # makes it finalize and drop the still-buffered tail (a real-time
+                            # client played 1.06 s of a 1.42 s greeting). Skip the hold on
+                            # barge-in/cancel.
+                            if REALTIME_PACING_ENABLED:
+                                held = 0.0
+                                while held < RESPONSE_DONE_TAIL_S:
+                                    if cancel_scope and cancel_scope.discarding:
+                                        break
+                                    await asyncio.sleep(PACING_SLICE_S)
+                                    held += PACING_SLICE_S
+                            sid = app.state.active_session
+                            ws = app.state.websockets.get(sid) if sid else None
                             if ws:
-                                await _send_events(ws, service.finish_audio_response(cid))
+                                await _send_events(ws, service.finish_audio_response(sid))
+                                last_client_send_t = loop.time()
                         if response_playing:
                             response_playing.clear()
                         if cancel_scope:
@@ -456,17 +478,18 @@ def create_app(
                         response_playing.set()
                         should_listen.set()
 
-                    for idx, cid in enumerate(service.connection_ids):
-                        ws = app.state.websockets.get(cid)
-                        if ws:
-                            out_events = service.encode_audio_chunk(cid, bytes(audio_batch))
-                            await _send_events(ws, out_events)
-                            deltas_sent += 1
-                            delta_pcm_bytes += len(audio_batch)
-                            if dump_pcm is not None and idx == 0:
-                                for ev in out_events:
-                                    if getattr(ev, "type", "") == "response.output_audio.delta":
-                                        dump_pcm += base64.b64decode(ev.delta)
+                    sid = app.state.active_session
+                    ws = app.state.websockets.get(sid) if sid else None
+                    if ws:
+                        out_events = service.encode_audio_chunk(sid, bytes(audio_batch))
+                        await _send_events(ws, out_events)
+                        deltas_sent += 1
+                        delta_pcm_bytes += len(audio_batch)
+                        last_client_send_t = loop.time()
+                        if dump_pcm is not None:
+                            for ev in out_events:
+                                if getattr(ev, "type", "") == "response.output_audio.delta":
+                                    dump_pcm += base64.b64decode(ev.delta)
 
                     # Far-end reference for AEC: the 16 kHz pipeline PCM, fed as it is
                     # sent (≈ when it plays), so the canceller can subtract its echo
@@ -498,6 +521,27 @@ def create_app(
                             await asyncio.sleep(min(remaining, PACING_SLICE_S))
                 except Empty:
                     pass
+
+                # Keepalive: a response is in_progress but the wire has been silent
+                # (LLM thinking, agent-side tool loop, TTS synth). Tell the client
+                # we're alive so its turn watchdog doesn't false-fire on a slow turn.
+                if HEARTBEAT_S > 0:
+                    sid = app.state.active_session
+                    st = service._conns.get(sid) if sid else None
+                    if st is not None and st.in_response and loop.time() - last_client_send_t >= HEARTBEAT_S:
+                        ws = app.state.websockets.get(sid)
+                        if ws:
+                            try:
+                                await ws.send_json(
+                                    {
+                                        "type": "s2s.keepalive",
+                                        "event_id": _generate_id("event"),
+                                        "response_id": st.current_response_id,
+                                    }
+                                )
+                            except Exception as e:
+                                logger.debug("keepalive send failed: %s", e)
+                        last_client_send_t = loop.time()
 
                 await asyncio.sleep(0.01)
 

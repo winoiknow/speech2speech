@@ -79,6 +79,9 @@ def _make_stream_mock(pcm_chunks: list[bytes]) -> MagicMock:
     mock_response = MagicMock()
     mock_response.raise_for_status = MagicMock()
     mock_response.iter_bytes.return_value = iter(pcm_chunks)
+    # Real dict so headers.get("X-Sample-Rate") is None, not a MagicMock
+    # (int(MagicMock()) == 1 would make the handler resample from "1 Hz").
+    mock_response.headers = {}
     mock_response.__enter__ = MagicMock(return_value=mock_response)
     mock_response.__exit__ = MagicMock(return_value=False)
     return mock_response
@@ -246,11 +249,15 @@ class TestRemoteOpenAITTSHandler:
         assert results == [AUDIO_RESPONSE_DONE]
 
     def test_cancellation_stops_stream(self):
-        """cancel_scope.cancel() after chunk 2 must yield exactly 2 chunks."""
+        """Barge-in mid-download must abort and yield NO audio.
+
+        The handler accumulates the full clip before chunking (F5-TTS returns
+        it in one shot), so a cancel during iter_bytes means nothing reaches
+        the output queue at all.
+        """
         cancel_scope = CancelScope()
         handler = _make_tts_handler(cancel_scope=cancel_scope)
 
-        # Ten individual CHUNK_BYTES deliveries
         single_chunk = _make_raw_pcm(CHUNK_SAMPLES)
         assert len(single_chunk) == CHUNK_BYTES
 
@@ -263,6 +270,7 @@ class TestRemoteOpenAITTSHandler:
         mock_response = MagicMock()
         mock_response.raise_for_status = MagicMock()
         mock_response.iter_bytes.return_value = iter_bytes_with_cancel()
+        mock_response.headers = {}
         mock_response.__enter__ = MagicMock(return_value=mock_response)
         mock_response.__exit__ = MagicMock(return_value=False)
 
@@ -271,14 +279,14 @@ class TestRemoteOpenAITTSHandler:
         with patch.object(handler._client, "stream", return_value=mock_response):
             results = list(handler.process(tts_input))
 
-        assert all(isinstance(r, np.ndarray) for r in results)
-        assert len(results) == 2
+        assert results == []
 
     def test_trailing_chunk_padded_to_chunk_samples(self):
-        """A sub-512-sample tail must be zero-padded to exactly CHUNK_SAMPLES."""
+        """A sub-CHUNK_SAMPLES tail must be zero-padded to exactly CHUNK_SAMPLES."""
         handler = _make_tts_handler()
-        # 600 samples: one full chunk (512) + 88-sample tail
-        raw_pcm = _make_raw_pcm(600)
+        # One full chunk + a 100-sample tail
+        n_samples = CHUNK_SAMPLES + 100
+        raw_pcm = _make_raw_pcm(n_samples)
         tts_input = TTSInput(text="Short.", language_code="en")
 
         mock_response = _make_stream_mock([raw_pcm])
@@ -291,7 +299,7 @@ class TestRemoteOpenAITTSHandler:
         assert len(results[0]) == CHUNK_SAMPLES
         assert len(results[1]) == CHUNK_SAMPLES
         # Padding samples are zero
-        assert np.all(results[1][88:] == 0)
+        assert np.all(results[1][100:] == 0)
 
     def test_empty_text_yields_nothing(self):
         """Empty or whitespace text should produce no output."""

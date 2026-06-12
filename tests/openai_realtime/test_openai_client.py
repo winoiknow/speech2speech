@@ -147,6 +147,17 @@ AUDIO_DONE = "response.output_audio.done"
 TRANSCRIPT_DONE = "response.output_audio_transcript.done"
 FUNCTION_CALL_DONE = "response.function_call_arguments.done"
 ERROR = "error"
+ITEM_ADDED = "response.output_item.added"
+PART_ADDED = "response.content_part.added"
+PART_DONE = "response.content_part.done"
+ITEM_DONE = "response.output_item.done"
+
+# Close-of-response lifecycle once an output item exists, in spec order.
+FINISH_TYPES = [AUDIO_DONE, PART_DONE, ITEM_DONE, RESPONSE_DONE]
+
+
+async def _recv_types(conn, n: int) -> list:
+    return [await _recv(conn) for _ in range(n)]
 
 
 # ===================================================================
@@ -255,18 +266,26 @@ class TestSDKVoiceTurn:
             assert event.transcript == "hello"
             assert event.usage.seconds == 1.9
 
-            # -- Server audio response --
-            server_env.output_queue.put(_pcm_bytes(256))
+            # The response lifecycle opens at turn start (response.created right
+            # after the transcription), not on the first audio chunk.
             event = await _recv(conn)
             assert event.type == RESPONSE_CREATED
             assert event.response.status == "in_progress"
             assert event.response.object == "realtime.response"
             conversation_id = event.response.conversation_id
 
+            # -- Server audio response --
+            server_env.output_queue.put(_pcm_bytes(256))
+            event = await _recv(conn)
+            assert event.type == ITEM_ADDED
+            event = await _recv(conn)
+            assert event.type == PART_ADDED
+
             event = await _recv(conn)
             assert event.type == AUDIO_DELTA
             decoded = base64.b64decode(event.delta)
-            assert len(decoded) == len(_pcm_bytes(256))
+            # 16 kHz pipeline PCM resampled to the default 24 kHz client rate.
+            assert len(decoded) == len(_pcm_bytes(256)) * 3 // 2
 
             server_env.text_output_queue.put(AssistantTextEvent(text="Hi there!"))
             event = await _recv(conn)
@@ -274,13 +293,11 @@ class TestSDKVoiceTurn:
             assert event.transcript == "Hi there!"
 
             server_env.output_queue.put(PIPELINE_END)
-            event = await _recv(conn)
-            assert event.type == AUDIO_DONE
-
-            event = await _recv(conn)
-            assert event.type == RESPONSE_DONE
-            assert event.response.status == "completed"
-            assert event.response.conversation_id == conversation_id
+            events = await _recv_types(conn, 4)
+            assert [e.type for e in events] == FINISH_TYPES
+            done = events[-1]
+            assert done.response.status == "completed"
+            assert done.response.conversation_id == conversation_id
 
 
 # ===================================================================
@@ -299,13 +316,14 @@ class TestSDKBargeIn:
             server_env.output_queue.put(_pcm_bytes(256))
             event = await _recv(conn)
             assert event.type == RESPONSE_CREATED
+            await _recv(conn)  # output_item.added
+            await _recv(conn)  # content_part.added
             await _recv(conn)  # audio delta
 
             server_env.text_output_queue.put(SpeechStartedEvent())
 
-            events = []
-            for _ in range(3):
-                events.append(await _recv(conn))
+            # finish (cancelled) lifecycle + speech_started
+            events = await _recv_types(conn, 5)
 
             types = [e.type for e in events]
             assert AUDIO_DONE in types
@@ -326,14 +344,15 @@ class TestSDKBargeIn:
             server_env.output_queue.put(_pcm_bytes(256))
             event = await _recv(conn)
             assert event.type == RESPONSE_CREATED
+            await _recv(conn)  # output_item.added
+            await _recv(conn)  # content_part.added
             await _recv(conn)  # audio delta
 
             server_env.text_output_queue.put(SpeechStartedEvent())
             server_env.text_output_queue.put(AssistantTextEvent(text="stale response text"))
 
-            events = []
-            for _ in range(3):
-                events.append(await _recv(conn))
+            # finish (cancelled) lifecycle + speech_started
+            events = await _recv_types(conn, 5)
 
             types = [e.type for e in events]
             assert AUDIO_DONE in types
@@ -379,14 +398,14 @@ class TestSDKPhantomSpeech:
             server_env.output_queue.put(_pcm_bytes(256))
             event = await _recv(conn)
             assert event.type == RESPONSE_CREATED
+            await _recv(conn)  # output_item.added
+            await _recv(conn)  # content_part.added
             await _recv(conn)  # audio delta
 
             server_env.output_queue.put(AUDIO_RESPONSE_DONE)
-            event = await _recv(conn)
-            assert event.type == AUDIO_DONE
-            event = await _recv(conn)
-            assert event.type == RESPONSE_DONE
-            assert event.response.status == "completed"
+            events = await _recv_types(conn, 4)
+            assert [e.type for e in events] == FINISH_TYPES
+            assert events[-1].response.status == "completed"
 
 
 class TestSDKInterruptionState:
@@ -403,13 +422,14 @@ class TestSDKInterruptionState:
 
             server_env.output_queue.put(_pcm_bytes(256))
             await _recv(conn)  # response.created
+            await _recv(conn)  # output_item.added
+            await _recv(conn)  # content_part.added
             await _recv(conn)  # audio delta
             assert server_env.response_playing.is_set()
 
             server_env.text_output_queue.put(SpeechStartedEvent())
-            events = []
-            for _ in range(3):
-                events.append(await _recv(conn))
+            # finish (cancelled) lifecycle + speech_started
+            events = await _recv_types(conn, 5)
 
             types = [e.type for e in events]
             assert SPEECH_STARTED in types
@@ -418,6 +438,49 @@ class TestSDKInterruptionState:
             await asyncio.sleep(0.1)
             assert not server_env.response_playing.is_set()
             assert server_env.cancel_scope.discarding
+
+
+# ===================================================================
+# 4c. Keepalive through the real SDK
+# ===================================================================
+
+
+class TestSDKKeepalive:
+    @pytest.mark.asyncio
+    async def test_sdk_tolerates_keepalive_during_thinking_gap(self, server_env, monkeypatch):
+        """The custom s2s.keepalive event must not break the official SDK client.
+
+        The SDK's permissive parsing should surface (or at least not choke on)
+        an event type outside the openai.types.realtime union.
+        """
+        import speech_to_speech.api.openai_realtime.websocket_router as router_mod
+
+        monkeypatch.setattr(router_mod, "HEARTBEAT_S", 0.2)
+        client = server_env.make_client()
+        async with client.realtime.connect(model="test") as conn:
+            await _recv(conn)  # session.created
+
+            # Open a turn: transcription completed → early response.created.
+            server_env.text_output_queue.put(SpeechStartedEvent())
+            await _recv(conn)
+            server_env.text_output_queue.put(SpeechStoppedEvent(duration_s=1.0))
+            await _recv(conn)
+            server_env.text_output_queue.put(TranscriptionCompletedEvent(transcript="hello"))
+            await _recv(conn)  # transcription completed
+            created = await _recv(conn)
+            assert created.type == RESPONSE_CREATED
+
+            # Silent gap: the next event the SDK parses is the keepalive.
+            ka = await _recv(conn)
+            assert ka.type == "s2s.keepalive"
+            assert ka.response_id == created.response.id
+
+            # The connection still works for protocol events afterwards.
+            server_env.output_queue.put(_pcm_bytes(256))
+            event = await _recv(conn)
+            while event.type == "s2s.keepalive":
+                event = await _recv(conn)
+            assert event.type == ITEM_ADDED
 
 
 # ===================================================================
@@ -446,6 +509,13 @@ class TestSDKToolCalling:
                     ],
                 )
             )
+
+            # assistant text opens the response/item/content-part lifecycle
+            # before the transcript and tool-call events.
+            event = await _recv(conn)
+            assert event.type == RESPONSE_CREATED
+            await _recv(conn)  # output_item.added
+            await _recv(conn)  # content_part.added
 
             event = await _recv(conn)
             assert event.type == TRANSCRIPT_DONE
@@ -576,6 +646,8 @@ class TestSDKErrorHandling:
 
             server_env.output_queue.put(_pcm_bytes(256))
             await _recv(conn)  # response.created
+            await _recv(conn)  # output_item.added
+            await _recv(conn)  # content_part.added
             await _recv(conn)  # audio delta
 
             await conn.send({"type": "response.create"})
@@ -599,17 +671,17 @@ class TestSDKResponseCancel:
 
             server_env.output_queue.put(_pcm_bytes(256))
             await _recv(conn)  # response.created
+            await _recv(conn)  # output_item.added
+            await _recv(conn)  # content_part.added
             await _recv(conn)  # audio delta
 
             await conn.send({"type": "response.cancel"})
 
-            event = await _recv(conn)
-            assert event.type == AUDIO_DONE
-
-            event = await _recv(conn)
-            assert event.type == RESPONSE_DONE
-            assert event.response.status == "cancelled"
-            assert event.response.status_details.reason == "client_cancelled"
+            events = await _recv_types(conn, 4)
+            assert [e.type for e in events] == FINISH_TYPES
+            done = events[-1]
+            assert done.response.status == "cancelled"
+            assert done.response.status_details.reason == "client_cancelled"
 
 
 # ===================================================================
@@ -633,18 +705,18 @@ class TestSDKMultiTurn:
             await _recv(conn)
 
             server_env.text_output_queue.put(TranscriptionCompletedEvent(transcript="hi"))
-            await _recv(conn)
+            await _recv(conn)  # transcription completed
+            t1_created = await _recv(conn)  # early response.created (turn start)
+            assert t1_created.type == RESPONSE_CREATED
 
             server_env.output_queue.put(_pcm_bytes(128))
-            t1_created = await _recv(conn)
-            assert t1_created.type == RESPONSE_CREATED
+            await _recv(conn)  # output_item.added
+            await _recv(conn)  # content_part.added
             await _recv(conn)  # audio delta
 
-            # Barge-in
+            # Barge-in: finish (cancelled) lifecycle + speech_started
             server_env.text_output_queue.put(SpeechStartedEvent())
-            events = []
-            for _ in range(3):
-                events.append(await _recv(conn))
+            events = await _recv_types(conn, 5)
 
             t1_done = next(e for e in events if e.type == RESPONSE_DONE)
 
@@ -657,16 +729,18 @@ class TestSDKMultiTurn:
             await _recv(conn)
 
             server_env.text_output_queue.put(TranscriptionCompletedEvent(transcript="bye"))
-            await _recv(conn)
+            await _recv(conn)  # transcription completed
+            t2_created = await _recv(conn)  # early response.created
+            assert t2_created.type == RESPONSE_CREATED
 
             server_env.output_queue.put(_pcm_bytes(128))
-            t2_created = await _recv(conn)
-            assert t2_created.type == RESPONSE_CREATED
+            await _recv(conn)  # output_item.added
+            await _recv(conn)  # content_part.added
             await _recv(conn)  # audio delta
 
             server_env.output_queue.put(PIPELINE_END)
-            await _recv(conn)  # audio done
-            t2_done = await _recv(conn)
-            assert t2_done.type == RESPONSE_DONE
+            events = await _recv_types(conn, 4)
+            assert [e.type for e in events] == FINISH_TYPES
+            t2_done = events[-1]
 
             assert t1_done.response.conversation_id == t2_done.response.conversation_id

@@ -153,6 +153,7 @@ Streams over MiniMax's T2A v2 **WebSocket** (stdlib client, no extra dependency)
 | `--responses_api_base_url` | `LLM_BASE_URL` | *(OpenAI)* | LLM server base URL |
 | `--responses_api_api_key` | `LLM_API_KEY` | *(none)* | Auth key |
 | `--model_name` | `LLM_MODEL` | `hermes-agent` | Model identifier sent in every request — must match what the server expects (e.g. `hermes-agent` for Hermes Agent API) |
+| `--responses_api_request_timeout_s` | `LLM_REQUEST_TIMEOUT_S` | `60` | Read timeout (s) between stream chunks. Agent backends running tool loops can stream nothing for tens of seconds — keep this above the slowest expected turn |
 
 > **Note on API key separation:** `STT_OPENAI_API_KEY`, `TTS_OPENAI_API_KEY`, and the LLM key are intentionally independent. None falls back to `OPENAI_API_KEY`.
 
@@ -161,6 +162,17 @@ Streams over MiniMax's T2A v2 **WebSocket** (stdlib client, no extra dependency)
 ## Barge-in / Cancellation
 
 When the user speaks while the assistant is replying, the pipeline's `CancelScope` increments its generation counter. The TTS handler detects this on its next byte read, returns immediately from the generator, and the `httpx` streaming context manager exits — sending TCP FIN to the F5-TTS server and stopping upstream generation. No stale audio is sent to the client after cancellation.
+
+Barge-in also works during the "thinking" gap (after the user stops speaking, before the first audio): the response lifecycle opens at turn start, so new speech cancels the in-flight LLM generation instead of queuing a second response behind it.
+
+---
+
+## Turn progress / keepalive (the "thinking" gap)
+
+Between end-of-user-speech and the first audio chunk, the pipeline is busy (STT → LLM/tool loop → TTS) but the wire would otherwise be silent — indistinguishable from a dead connection for any client. Two signals fix this, for **any** OpenAI-Realtime-compatible client:
+
+1. **Early `response.created`** — emitted the moment the turn's transcription completes and LLM generation is triggered (not on the first audio chunk). Spec-standard; use it to show "working" feedback and arm a turn watchdog.
+2. **`s2s.keepalive`** — a custom event `{"type": "s2s.keepalive", "event_id": "...", "response_id": "..."}` emitted every `S2S_HEARTBEAT_S` seconds (default `5`) while a response is in progress and nothing else has been sent. Refresh your watchdog on each one. Clients should ignore unknown event types per Realtime convention (the official OpenAI Python SDK parses it without error); set `S2S_HEARTBEAT_S=0` for strict clients.
 
 ---
 

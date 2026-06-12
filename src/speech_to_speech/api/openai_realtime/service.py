@@ -324,6 +324,11 @@ class RealtimeService:
         if transcript:
             cfg.chat.add_item(make_user_message(transcript))
 
+        # Captured BEFORE begin_turn_response starts the response's output item:
+        # diarization must be keyed to the input item_id the client just received
+        # in the completed event.
+        input_item_id = self.response._current_item_id(conn_id)
+
         queue = self.text_prompt_queue
         if queue and transcript:
             queue.put(
@@ -332,14 +337,16 @@ class RealtimeService:
                     language_code=event.language_code,
                 )
             )
+            # Open the response lifecycle now (response.created in_progress), not on
+            # the first audio chunk, so the client gets a signal during the otherwise
+            # silent STT→LLM→TTS gap.
+            events.extend(self.response.begin_turn_response(conn_id))
 
         # Phase 4: kick off async diarization AFTER the LLM is already triggered, so
-        # it never touches the turn's hot path. Keyed to the SAME item_id the client
-        # just received in the completed event. Submit-and-forget; the worker emits
+        # it never touches the turn's hot path. Submit-and-forget; the worker emits
         # a correction (or drops on any failure).
         if self.diarize_enabled and event.audio_wav and self._diarize_pool is not None:
-            item_id = self.response._current_item_id(conn_id)
-            self._diarize_pool.submit(self._diarize_and_emit, item_id, event.audio_wav)
+            self._diarize_pool.submit(self._diarize_and_emit, input_item_id, event.audio_wav)
 
         return events
 

@@ -58,7 +58,11 @@ class ResponsesApiModelHandler(BaseHandler[LLMIn, LLMOut]):
         user_role: str = "user",
         cancel_scope: CancelScope | None = None,
         disable_thinking: bool = True,
-        request_timeout_s: float = 20.0,
+        # Streaming read timeout BETWEEN chunks (httpx). An agent backend running a
+        # tool loop can legitimately stream nothing for tens of seconds (measured
+        # 25-30 s to first token on tool-free agent turns), so this must comfortably
+        # exceed that; the s2s.keepalive event keeps clients informed meanwhile.
+        request_timeout_s: float = 60.0,
         stream_batch_sentences: int = 3,
         enable_lang_prompt: bool = False,
         compact_history: bool = False,
@@ -307,6 +311,15 @@ class ResponsesApiModelHandler(BaseHandler[LLMIn, LLMOut]):
             # True and every subsequent response's audio would be silently
             # dropped. A transient LLM hiccup must not permanently mute the agent.
             logger.error("LLM generation failed; ending response cleanly", exc_info=True)
+            # Speak the failure instead of leaving the user in dead silence —
+            # unless this generation was cancelled (barge-in/session end), where
+            # the teardown itself can raise and an apology would be spurious.
+            if gen is None or self.cancel_scope is None or not self.cancel_scope.is_stale(gen):
+                yield LLMResponseChunk(
+                    text="Sorry, I ran into a problem with that. Could you try again?",
+                    runtime_config=runtime_config,
+                    response=response,
+                )
         finally:
             if api_response is not None and hasattr(api_response, "close"):
                 try:

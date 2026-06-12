@@ -17,7 +17,12 @@ from speech_to_speech.api.openai_realtime.service import CHUNK_SIZE_BYTES, Realt
 from speech_to_speech.api.openai_realtime.websocket_router import create_app
 from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.control import SESSION_END, is_control_message
-from speech_to_speech.pipeline.events import AssistantTextEvent, SpeechStartedEvent
+from speech_to_speech.pipeline.events import (
+    AssistantTextEvent,
+    SpeechStartedEvent,
+    SpeechStoppedEvent,
+    TranscriptionCompletedEvent,
+)
 from speech_to_speech.pipeline.messages import AUDIO_RESPONSE_DONE, PIPELINE_END
 
 # ---------------------------------------------------------------------------
@@ -59,6 +64,25 @@ def setup():
 
 def _pcm_bytes(n_samples: int) -> bytes:
     return b"\x00" * (n_samples * 2)
+
+
+# Realtime output lifecycle, in spec order, before the first audio delta.
+BEGIN_EVENT_TYPES = [
+    "response.created",
+    "response.output_item.added",
+    "response.content_part.added",
+]
+# Close-of-response lifecycle, after the last audio delta.
+FINISH_EVENT_TYPES = [
+    "response.output_audio.done",
+    "response.content_part.done",
+    "response.output_item.done",
+    "response.done",
+]
+
+
+def _receive_types(ws, n: int) -> list[str]:
+    return [ws.receive_json()["type"] for _ in range(n)]
 
 
 # ===================================================================
@@ -106,10 +130,13 @@ class TestClientEventDispatch:
                 )
                 time.sleep(0.1)
                 item = input_queue.get(timeout=1)
-                assert isinstance(item, tuple) and len(item) == 2
-                chunk, rt_cfg = item
+                # (raw, aec-cleaned, far_active, runtime_config)
+                assert isinstance(item, tuple) and len(item) == 4
+                chunk, cleaned, far_active, rt_cfg = item
                 assert isinstance(chunk, bytes)
                 assert len(chunk) == CHUNK_SIZE_BYTES
+                assert isinstance(cleaned, bytes)
+                assert isinstance(far_active, bool)
 
     def test_session_update_applied(self, setup):
         app, service, *_ = setup
@@ -252,12 +279,10 @@ class TestSendLoop:
                 output_queue.put(SESSION_END)
                 output_queue.put(_pcm_bytes(256))
 
-                msg1 = ws.receive_json()
-                assert msg1["type"] == "response.created"
-                msg2 = ws.receive_json()
-                assert msg2["type"] == "response.output_audio.delta"
+                types = _receive_types(ws, 4)
+                assert types == BEGIN_EVENT_TYPES + ["response.output_audio.delta"]
 
-    def test_audio_output_sends_response_created_and_delta(self, setup):
+    def test_audio_output_sends_lifecycle_and_delta(self, setup):
         app, _, _, output_queue, *_ = setup
         with TestClient(app) as client:
             with client.websocket_connect("/v1/realtime") as ws:
@@ -266,6 +291,8 @@ class TestSendLoop:
                 msg1 = ws.receive_json()
                 assert msg1["type"] == "response.created"
                 assert msg1["response"]["status"] == "in_progress"
+                assert ws.receive_json()["type"] == "response.output_item.added"
+                assert ws.receive_json()["type"] == "response.content_part.added"
                 msg2 = ws.receive_json()
                 assert msg2["type"] == "response.output_audio.delta"
                 assert "delta" in msg2
@@ -279,19 +306,21 @@ class TestSendLoop:
                 output_queue.put(_pcm_bytes(256))
                 output_queue.put(PIPELINE_END)
 
-                msg1 = ws.receive_json()
-                assert msg1["type"] == "response.created"
+                types = _receive_types(ws, 3)
+                assert types == BEGIN_EVENT_TYPES
 
-                msg2 = ws.receive_json()
-                assert msg2["type"] == "response.output_audio.delta"
-                decoded = base64.b64decode(msg2["delta"])
-                assert len(decoded) == len(_pcm_bytes(512))
+                # MAX_AUDIO_BATCH_BYTES (20 ms = 640 bytes at the pipeline rate)
+                # keeps the two 512-byte chunks in separate deltas; each is
+                # resampled 16 kHz -> 24 kHz (default client rate), so the total
+                # PCM grows by 1.5x.
+                total_pcm = 0
+                for _ in range(2):
+                    msg = ws.receive_json()
+                    assert msg["type"] == "response.output_audio.delta"
+                    total_pcm += len(base64.b64decode(msg["delta"]))
+                assert total_pcm == len(_pcm_bytes(512)) * 3 // 2
 
-                msg3 = ws.receive_json()
-                msg4 = ws.receive_json()
-                types = {msg3["type"], msg4["type"]}
-                assert "response.output_audio.done" in types
-                assert "response.done" in types
+                assert _receive_types(ws, 4) == FINISH_EVENT_TYPES
 
     def test_end_marker_sends_finish_events(self, setup):
         app, _, _, output_queue, *_ = setup
@@ -299,14 +328,9 @@ class TestSendLoop:
             with client.websocket_connect("/v1/realtime") as ws:
                 ws.receive_json()
                 output_queue.put(_pcm_bytes(256))
-                ws.receive_json()  # response.created
-                ws.receive_json()  # audio delta
+                _receive_types(ws, 4)  # begin lifecycle + audio delta
                 output_queue.put(PIPELINE_END)
-                msg1 = ws.receive_json()
-                msg2 = ws.receive_json()
-                types = {msg1["type"], msg2["type"]}
-                assert "response.output_audio.done" in types
-                assert "response.done" in types
+                assert _receive_types(ws, 4) == FINISH_EVENT_TYPES
 
     def test_text_output_sends_pipeline_events(self, setup):
         app, _, _, _, text_output_queue, *_ = setup
@@ -360,6 +384,141 @@ class TestSendLoop:
                 assert response_playing.is_set(), "response_playing should remain set"
                 assert not cancel_scope.discarding, "cancel_scope should not be discarding"
                 assert service._state(conn_id).in_response, "response should still be active"
+
+
+# ===================================================================
+# Turn-start lifecycle and keepalive (the silent "thinking" gap)
+# ===================================================================
+
+
+class TestThinkingGap:
+    def _start_turn(self, ws, text_output_queue):
+        """Drive a VAD turn to completion and return the early response.created."""
+        text_output_queue.put(SpeechStartedEvent())
+        assert ws.receive_json()["type"] == "input_audio_buffer.speech_started"
+        text_output_queue.put(SpeechStoppedEvent(duration_s=1.0))
+        assert ws.receive_json()["type"] == "input_audio_buffer.speech_stopped"
+        text_output_queue.put(TranscriptionCompletedEvent(transcript="hello"))
+        assert ws.receive_json()["type"] == "conversation.item.input_audio_transcription.completed"
+        created = ws.receive_json()
+        assert created["type"] == "response.created"
+        assert created["response"]["status"] == "in_progress"
+        return created
+
+    def test_response_created_emitted_at_turn_start(self, setup):
+        """response.created arrives with the transcription, before any audio exists."""
+        app, service, _, output_queue, text_output_queue, *_ = setup
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()  # session.created
+                created = self._start_turn(ws, text_output_queue)
+                conn_id = list(service._conns.keys())[0]
+                assert service._state(conn_id).in_response
+
+                # First audio attaches to the SAME response: no second created.
+                output_queue.put(_pcm_bytes(256))
+                assert ws.receive_json()["type"] == "response.output_item.added"
+                assert ws.receive_json()["type"] == "response.content_part.added"
+                delta = ws.receive_json()
+                assert delta["type"] == "response.output_audio.delta"
+                assert delta["response_id"] == created["response"]["id"]
+
+    def test_keepalive_during_silent_gap(self, setup, monkeypatch):
+        """With a response in_progress and nothing on the wire, s2s.keepalive is emitted."""
+        import speech_to_speech.api.openai_realtime.websocket_router as router_mod
+
+        monkeypatch.setattr(router_mod, "HEARTBEAT_S", 0.2)
+        app, _, _, _, text_output_queue, *_ = setup
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()  # session.created
+                created = self._start_turn(ws, text_output_queue)
+                # Nothing else is sent: the next event must be the keepalive.
+                ka = ws.receive_json()
+                assert ka["type"] == "s2s.keepalive"
+                assert ka["response_id"] == created["response"]["id"]
+                assert ka["event_id"].startswith("event_")
+                # And it repeats while the gap continues.
+                assert ws.receive_json()["type"] == "s2s.keepalive"
+
+    def test_no_keepalive_outside_response(self, setup, monkeypatch):
+        """Idle session (no in-flight response) must stay silent."""
+        import speech_to_speech.api.openai_realtime.websocket_router as router_mod
+
+        monkeypatch.setattr(router_mod, "HEARTBEAT_S", 0.2)
+        app, _, _, _, text_output_queue, *_ = setup
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()  # session.created
+                # Idle for several heartbeat intervals with no response open.
+                time.sleep(0.7)
+                # The next frame on the wire must be this event — if any
+                # keepalive had been sent while idle, it would arrive first.
+                text_output_queue.put(SpeechStartedEvent())
+                assert ws.receive_json()["type"] == "input_audio_buffer.speech_started"
+
+    def test_barge_in_during_thinking_gap_cancels(self, setup):
+        """Speech while the LLM is in flight (no audio yet) cancels the early response."""
+        app, service, _, output_queue, text_output_queue, _, _, _, cancel_scope = setup
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()  # session.created
+                created = self._start_turn(ws, text_output_queue)
+
+                # User speaks again before any audio was produced.
+                text_output_queue.put(SpeechStartedEvent())
+                # finish (cancelled, no output item yet) + speech_started
+                msgs = [ws.receive_json() for _ in range(3)]
+                types = [m["type"] for m in msgs]
+                assert "response.output_audio.done" in types
+                assert "response.done" in types
+                assert "input_audio_buffer.speech_started" in types
+                done = next(m for m in msgs if m["type"] == "response.done")
+                assert done["response"]["id"] == created["response"]["id"]
+                assert done["response"]["status"] == "cancelled"
+                time.sleep(0.1)
+                assert cancel_scope.discarding
+
+    def test_stale_response_done_does_not_close_next_response(self, setup):
+        """A cancelled generation's __RESPONSE_DONE__ must not finish the next
+        (already-created) response; it only clears the discard guard."""
+        app, service, _, output_queue, text_output_queue, _, _, _, cancel_scope = setup
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()  # session.created
+                self._start_turn(ws, text_output_queue)
+
+                # Barge-in during the gap: turn 1's response is cancelled.
+                text_output_queue.put(SpeechStartedEvent())
+                for _ in range(3):
+                    ws.receive_json()
+                time.sleep(0.1)
+                assert cancel_scope.discarding
+
+                # Turn 2 opens its response while turn 1's LLM is still winding down.
+                text_output_queue.put(SpeechStoppedEvent(duration_s=1.0))
+                assert ws.receive_json()["type"] == "input_audio_buffer.speech_stopped"
+                text_output_queue.put(TranscriptionCompletedEvent(transcript="again"))
+                assert ws.receive_json()["type"] == "conversation.item.input_audio_transcription.completed"
+                created2 = ws.receive_json()
+                assert created2["type"] == "response.created"
+
+                # Turn 1's terminator finally drains: guard clears, turn 2 stays open.
+                output_queue.put(AUDIO_RESPONSE_DONE)
+                time.sleep(0.2)
+                assert not cancel_scope.discarding
+                conn_id = list(service._conns.keys())[0]
+                assert service._state(conn_id).in_response, "stale done must not close the new response"
+
+                # Turn 2 then streams and completes normally.
+                output_queue.put(_pcm_bytes(256))
+                assert ws.receive_json()["type"] == "response.output_item.added"
+                assert ws.receive_json()["type"] == "response.content_part.added"
+                delta = ws.receive_json()
+                assert delta["type"] == "response.output_audio.delta"
+                assert delta["response_id"] == created2["response"]["id"]
+                output_queue.put(AUDIO_RESPONSE_DONE)
+                assert _receive_types(ws, 4) == FINISH_EVENT_TYPES
 
 
 # ===================================================================

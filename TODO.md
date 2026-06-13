@@ -66,8 +66,16 @@ be tightened back down.
 ## 2. Support multiple concurrent, isolated sessions
 
 **Requirement (Eric).** s2s must eventually handle **multiple unique concurrent
-sessions, kept organized and isolated from each other**. Not needed yet; capture
-the design before building.
+sessions, kept organized and isolated from each other** — a truly multi-use
+backend: multiple smart speakers holding warm WebSocket connections, plus other
+client types (Matrix/Element Call bridge, browser, …).
+
+**➜ Detailed design of record: [MULTI_SESSION_PLAN.md](MULTI_SESSION_PLAN.md)**
+(2026-06-12). Decision: in-process session pool (`SessionPipeline` per
+connection) for the remote profile — the heavy models are already external HTTP
+services, so a session costs ~6 idle threads — with replica scale-out as the
+later story. Phases A–E with per-phase acceptance criteria are in the plan; the
+notes below are the original capture, superseded where they conflict.
 
 **Current state — hard single-session.** The WS endpoint `realtime_endpoint` in
 `src/speech_to_speech/api/openai_realtime/websocket_router.py` rejects any second

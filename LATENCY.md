@@ -163,3 +163,72 @@ From the upstream HuggingFace pipeline this fork is based on:
 
 Re-engage these once §4 has hard numbers showing which stage actually dominates
 on this deployment.
+
+---
+
+## 7. Multi-session capacity (Phase D load test)
+
+s2s now serves up to `S2S_MAX_SESSIONS` concurrent realtime sessions in one
+process (remote profile only; local in-process models force `1`). N sessions ⇒
+up to N concurrent turns hitting the *same* shared STT/F5/Hermes endpoints, so
+first-audio latency degrades as concurrency rises. The job of this section is to
+**measure that curve on real hardware and document the recommended cap from its
+knee** — the point where p95 first-audio crosses your latency budget.
+
+> Status: **measure first.** The harness below is wired; the tables are
+> placeholders until filled from a real run against the production remote stack.
+
+### 7.1 How to run
+
+Start a server with the remote profile and a cap at least as large as the biggest
+level you'll test, then drive it. The harness streams a real speech WAV per turn
+(server-VAD endpoints it) and measures **speech_stopped → first audio delta** —
+the same first-audio number as §1.
+
+```bash
+# server (remote profile), capacity 8
+S2S_MAX_SESSIONS=8 python -m speech_to_speech.s2s_pipeline --mode realtime ... &
+
+# load test: 2 / 4 / 8 concurrent turns, 5 waves each, emit a markdown table
+python scripts/load_test_sessions.py --wav sample.wav --concurrencies 2,4,8 --rounds 5 --markdown
+
+# soak: 8 warm sessions, one random active talker, 5-minute smoke (24 h for real)
+python scripts/soak_sessions.py --wav sample.wav --sessions 8 \
+    --duration-s 300 --turn-interval-s 8 --server-pid $(pgrep -f s2s_pipeline)
+```
+
+`load_test_sessions.py` reads `/v1/sessions` to warn if `max_sessions` is below
+the requested concurrency. `soak_sessions.py` samples server RSS/threads/fds via
+`/proc` when `--server-pid` is given and fails if any of them trend upward
+(warm-connection leak check, §6.3 of MULTI_SESSION_PLAN.md).
+
+### 7.2 Results — fill in from runs
+
+First-audio latency (speech_stopped → first audio delta), seconds:
+
+| Concurrent turns | Turns | OK% | p50 (s) | p95 (s) | p99 (s) | max (s) |
+|---|---|---|---|---|---|---|
+| 1 (baseline) | — | — | — | — | — | — |
+| 2 | — | — | — | — | — | — |
+| 4 | — | — | — | — | — | — |
+| 8 | — | — | — | — | — | — |
+
+Soak (8 warm, 1 active talker): threads / fds / RSS baseline → peak, turns
+ok/fail. Expect **flat** resource lines.
+
+### 7.3 Picking the cap
+
+1. Run §7.1, fill §7.2.
+2. The recommended `S2S_MAX_SESSIONS` is the **highest concurrency whose p95
+   first-audio stays within budget** *and* whose success rate is 100% — beyond
+   it, turns queue behind the shared endpoints and latency knees up.
+3. Pair the cap with the external services' own concurrency (Whisper batch slots,
+   F5 instance count, Hermes worker pool). If the endpoints saturate before s2s
+   does, set the per-service caps (`STT_MAX_CONCURRENCY` / `TTS_MAX_CONCURRENCY` /
+   `LLM_MAX_CONCURRENCY`, default unlimited) so s2s queues fairly — with the
+   early `response.created` + `s2s.keepalive` already shipped, a queued turn still
+   shows honest "working" feedback instead of dead air. Document the chosen
+   pairing in REMOTE_SETUP.md.
+
+> **Recommended `S2S_MAX_SESSIONS` for the production remote stack: _TBD_**
+> (fill once §7.2 has numbers).

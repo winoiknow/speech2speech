@@ -828,3 +828,78 @@ class TestMultiSession:
                     # Each socket independently sees a keepalive during its gap.
                     assert _recv_until(ws_a, "s2s.keepalive")["response_id"] == service._state(conn_a).current_response_id
                     assert _recv_until(ws_b, "s2s.keepalive")["response_id"] == service._state(conn_b).current_response_id
+
+
+class TestObservability:
+    def test_sessions_endpoint_empty(self):
+        factory = IndependentSessionStubFactory()
+        app, _service = _multi_app(factory, max_sessions=2)
+        with TestClient(app) as client:
+            body = client.get("/v1/sessions").json()
+            assert body == {"count": 0, "max_sessions": 2, "sessions": []}
+
+    def test_sessions_endpoint_lists_live_sessions(self):
+        factory = IndependentSessionStubFactory()
+        app, service = _multi_app(factory, max_sessions=2)
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws_a:
+                ws_a.receive_json()
+                with client.websocket_connect("/v1/realtime") as ws_b:
+                    ws_b.receive_json()
+                    body = client.get("/v1/sessions").json()
+                    assert body["count"] == 2
+                    ids = {s["session_id"] for s in body["sessions"]}
+                    assert ids == set(service.connection_ids)
+                    for s in body["sessions"]:
+                        assert s["state"] in {"idle", "listening", "thinking", "speaking"}
+                        assert s["connected_s"] >= 0
+                        assert "usage" in s and "turns" in s
+
+    def test_session_state_reflects_response_lifecycle(self):
+        factory = IndependentSessionStubFactory()
+        app, service = _multi_app(factory, max_sessions=1)
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                conn = service.connection_ids[0]
+                assert service._session_state(conn) == "idle"
+                # thinking: in_response but not yet playing audio
+                service.response._ensure_response(conn)
+                assert service._session_state(conn) == "thinking"
+                # speaking: pipeline is playing audio
+                factory.built[0].response_playing.set()
+                assert service._session_state(conn) == "speaking"
+
+    def test_usage_endpoint_has_per_session_breakdown(self):
+        factory = IndependentSessionStubFactory()
+        app, service = _multi_app(factory, max_sessions=2)
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                conn = service.connection_ids[0]
+                service._state(conn).response_usage.turns = 3
+                body = client.get("/v1/usage").json()
+                assert body["active_sessions"] == 1
+                assert body["per_session"][conn]["turns"] == 3
+
+    def test_handler_thread_names_carry_session_tag(self):
+        """The real session pipeline tags every handler thread with the short sid."""
+        from speech_to_speech.utils.thread_manager import ThreadManager
+        from speech_to_speech.utils.utils import short_sid
+
+        class _Idle(BaseHandler):
+            def setup(self, *a, **k):
+                pass
+
+            def process(self, item):
+                yield item
+
+        sid = "session_deadbeefcafe"
+        tm = ThreadManager([_Idle(ThreadingEvent(), Queue(), Queue())], daemon=True, name_prefix=short_sid(sid))
+        tm.start()
+        try:
+            names = [t.name for t in tm.threads]
+            assert names == [f"_Idle-{short_sid(sid)}"]
+            assert short_sid(sid) == "deadbeef"
+        finally:
+            tm.stop()

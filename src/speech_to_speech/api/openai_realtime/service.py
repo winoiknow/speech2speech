@@ -1,5 +1,6 @@
 import logging
 import threading
+import time
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
@@ -151,6 +152,11 @@ class ConnState(BaseModel):
     session_id: str = Field(default_factory=lambda: _generate_id("session"))
     conversation_id: str = Field(default_factory=lambda: _generate_id("conv"))
     runtime_config: RuntimeConfig = Field(default_factory=RuntimeConfig)
+    # Observability (Phase D): wall-clock connect time and last-client-activity
+    # time. last_activity_at is bumped on every inbound client event (touch) and
+    # drives both /v1/sessions reporting and the optional idle reaper.
+    connected_at: float = Field(default_factory=time.time)
+    last_activity_at: float = Field(default_factory=time.time)
     in_response: bool = False
     audio_buffer_has_data: bool = False
     audio_remainder: bytes = b""
@@ -263,6 +269,56 @@ class RealtimeService:
     @property
     def connection_ids(self) -> list[str]:
         return list(self._conns)
+
+    def touch(self, conn_id: str) -> None:
+        """Mark a session as active now (called on each inbound client event)."""
+        st = self._conns.get(conn_id)
+        if st is not None:
+            st.last_activity_at = time.time()
+
+    # ── Observability ────────────────────────────────
+
+    def _session_state(self, conn_id: str) -> str:
+        """Coarse session state for /v1/sessions: speaking | thinking | listening | idle."""
+        st = self._conns.get(conn_id)
+        if st is None:
+            return "gone"
+        pipeline = self._pipelines.get(conn_id)
+        if pipeline is not None and pipeline.response_playing.is_set():
+            return "speaking"
+        if st.in_response:
+            return "thinking"
+        if st.audio_buffer_has_data:
+            return "listening"
+        return "idle"
+
+    def get_sessions(self) -> list[dict[str, Any]]:
+        """Snapshot of every live session for the /v1/sessions endpoint."""
+        now = time.time()
+        sessions: list[dict[str, Any]] = []
+        for conn_id, st in list(self._conns.items()):
+            sessions.append(
+                {
+                    "session_id": conn_id,
+                    "conversation_id": st.conversation_id,
+                    "state": self._session_state(conn_id),
+                    "connected_at": st.connected_at,
+                    "last_activity_at": st.last_activity_at,
+                    "connected_s": round(now - st.connected_at, 1),
+                    "idle_s": round(now - st.last_activity_at, 1),
+                    "turns": st.response_usage.turns,
+                    "in_response": st.in_response,
+                    "usage": st.response_usage.model_dump(),
+                }
+            )
+        return sessions
+
+    def idle_session_ids(self, idle_timeout_s: float) -> list[str]:
+        """Session ids whose last client activity is older than idle_timeout_s."""
+        if idle_timeout_s <= 0:
+            return []
+        cutoff = time.time() - idle_timeout_s
+        return [cid for cid, st in list(self._conns.items()) if st.last_activity_at < cutoff]
 
     # ── Per-connection pipeline binding ──────────────
 
@@ -432,11 +488,19 @@ class RealtimeService:
         return []
 
     def get_usage(self) -> dict[str, Any]:
-        """Return cumulative usage metrics across all completed responses."""
+        """Return cumulative usage metrics plus a live per-session breakdown.
+
+        The cumulative totals only fold in a session's counters at unregister, so
+        ``per_session`` surfaces the in-flight usage of sessions that are still
+        connected (which the totals don't yet include)."""
         with self._usage_lock:
             data = self.total_usage.model_dump()
             data["total_errors"] = self.total_usage.total_errors
         data["total_tokens"] = data["input_tokens"] + data["output_tokens"]
+        data["active_sessions"] = len(self._conns)
+        data["per_session"] = {
+            conn_id: st.response_usage.model_dump() for conn_id, st in list(self._conns.items())
+        }
         return data
 
     # ── Error ───────────────────────────────────

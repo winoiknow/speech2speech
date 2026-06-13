@@ -264,6 +264,7 @@ def create_app(
                 except asyncio.TimeoutError:
                     continue
 
+                service.touch(session_id)
                 event = service.parse_client_event(raw)
                 if event is None:
                     await _send_event(
@@ -353,6 +354,13 @@ def create_app(
     @app.get("/v1/usage")
     async def usage_endpoint() -> dict[str, Any]:
         return service.get_usage()
+
+    @app.get("/v1/sessions")
+    async def sessions_endpoint() -> dict[str, Any]:
+        """Live session roster: one entry per connected session with its coarse
+        state, age, idle time, turn count and per-session usage."""
+        sessions = service.get_sessions()
+        return {"count": len(sessions), "max_sessions": max_sessions, "sessions": sessions}
 
     async def _session_send_loop(session_id: str, pipeline: "SessionPipeline", ws: WebSocket) -> None:
         """Poll one session's output queues and send to its client."""

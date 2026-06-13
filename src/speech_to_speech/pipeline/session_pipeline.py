@@ -47,6 +47,7 @@ from speech_to_speech.s2s_pipeline import (
 )
 from speech_to_speech.STT.transcription_notifier import TranscriptionNotifier
 from speech_to_speech.utils.thread_manager import ThreadManager
+from speech_to_speech.utils.utils import short_sid
 from speech_to_speech.VAD.vad_handler import VADHandler
 
 logger = logging.getLogger(__name__)
@@ -574,7 +575,9 @@ class HandlerFactory:
             handlers=core_handlers,
             # daemon=True: a per-session handler is torn down at disconnect; if one
             # is briefly stuck in a blocking call it must never hold up process exit.
-            threads=ThreadManager(core_handlers, daemon=True),
+            # name_prefix tags every handler thread with this session's short id so
+            # stack dumps / logs are attributable to the right session.
+            threads=ThreadManager(core_handlers, daemon=True, name_prefix=short_sid(session_id)),
         )
 
     def effective_max_sessions(self) -> int:

@@ -37,6 +37,7 @@ from speech_to_speech.pipeline.messages import (
     LLMResponseChunk,
     TokenUsage,
 )
+from speech_to_speech.utils.concurrency import LLM_LIMITER
 from speech_to_speech.utils.utils import _generate_id
 
 logger = logging.getLogger(__name__)
@@ -161,6 +162,11 @@ class ResponsesApiModelHandler(BaseHandler[LLMIn, LLMOut]):
         clean_text = ""
         input_tokens = 0
         output_tokens = 0
+        # Cap concurrent in-flight LLM turns across all sessions (no-op unless
+        # LLM_MAX_CONCURRENCY is set). Acquired before the create and released in
+        # the finally below, so the slot is held across the whole streaming
+        # generation — that is where the inference cost lives.
+        LLM_LIMITER.acquire()
         try:
             api_response = self.client.responses.create(
                 model=self.model_name,
@@ -321,6 +327,7 @@ class ResponsesApiModelHandler(BaseHandler[LLMIn, LLMOut]):
                     response=response,
                 )
         finally:
+            LLM_LIMITER.release()
             if api_response is not None and hasattr(api_response, "close"):
                 try:
                     api_response.close()

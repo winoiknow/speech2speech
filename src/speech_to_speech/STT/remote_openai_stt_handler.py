@@ -17,6 +17,7 @@ from rich.console import Console
 from speech_to_speech.baseHandler import BaseHandler
 from speech_to_speech.pipeline.handler_types import STTIn, STTOut
 from speech_to_speech.pipeline.messages import Transcription
+from speech_to_speech.utils.concurrency import STT_LIMITER
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -119,7 +120,10 @@ class RemoteOpenAISTTHandler(BaseHandler[STTIn, STTOut]):
 
         logger.debug("RemoteOpenAISTT: posting %d bytes to %s", len(wav_bytes), self.endpoint)
         try:
-            response = self._client.post(self.endpoint, headers=self.headers, files=files)
+            # Cap concurrent in-flight STT requests across all sessions (no-op
+            # unless STT_MAX_CONCURRENCY is set); the slot covers the blocking POST.
+            with STT_LIMITER.slot():
+                response = self._client.post(self.endpoint, headers=self.headers, files=files)
             response.raise_for_status()
             result = response.json()
             pred_text = result.get("text", "").strip()

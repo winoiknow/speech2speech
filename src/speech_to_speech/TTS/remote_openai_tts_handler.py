@@ -20,6 +20,7 @@ from speech_to_speech.debug import DEBUG_MODE
 from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.handler_types import TTSIn, TTSOut
 from speech_to_speech.pipeline.messages import AUDIO_RESPONSE_DONE, EndOfResponse, TTSInput
+from speech_to_speech.utils.concurrency import TTS_LIMITER
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -101,7 +102,10 @@ class RemoteOpenAITTSHandler(BaseHandler[TTSIn, TTSOut]):
         src_rate = self.source_sample_rate  # overridden by the endpoint's X-Sample-Rate header if present
 
         try:
-            with self._client.stream(
+            # Cap concurrent in-flight TTS streams across all sessions (no-op
+            # unless TTS_MAX_CONCURRENCY is set); the slot is held for the whole
+            # stream, since the synthesis cost spans the streaming response.
+            with TTS_LIMITER.slot(), self._client.stream(
                 "POST",
                 self.stream_endpoint,
                 headers={**self.headers, "Content-Type": "application/json"},

@@ -11,8 +11,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field
 from queue import Queue
 from threading import Event
 from typing import Any
@@ -21,8 +23,11 @@ from openai.types.realtime import RealtimeSessionCreateRequest
 
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 from speech_to_speech.arguments_classes.speaker_id_arguments import SpeakerIdHandlerArguments
+from speech_to_speech.audio.echo_canceller import EchoCanceller
 from speech_to_speech.LLM.chat import Chat
 from speech_to_speech.pipeline.cancel_scope import CancelScope
+from speech_to_speech.pipeline.control import SESSION_END
+from speech_to_speech.pipeline.messages import PIPELINE_END
 from speech_to_speech.pipeline.queue_types import (
     AudioInItem,
     AudioOutItem,
@@ -45,6 +50,17 @@ from speech_to_speech.utils.thread_manager import ThreadManager
 from speech_to_speech.VAD.vad_handler import VADHandler
 
 logger = logging.getLogger(__name__)
+
+# Pipeline-internal PCM rate the EchoCanceller operates at (mirrors the router).
+PIPELINE_SAMPLE_RATE = 16000
+# Acoustic echo cancellation on the input path, per session. Off by default.
+# AEC_FILTER_LENGTH_MS should cover the echo round-trip delay (small on
+# LAN/browser; larger with a client jitter buffer); it applies to the speex
+# backend only. Backend: "aec3" (WebRTC AEC3, delay-estimating, default) or
+# "speex" (libspeexdsp adaptive filter).
+AEC_ENABLED = os.getenv("AEC_ENABLED", "0").lower() in ("1", "true", "on", "yes")
+AEC_BACKEND = os.getenv("AEC_BACKEND", "aec3")
+AEC_FILTER_LENGTH_MS = int(os.getenv("AEC_FILTER_LENGTH_MS", "250"))
 
 
 @dataclass
@@ -77,10 +93,16 @@ class SessionPipeline:
     should_listen: Event
     response_playing: Event
     cancel_scope: CancelScope
+    # Far-end (agent TTS) reference buffer for AEC; near-end mic is cleaned
+    # against it before the VAD decision. One per session (one call).
+    echo_canceller: EchoCanceller
 
     # ── Handler threads ──────────────────────────────────────────────
     handlers: list[Any]
     threads: ThreadManager
+
+    # ── Per-session asyncio send task (set by the router at connect) ──
+    send_task: asyncio.Task | None = field(default=None)
 
     def start(self) -> None:
         self.threads.start()
@@ -90,6 +112,30 @@ class SessionPipeline:
 
     def stop(self) -> None:
         self.threads.stop()
+
+    def shutdown(self, timeout: float = 5.0) -> None:
+        """Tear down all handler threads. Safe to call from a worker thread.
+
+        The handler chain is strictly linear (recv_audio → vad → … → tts →
+        send_audio), so a single ``PIPELINE_END`` on ``recv_audio`` breaks each
+        thread's loop and is forwarded downstream on cleanup, cascading through
+        the whole chain. ``SESSION_END`` first runs each handler's
+        ``on_session_end`` (closing per-session resources); ``stop_event`` is a
+        belt-and-suspenders wake for any handler idling on its 0.1 s get-timeout.
+        """
+        self.recv_audio.put(SESSION_END)
+        self.recv_audio.put(PIPELINE_END)
+        self.stop_event.set()
+        for thread in self.threads.threads:
+            if thread.is_alive():
+                thread.join(timeout=timeout)
+                if thread.is_alive():
+                    logger.warning(
+                        "session %s: thread %s did not terminate within %.1fs",
+                        self.session_id,
+                        thread.name,
+                        timeout,
+                    )
 
 
 class HandlerFactory:
@@ -350,6 +396,181 @@ class HandlerFactory:
             should_listen=should_listen,
             response_playing=response_playing,
             cancel_scope=cancel_scope,
+            # Non-realtime modes don't run the AEC input path; a disabled
+            # canceller is a no-op passthrough that just satisfies the field.
+            echo_canceller=EchoCanceller(sample_rate=PIPELINE_SAMPLE_RATE, enabled=False),
             handlers=pipeline_handlers,
             threads=ThreadManager(pipeline_handlers),
+        )
+
+    def build_session_pipeline(self, session_id: str) -> SessionPipeline:
+        """Build one realtime session's pipeline: fresh queues/events/cancel
+        scope/echo-canceller + the six core handlers, with **no** comms handler
+        (the server is shared infra, built once by :meth:`build_realtime_server`).
+
+        Called per WebSocket connect. The shared handler-arg objects are mutated
+        with this session's ``cancel_scope`` / ``text_output`` queue right before
+        the handlers are constructed; with the single-session guard still in
+        place (Phase B) only one pipeline exists at a time, so this is safe.
+        Per-session arg isolation lands with the guard lift in Phase C.
+        """
+        args = self.args
+        module_kwargs = args.module_kwargs
+        speaker_args = self.speaker_args
+        speaker_client = self.speaker_client
+
+        qe = initialize_queues_and_events()
+        stop_event: Event = qe["stop_event"]
+        should_listen: Event = qe["should_listen"]
+        response_playing: Event = qe["response_playing"]
+        cancel_scope: CancelScope = qe["cancel_scope"]
+        recv_audio_chunks_queue: Queue[AudioInItem] = qe["recv_audio_chunks_queue"]
+        send_audio_chunks_queue: Queue[AudioOutItem] = qe["send_audio_chunks_queue"]
+        spoken_prompt_queue: Queue[VADOutItem] = qe["spoken_prompt_queue"]
+        stt_output_queue: Queue[STTOutItem] = qe["stt_output_queue"]
+        text_prompt_queue: Queue[TextPromptItem] = qe["text_prompt_queue"]
+        lm_response_queue: Queue[LMOutItem] = qe["lm_response_queue"]
+        lm_processed_queue: Queue[TTSInItem] = qe["lm_processed_queue"]
+        text_output_queue: Queue[TextEventItem] = qe["text_output_queue"]
+
+        # Realtime arg wiring: each TTS/LM handler reads cancel_scope from its
+        # setup_kwargs; the VAD emits protocol events onto text_output.
+        vars(args.vad_handler_kwargs)["text_output_queue"] = text_output_queue
+        for kw in (
+            args.language_model_handler_kwargs,
+            args.responses_api_language_model_handler_kwargs,
+            args.kokoro_tts_handler_kwargs,
+            args.qwen3_tts_handler_kwargs,
+            args.pocket_tts_handler_kwargs,
+            args.chat_tts_handler_kwargs,
+            args.facebook_mms_tts_handler_kwargs,
+            args.remote_openai_tts_handler_kwargs,
+            args.elevenlabs_tts_handler_kwargs,
+            args.minimax_tts_handler_kwargs,
+        ):
+            vars(kw)["cancel_scope"] = cancel_scope
+
+        if module_kwargs.enable_live_transcription:
+            args.vad_handler_kwargs.enable_realtime_transcription = True
+            args.vad_handler_kwargs.realtime_processing_pause = module_kwargs.live_transcription_update_interval
+
+        vad = VADHandler(
+            stop_event,
+            queue_in=recv_audio_chunks_queue,
+            queue_out=spoken_prompt_queue,
+            setup_args=(should_listen,),
+            setup_kwargs=vars(args.vad_handler_kwargs),
+        )
+
+        # Realtime path: inline identify labels only when SPEAKER_ID_ENABLED; no
+        # runtime_config on the notifier (the service owns each session's chat).
+        transcription_notifier = TranscriptionNotifier(
+            stop_event,
+            queue_in=stt_output_queue,
+            queue_out=text_prompt_queue,
+            setup_kwargs={
+                "text_output_queue": text_output_queue,
+                "should_listen": should_listen,
+                "label_format": speaker_args.speaker_id_label_format if speaker_args.speaker_id_enabled else "",
+            },
+        )
+
+        stt = get_stt_handler(
+            module_kwargs,
+            stop_event,
+            spoken_prompt_queue,
+            stt_output_queue,
+            args.whisper_stt_handler_kwargs,
+            args.faster_whisper_stt_handler_kwargs,
+            args.paraformer_stt_handler_kwargs,
+            args.mlx_audio_whisper_stt_handler_kwargs,
+            args.parakeet_tdt_stt_handler_kwargs,
+            args.remote_openai_stt_handler_kwargs,
+            speaker_client=speaker_client if speaker_args.speaker_id_enabled else None,
+            speaker_timeout=speaker_args.speaker_id_timeout,
+            diarize_enabled=speaker_args.speaker_diarize_enabled,
+        )
+
+        lm = get_llm_handler(
+            module_kwargs,
+            stop_event,
+            text_prompt_queue,
+            lm_response_queue,
+            args.language_model_handler_kwargs,
+            args.responses_api_language_model_handler_kwargs,
+        )
+
+        from speech_to_speech.LLM.lm_output_processor import LMOutputProcessor
+
+        lm_processor = LMOutputProcessor(
+            stop_event,
+            queue_in=lm_response_queue,
+            queue_out=lm_processed_queue,
+            setup_kwargs={"text_output_queue": text_output_queue},
+        )
+
+        tts = get_tts_handler(
+            module_kwargs,
+            stop_event,
+            lm_processed_queue,
+            send_audio_chunks_queue,
+            should_listen,
+            args.chat_tts_handler_kwargs,
+            args.facebook_mms_tts_handler_kwargs,
+            args.pocket_tts_handler_kwargs,
+            args.kokoro_tts_handler_kwargs,
+            args.qwen3_tts_handler_kwargs,
+            args.remote_openai_tts_handler_kwargs,
+            args.elevenlabs_tts_handler_kwargs,
+            args.minimax_tts_handler_kwargs,
+        )
+
+        core_handlers: list[Any] = [vad, stt, transcription_notifier, lm, lm_processor, tts]
+
+        return SessionPipeline(
+            session_id=session_id,
+            recv_audio=recv_audio_chunks_queue,
+            spoken_prompt=spoken_prompt_queue,
+            stt_output=stt_output_queue,
+            text_prompt=text_prompt_queue,
+            lm_response=lm_response_queue,
+            lm_processed=lm_processed_queue,
+            send_audio=send_audio_chunks_queue,
+            text_output=text_output_queue,
+            stop_event=stop_event,
+            should_listen=should_listen,
+            response_playing=response_playing,
+            cancel_scope=cancel_scope,
+            echo_canceller=EchoCanceller(
+                sample_rate=PIPELINE_SAMPLE_RATE,
+                filter_length_ms=AEC_FILTER_LENGTH_MS,
+                enabled=AEC_ENABLED,
+                backend=AEC_BACKEND,
+            ),
+            handlers=core_handlers,
+            threads=ThreadManager(core_handlers),
+        )
+
+    def build_realtime_server(self) -> Any:
+        """Build the shared realtime server (uvicorn + FastAPI app). Per-session
+        pipelines are built on connect by the app via ``self`` as the session
+        factory, so this carries no queues — only server + service config."""
+        from speech_to_speech.api.openai_realtime.server import RealtimeServer
+
+        args = self.args
+        module_kwargs = args.module_kwargs
+        if module_kwargs.llm_backend == "responses-api":
+            chat_size = vars(args.responses_api_language_model_handler_kwargs).get("chat_size", 10)
+        else:
+            chat_size = vars(args.language_model_handler_kwargs).get("chat_size", 10)
+
+        return RealtimeServer(
+            stop_event=Event(),
+            session_factory=self,
+            host=args.websocket_streamer_kwargs.ws_host,
+            port=args.websocket_streamer_kwargs.ws_port,
+            chat_size=chat_size,
+            server_api_key=module_kwargs.server_api_key,
+            speaker_client=self.speaker_client,
+            speaker_diarize_enabled=self.speaker_args.speaker_diarize_enabled,
         )

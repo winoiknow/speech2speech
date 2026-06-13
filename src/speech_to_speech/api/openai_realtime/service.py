@@ -184,18 +184,27 @@ class RealtimeService:
         speaker_client: Any | None = None,
         diarize_enabled: bool = False,
     ) -> None:
+        # Startup-time fallbacks. In realtime mode (Phase B) these stay None and
+        # each connection's queues/events come from its bound SessionPipeline via
+        # _pipelines; non-realtime/test callers still pass singletons here and the
+        # per-conn accessors below fall back to them.
         self.text_prompt_queue = text_prompt_queue
         self.should_listen = should_listen
         self._chat_size = chat_size
         self._conns: dict[str, ConnState] = {}
+        # conn_id → SessionPipeline (set by the router at connect, cleared at
+        # disconnect). The per-connection unit of isolation; queues/events are
+        # read from here in preference to the startup singletons.
+        self._pipelines: dict[str, Any] = {}
         self.total_usage = GlobalUsageMetrics()
 
         # Phase 4 (Tier 2): async diarization correction, OFF the hot path. The
-        # corrected event is emitted onto text_output_queue from a worker thread;
-        # the router drops it until a consumer handler is registered (emit-and-drop).
+        # corrected event is emitted onto the session's text_output queue from a
+        # worker thread; the router drops it until a consumer handler is
+        # registered (emit-and-drop).
         self.text_output_queue = text_output_queue
         self.speaker_client = speaker_client
-        self.diarize_enabled = bool(diarize_enabled and speaker_client is not None and text_output_queue is not None)
+        self.diarize_enabled = bool(diarize_enabled and speaker_client is not None)
         self._diarize_pool = ThreadPoolExecutor(max_workers=2) if self.diarize_enabled else None
         if self.diarize_enabled:
             logger.info("Diarization correction ENABLED (async, off hot path)")
@@ -245,6 +254,28 @@ class RealtimeService:
     @property
     def connection_ids(self) -> list[str]:
         return list(self._conns)
+
+    # ── Per-connection pipeline binding ──────────────
+
+    def attach_pipeline(self, conn_id: str, pipeline: Any) -> None:
+        """Bind a connection's SessionPipeline so its queues/events drive this
+        connection's transcription→LLM bridge and diarize emit."""
+        self._pipelines[conn_id] = pipeline
+
+    def detach_pipeline(self, conn_id: str) -> None:
+        self._pipelines.pop(conn_id, None)
+
+    def _text_prompt_queue(self, conn_id: str) -> Queue[TextPromptItem] | None:
+        pipeline = self._pipelines.get(conn_id)
+        return pipeline.text_prompt if pipeline is not None else self.text_prompt_queue
+
+    def _text_output_queue(self, conn_id: str) -> Queue[TextEventItem] | None:
+        pipeline = self._pipelines.get(conn_id)
+        return pipeline.text_output if pipeline is not None else self.text_output_queue
+
+    def _should_listen_for(self, conn_id: str) -> ThreadingEvent | None:
+        pipeline = self._pipelines.get(conn_id)
+        return pipeline.should_listen if pipeline is not None else self.should_listen
 
     # ── Client event parsing ─────────────────────
 
@@ -329,7 +360,7 @@ class RealtimeService:
         # in the completed event.
         input_item_id = self.response._current_item_id(conn_id)
 
-        queue = self.text_prompt_queue
+        queue = self._text_prompt_queue(conn_id)
         if queue and transcript:
             queue.put(
                 GenerateResponseRequest(
@@ -344,19 +375,22 @@ class RealtimeService:
 
         # Phase 4: kick off async diarization AFTER the LLM is already triggered, so
         # it never touches the turn's hot path. Submit-and-forget; the worker emits
-        # a correction (or drops on any failure).
-        if self.diarize_enabled and event.audio_wav and self._diarize_pool is not None:
-            self._diarize_pool.submit(self._diarize_and_emit, input_item_id, event.audio_wav)
+        # a correction (or drops on any failure). The session's text_output queue is
+        # captured now so the worker emits to the right connection.
+        text_output = self._text_output_queue(conn_id)
+        if self.diarize_enabled and event.audio_wav and self._diarize_pool is not None and text_output is not None:
+            self._diarize_pool.submit(self._diarize_and_emit, input_item_id, event.audio_wav, text_output)
 
         return events
 
-    def _diarize_and_emit(self, item_id: str, wav: bytes) -> None:
+    def _diarize_and_emit(self, item_id: str, wav: bytes, text_output: Queue[TextEventItem]) -> None:
         """Worker: diarize off the hot path and emit a correction for ``item_id``.
 
         Runs in the diarize pool thread. Never raises (the client never raises and
         we guard the emit) so a failure can't take down the pool or the turn. The
-        corrected event goes on text_output_queue; with no dispatch handler yet it's
-        logged and dropped (emit-and-drop) — a consumer is a one-line follow-up.
+        corrected event goes on the session's text_output queue; with no dispatch
+        handler yet it's logged and dropped (emit-and-drop) — a consumer is a
+        one-line follow-up.
         """
         try:
             corr = self.speaker_client.diarize(wav, item_id=item_id, revision=1)
@@ -370,8 +404,7 @@ class RealtimeService:
                 revision=corr.revision,
                 segments=[s.model_dump() for s in corr.segments],
             )
-            if self.text_output_queue is not None:
-                self.text_output_queue.put(event)
+            text_output.put(event)
         except Exception as e:  # never let a background failure escape
             logger.debug("diarize correction for %s failed (%s) → dropped", item_id, e)
 

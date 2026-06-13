@@ -15,7 +15,10 @@ from starlette.testclient import TestClient
 
 from speech_to_speech.api.openai_realtime.service import CHUNK_SIZE_BYTES, RealtimeService
 from speech_to_speech.api.openai_realtime.websocket_router import create_app
+from speech_to_speech.baseHandler import BaseHandler
 from speech_to_speech.pipeline.cancel_scope import CancelScope
+
+from .conftest import FixedQueueSessionFactory
 from speech_to_speech.pipeline.control import SESSION_END, is_control_message
 from speech_to_speech.pipeline.events import (
     AssistantTextEvent,
@@ -46,9 +49,19 @@ def setup():
     stop_event = ThreadingEvent()
     response_playing = ThreadingEvent()
     cancel_scope = CancelScope()
-    app = create_app(
-        service, input_queue, output_queue, text_output_queue, should_listen, response_playing, cancel_scope, stop_event
+    # Connect-time build (Phase B): the pipeline is built by the factory on
+    # connect, wrapping these fixed queues so the test bodies inject/inspect them
+    # unchanged.
+    factory = FixedQueueSessionFactory(
+        recv_audio=input_queue,
+        send_audio=output_queue,
+        text_output=text_output_queue,
+        should_listen=should_listen,
+        response_playing=response_playing,
+        cancel_scope=cancel_scope,
+        text_prompt=text_prompt_queue,
     )
+    app = create_app(service, factory, stop_event)
     return (
         app,
         service,
@@ -580,3 +593,99 @@ class TestCleanup:
         assert text_output_queue.empty()
         end = input_queue.get(timeout=1)
         assert is_control_message(end, SESSION_END.kind)
+
+
+# ===================================================================
+# Phase B: connect-time build / disconnect-time teardown leaks no threads
+# ===================================================================
+
+
+class _IdentityHandler(BaseHandler):
+    """Trivial pass-through handler that runs the real BaseHandler loop, so it
+    starts a thread on connect and must be joined (via PIPELINE_END cascade /
+    stop_event) on disconnect."""
+
+    def process(self, item):
+        yield item
+
+
+class _ThreadedStubFactory:
+    """Session factory that builds a real (but trivial) 3-handler thread chain
+    wired recv_audio → … → send_audio, so a connect/disconnect cycle exercises
+    actual thread start + join."""
+
+    def __init__(self):
+        self.built: list = []
+
+    def build_session_pipeline(self, session_id: str):
+        from speech_to_speech.audio.echo_canceller import EchoCanceller
+        from speech_to_speech.pipeline.session_pipeline import SessionPipeline
+        from speech_to_speech.utils.thread_manager import ThreadManager
+
+        stop_event = ThreadingEvent()
+        recv, q1, q2, send = Queue(), Queue(), Queue(), Queue()
+        handlers = [
+            _IdentityHandler(stop_event, recv, q1),
+            _IdentityHandler(stop_event, q1, q2),
+            _IdentityHandler(stop_event, q2, send),
+        ]
+        pipeline = SessionPipeline(
+            session_id=session_id,
+            recv_audio=recv,
+            spoken_prompt=q1,
+            stt_output=q2,
+            text_prompt=Queue(),
+            lm_response=Queue(),
+            lm_processed=Queue(),
+            send_audio=send,
+            text_output=Queue(),
+            stop_event=stop_event,
+            should_listen=ThreadingEvent(),
+            response_playing=ThreadingEvent(),
+            cancel_scope=CancelScope(),
+            echo_canceller=EchoCanceller(sample_rate=16000, enabled=False),
+            handlers=handlers,
+            threads=ThreadManager(handlers),
+        )
+        self.built.append(pipeline)
+        return pipeline
+
+
+def _wait_until(predicate, timeout: float = 5.0, interval: float = 0.02) -> bool:
+    """Poll *predicate* until true or *timeout*; returns its final value. Used
+    instead of a fixed sleep so the assertion is robust to CPU contention from
+    other tests (the disconnect teardown joins threads asynchronously)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return predicate()
+
+
+class TestThreadLifecycle:
+    def test_reconnect_cycle_leaks_no_threads(self):
+        """connect → disconnect → reconnect, three times: every session's handler
+        threads must be started on connect and fully joined on disconnect."""
+        factory = _ThreadedStubFactory()
+        service = RealtimeService()
+        stop_event = ThreadingEvent()
+        app = create_app(service, factory, stop_event)
+
+        with TestClient(app) as client:
+            for _ in range(3):
+                with client.websocket_connect("/v1/realtime") as ws:
+                    ws.receive_json()  # session.created
+                    # the freshly built pipeline's threads are alive while connected
+                    pipeline = factory.built[-1]
+                    assert all(t.is_alive() for t in pipeline.threads.threads)
+                # after disconnect, that session's threads are all joined (the
+                # teardown join is async, so poll rather than sleep a fixed time)
+                joined = _wait_until(lambda: not any(t.is_alive() for t in pipeline.threads.threads))
+                assert joined, "session handler threads not joined after disconnect"
+
+        assert _wait_until(lambda: len(service._conns) == 0)
+        # No session pipeline left a live thread behind across all three cycles.
+        for pipeline in factory.built:
+            assert not any(t.is_alive() for t in pipeline.threads.threads)
+        assert len(factory.built) == 3

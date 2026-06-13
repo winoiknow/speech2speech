@@ -1,37 +1,32 @@
 import logging
 import threading
-from queue import Queue
 from threading import Event
-from typing import cast
+from typing import TYPE_CHECKING
 
 import uvicorn
 
 from speech_to_speech.api.openai_realtime.service import RealtimeService
 from speech_to_speech.api.openai_realtime.websocket_router import create_app
-from speech_to_speech.pipeline.cancel_scope import CancelScope
-from speech_to_speech.pipeline.queue_types import AudioInItem, AudioOutItem, TextEventItem, TextPromptItem
+
+if TYPE_CHECKING:
+    from speech_to_speech.pipeline.session_pipeline import HandlerFactory
 
 logger = logging.getLogger(__name__)
 
 
 class RealtimeServer:
-    """
-    Pipeline handler for the OpenAI Realtime API mode.
+    """Pipeline handler for the OpenAI Realtime API mode.
 
-    Owns pipeline queues, exposes run() for ThreadManager, and bridges
-    between FastAPI/uvicorn and the internal audio + text queues.
+    Owns uvicorn + the FastAPI app and the shared :class:`RealtimeService`. It
+    holds **no** pipeline queues: each WebSocket connection builds its own
+    :class:`SessionPipeline` via ``session_factory`` at connect time (Phase B),
+    so the only state here is server + service config.
     """
 
     def __init__(
         self,
         stop_event: Event,
-        input_queue: Queue[AudioInItem],
-        output_queue: Queue[AudioOutItem],
-        should_listen: Event,
-        response_playing: Event | None = None,
-        cancel_scope: CancelScope | None = None,
-        text_output_queue: Queue[TextEventItem] | None = None,
-        text_prompt_queue: Queue[TextPromptItem] | None = None,
+        session_factory: "HandlerFactory",
         host: str = "0.0.0.0",
         port: int = 8765,
         chat_size: int = 10,
@@ -40,13 +35,7 @@ class RealtimeServer:
         speaker_diarize_enabled: bool = False,
     ) -> None:
         self.stop_event = stop_event
-        self.input_queue = input_queue
-        self.output_queue = output_queue
-        self.text_output_queue = text_output_queue
-        self.text_prompt_queue = text_prompt_queue
-        self.should_listen = should_listen
-        self.response_playing = response_playing
-        self.cancel_scope = cancel_scope
+        self.session_factory = session_factory
         self.host = host
         self.port = port
         self.chat_size = chat_size
@@ -59,21 +48,13 @@ class RealtimeServer:
     def run(self) -> None:
         """Start the FastAPI/uvicorn server (called from a ThreadManager thread)."""
         service = RealtimeService(
-            text_prompt_queue=self.text_prompt_queue,
-            should_listen=self.should_listen,
             chat_size=self.chat_size,
-            text_output_queue=self.text_output_queue,
             speaker_client=self.speaker_client,
             diarize_enabled=self.speaker_diarize_enabled,
         )
         app = create_app(
             service=service,
-            input_queue=self.input_queue,
-            output_queue=self.output_queue,
-            text_output_queue=cast(Queue[TextEventItem], self.text_output_queue),
-            should_listen=self.should_listen,
-            response_playing=self.response_playing,
-            cancel_scope=self.cancel_scope,
+            session_factory=self.session_factory,
             stop_event=self.stop_event,
             server_api_key=self.server_api_key,
         )

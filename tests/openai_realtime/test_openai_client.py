@@ -30,6 +30,8 @@ from openai import AsyncOpenAI
 from speech_to_speech.api.openai_realtime.service import RealtimeService
 from speech_to_speech.api.openai_realtime.websocket_router import create_app
 from speech_to_speech.pipeline.cancel_scope import CancelScope
+
+from .conftest import FixedQueueSessionFactory
 from speech_to_speech.pipeline.events import (
     AssistantTextEvent,
     PartialTranscriptionEvent,
@@ -71,16 +73,19 @@ class _ServerEnv:
         self.stop_event = ThreadingEvent()
         self.response_playing = ThreadingEvent()
         self.cancel_scope = CancelScope()
-        self.app = create_app(
-            self.service,
-            self.input_queue,
-            self.output_queue,
-            self.text_output_queue,
-            self.should_listen,
-            self.response_playing,
-            self.cancel_scope,
-            self.stop_event,
+        # Connect-time build (Phase B): the pipeline is built on connect from a
+        # factory wrapping these fixed queues, so the test bodies drive the
+        # pipeline through them exactly as before.
+        self.factory = FixedQueueSessionFactory(
+            recv_audio=self.input_queue,
+            send_audio=self.output_queue,
+            text_output=self.text_output_queue,
+            should_listen=self.should_listen,
+            response_playing=self.response_playing,
+            cancel_scope=self.cancel_scope,
+            text_prompt=self.text_prompt_queue,
         )
+        self.app = create_app(self.service, self.factory, self.stop_event)
         self.port = _free_port()
         self._server_thread: threading.Thread | None = None
 

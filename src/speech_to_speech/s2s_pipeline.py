@@ -641,14 +641,23 @@ def main() -> None:
         args.minimax_tts_handler_kwargs,
     )
 
-    # Phase A: one HandlerFactory captures the prepared args, one SessionPipeline
-    # is built at startup and run for the process lifetime (single-session
-    # semantics, unchanged). Imported here (not at module top) to avoid a circular
-    # import — session_pipeline reuses get_*_handler / initialize_queues_and_events
-    # from this module.
+    # One HandlerFactory captures the prepared args. Imported here (not at module
+    # top) to avoid a circular import — session_pipeline reuses get_*_handler /
+    # initialize_queues_and_events from this module.
     from speech_to_speech.pipeline.session_pipeline import HandlerFactory
+    from speech_to_speech.utils.thread_manager import ThreadManager
 
-    pipeline_manager = HandlerFactory(args).build()
+    factory = HandlerFactory(args)
+
+    if args.module_kwargs.mode == "realtime":
+        # Phase B: realtime builds only the shared server at startup; each
+        # WebSocket connection builds + tears down its own SessionPipeline. Run
+        # the server under a ThreadManager so the existing start/stop/wait +
+        # signal-handling path is unchanged.
+        pipeline_manager: Any = ThreadManager([factory.build_realtime_server()])
+    else:
+        # local / websocket / socket modes keep one startup-built pipeline.
+        pipeline_manager = factory.build()
 
     # Set up graceful shutdown handler
     shutdown_requested = [False]  # Use list for nonlocal mutation

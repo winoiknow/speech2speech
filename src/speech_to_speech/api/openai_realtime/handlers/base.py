@@ -29,10 +29,10 @@ class RealtimeBaseHandler:
     # ── conn_id-keyed accessors ──
 
     def _queue(self, conn_id: str) -> Queue | None:
-        return self._service.text_prompt_queue
+        return self._service._text_prompt_queue(conn_id)
 
     def _should_listen(self, conn_id: str) -> ThreadingEvent | None:
-        return self._service.should_listen
+        return self._service._should_listen_for(conn_id)
 
     # ── shared helpers ────────────────────────────────
 

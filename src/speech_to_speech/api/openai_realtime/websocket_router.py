@@ -2,12 +2,13 @@ import asyncio
 import base64
 import logging
 import os
+import time
 import wave
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from queue import Empty, Queue
 from threading import Event as ThreadingEvent
-from typing import Any, Callable, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Callable, Optional, TypeVar
 
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -21,9 +22,7 @@ from openai.types.realtime import (
 )
 
 from speech_to_speech.api.openai_realtime.service import RealtimeService, ServerEvent
-from speech_to_speech.audio.echo_canceller import EchoCanceller
 from speech_to_speech.debug import DEBUG_MODE
-from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.control import SESSION_END, PipelineControlMessage, is_control_message
 from speech_to_speech.pipeline.events import (
     AssistantTextEvent,
@@ -33,8 +32,10 @@ from speech_to_speech.pipeline.events import (
     TokenUsageEvent,
 )
 from speech_to_speech.pipeline.messages import AUDIO_RESPONSE_DONE, PIPELINE_END
-from speech_to_speech.pipeline.queue_types import AudioInItem, AudioOutItem, TextEventItem
 from speech_to_speech.utils.utils import _generate_id
+
+if TYPE_CHECKING:
+    from speech_to_speech.pipeline.session_pipeline import HandlerFactory, SessionPipeline
 
 logger = logging.getLogger(__name__)
 QItem = TypeVar("QItem")
@@ -72,15 +73,6 @@ HEARTBEAT_S = float(os.getenv("S2S_HEARTBEAT_S", "5"))
 TTS_DUMP_DIR = os.getenv("S2S_TTS_DUMP_DIR") or None
 # Sample rate of the dumped WAV — the negotiated client output rate (GA pcm = 24000).
 TTS_DUMP_RATE = int(os.getenv("S2S_TTS_DUMP_RATE", "24000"))
-# Acoustic echo cancellation on the input path: subtract the agent's own TTS
-# (far-end) from the caller's mic (near-end) before the VAD sees it, so the VAD
-# stops tripping on echo. Off by default. AEC_FILTER_LENGTH_MS should cover the
-# echo round-trip delay (small on LAN/browser; larger with a client jitter buffer).
-AEC_ENABLED = os.getenv("AEC_ENABLED", "0").lower() in ("1", "true", "on", "yes")
-# Backend: "aec3" (WebRTC AEC3, Rust wheel — delay-estimating, default) or "speex"
-# (libspeexdsp, adaptive filter only). AEC_FILTER_LENGTH_MS applies to speex.
-AEC_BACKEND = os.getenv("AEC_BACKEND", "aec3")
-AEC_FILTER_LENGTH_MS = int(os.getenv("AEC_FILTER_LENGTH_MS", "250"))
 
 
 async def _send_event(ws: WebSocket, event: ServerEvent) -> None:
@@ -105,23 +97,18 @@ def _keep_user_text_event(item: Any) -> bool:
 
 def create_app(
     service: RealtimeService,
-    input_queue: Queue[AudioInItem],
-    output_queue: Queue[AudioOutItem],
-    text_output_queue: Queue[TextEventItem],
-    should_listen: ThreadingEvent,
-    response_playing: ThreadingEvent | None,
-    cancel_scope: CancelScope | None,
+    session_factory: "HandlerFactory",
     stop_event: ThreadingEvent,
     server_api_key: Optional[str] = None,
 ) -> FastAPI:
+    """Build the realtime FastAPI app.
 
-    # Shared by the receive loop (near-end mic) and the send loop (far-end TTS).
-    echo_canceller = EchoCanceller(
-        sample_rate=PIPELINE_SAMPLE_RATE,
-        filter_length_ms=AEC_FILTER_LENGTH_MS,
-        enabled=AEC_ENABLED,
-        backend=AEC_BACKEND,
-    )
+    Holds no pipeline queues: each WebSocket connection builds its own
+    :class:`SessionPipeline` via ``session_factory`` at connect time and tears it
+    down at disconnect. ``session_factory`` only needs a
+    ``build_session_pipeline(session_id) -> SessionPipeline`` method, so tests can
+    pass a lightweight stub.
+    """
 
     def _flush_queue(q: Queue[QItem], *, preserve: Callable[[QItem], bool] | None = None) -> None:
         """Drain a queue, optionally preserving items matching *preserve*.
@@ -144,21 +131,20 @@ def create_app(
                     q.queue.appendleft(item)
                 q.not_empty.notify(len(preserved))
 
-    def clean_session(preserve: Callable[[Any], bool] | None = None) -> None:
+    def clean_session(pipeline: "SessionPipeline", preserve: Callable[[Any], bool] | None = None) -> None:
         # Invalidate in-flight LLM/TTS work (cooperative cancel via is_stale), then
-        # flush queues. reset() clears discarding only; generation stays bumped.
-        # Blocking HTTP reads are not interrupted here; see ResponsesApiModelHandler.process.
-        if cancel_scope:
-            cancel_scope.cancel()
-        _flush_queue(output_queue, preserve=preserve)
-        _flush_queue(text_output_queue, preserve=preserve)
-        if response_playing:
-            response_playing.clear()
-        if cancel_scope:
-            cancel_scope.reset()
-        should_listen.set()
+        # flush this session's queues. reset() clears discarding only; generation
+        # stays bumped. Blocking HTTP reads are not interrupted here; see
+        # ResponsesApiModelHandler.process.
+        pipeline.cancel_scope.cancel()
+        _flush_queue(pipeline.send_audio, preserve=preserve)
+        if pipeline.text_output is not None:
+            _flush_queue(pipeline.text_output, preserve=preserve)
+        pipeline.response_playing.clear()
+        pipeline.cancel_scope.reset()
+        pipeline.should_listen.set()
 
-    def _to_audio_bytes(chunk: AudioOutItem) -> bytes:
+    def _to_audio_bytes(chunk: Any) -> bytes:
         if isinstance(chunk, PipelineControlMessage):
             raise TypeError(f"unexpected control message on audio output queue: {chunk!r}")
         if isinstance(chunk, np.ndarray) or hasattr(chunk, "tobytes"):
@@ -167,27 +153,35 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        # session_id → SessionPipeline / WebSocket. active_session is retained
+        # while the single-session guard is in force (Phase B); Phase C replaces it.
+        app.state.sessions = {}
         app.state.websockets = {}
         app.state.active_session: Optional[str] = None  # type: ignore[misc]
-        app.state.send_task = asyncio.create_task(_send_loop())
         yield
-        app.state.send_task.cancel()
-        try:
-            await app.state.send_task
-        except asyncio.CancelledError:
-            pass
-        for ws in list(app.state.websockets.values()):
-            try:
-                await ws.close()
-            except Exception:
-                pass
+        # Server shutdown: stop each session's send task, close its socket, and
+        # tear down its pipeline threads.
+        loop = asyncio.get_running_loop()
+        for session_id, pipeline in list(app.state.sessions.items()):
+            if pipeline.send_task is not None:
+                pipeline.send_task.cancel()
+                try:
+                    await pipeline.send_task
+                except asyncio.CancelledError:
+                    pass
+            ws = app.state.websockets.get(session_id)
+            if ws is not None:
+                try:
+                    await ws.close(code=1001)
+                except Exception:
+                    pass
+            await loop.run_in_executor(None, pipeline.shutdown)
 
     app = FastAPI(lifespan=lifespan)
 
     @app.websocket("/v1/realtime")
     async def realtime_endpoint(ws: WebSocket) -> None:
         await ws.accept()
-        echo_canceller.reset()  # fresh far-end buffer for a new call
 
         if server_api_key:
             auth_header = ws.headers.get("authorization", "")
@@ -197,7 +191,8 @@ def create_app(
                 await ws.close(code=4001, reason="Unauthorized")
                 return
 
-        if app.state.websockets:
+        # Single-session guard (lifted behind S2S_MAX_SESSIONS in Phase C).
+        if app.state.sessions:
             logger.warning("Rejected connection: a session is already active")
             await _send_event(
                 ws,
@@ -210,13 +205,29 @@ def create_app(
             return
 
         session_id = service.register()
+
+        # Build this connection's pipeline (fresh queues/events/cancel scope/AEC +
+        # the handler threads). Instrumented: warm-connection clients depend on a
+        # low connect cost.
+        build_start = time.perf_counter()
+        pipeline = session_factory.build_session_pipeline(session_id)
+        pipeline.start()
+        build_ms = (time.perf_counter() - build_start) * 1000
+        logger.info("Session %s pipeline built + started in %.0f ms", session_id, build_ms)
+
+        service.attach_pipeline(session_id, pipeline)
+        app.state.sessions[session_id] = pipeline
         app.state.websockets[session_id] = ws
         app.state.active_session = session_id
+        pipeline.echo_canceller.reset()  # fresh far-end buffer for a new call
         logger.info(f"Client connected (session {session_id})")
 
-        # Defensive: drain edge queues and reset events so stale data from a
-        # previous session that survived SESSION_END propagation doesn't leak.
-        clean_session()
+        # Per-session send loop: drains this pipeline's output queues to this ws.
+        pipeline.send_task = asyncio.create_task(_session_send_loop(session_id, pipeline, ws))
+
+        # Defensive: drain edge queues and reset events so nothing leaks into the
+        # first turn.
+        clean_session(pipeline)
 
         try:
             await _send_event(ws, service.build_session_created(session_id))
@@ -246,8 +257,10 @@ def create_app(
                         # far_active drives the VAD's far-aware gate (raw gate when
                         # the agent is silent, residual gate while it's speaking).
                         # Payload: (raw, cleaned, far_active, runtime_config).
-                        cleaned = echo_canceller.process(chunk)
-                        input_queue.put((bytes(chunk), cleaned, echo_canceller.far_active, rt_cfg))
+                        cleaned = pipeline.echo_canceller.process(chunk)
+                        pipeline.recv_audio.put(
+                            (bytes(chunk), cleaned, pipeline.echo_canceller.far_active, rt_cfg)
+                        )
 
                 elif isinstance(event, InputAudioBufferCommitEvent):
                     err = service.handle_audio_commit(session_id)
@@ -266,42 +279,64 @@ def create_app(
                 elif isinstance(event, ResponseCreateEvent):
                     result = service.handle_response_create(session_id, event)
                     if result:
-                        if result.type != "error" and cancel_scope:
-                            cancel_scope.new_response()
+                        if result.type != "error":
+                            pipeline.cancel_scope.new_response()
                         await _send_event(ws, result)
 
                 elif isinstance(event, ResponseCancelEvent):
                     was_active = service._state(session_id).in_response
-                    if was_active and cancel_scope:
-                        cancel_scope.cancel()
-                    _flush_queue(output_queue, preserve=_keep_audio_sentinel)
-                    _flush_queue(text_output_queue, preserve=_keep_user_text_event)
+                    if was_active:
+                        pipeline.cancel_scope.cancel()
+                    _flush_queue(pipeline.send_audio, preserve=_keep_audio_sentinel)
+                    if pipeline.text_output is not None:
+                        _flush_queue(pipeline.text_output, preserve=_keep_user_text_event)
                     events = service.handle_response_cancel(session_id)
                     if events:
                         await _send_events(ws, events)
-                    if response_playing:
-                        response_playing.clear()
+                    pipeline.response_playing.clear()
 
         except WebSocketDisconnect:
             logger.info(f"Client {session_id} disconnected")
         except Exception as e:
             logger.error(f"Client {session_id} error: {type(e).__name__}: {e}", exc_info=True)
         finally:
-            clean_session()
+            # Stop sending to this socket before tearing the pipeline down so a
+            # PIPELINE_END draining through the send loop can't race the close.
+            if pipeline.send_task is not None:
+                pipeline.send_task.cancel()
+                try:
+                    await pipeline.send_task
+                except asyncio.CancelledError:
+                    pass
+            # Bookkeeping first so the session is observably gone (and the
+            # single-session slot freed) immediately — the handler-thread join
+            # below must not gate that.
+            service.detach_pipeline(session_id)
+            clean_session(pipeline)
             service.unregister(session_id)
-            if not service._conns:
-                input_queue.put(SESSION_END)
-                logger.info("Last client disconnected, sent SESSION_END")
+            app.state.sessions.pop(session_id, None)
             app.state.websockets.pop(session_id, None)
             app.state.active_session = None
+            # Join the handler threads off the event loop so a slow teardown can't
+            # block the connection handler from returning.
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, pipeline.shutdown)
             logger.info(f"Client {session_id} removed")
 
     @app.get("/v1/usage")
     async def usage_endpoint() -> dict[str, Any]:
         return service.get_usage()
 
-    async def _send_loop() -> None:
-        """Poll pipeline output queues and send to each connected client."""
+    async def _session_send_loop(session_id: str, pipeline: "SessionPipeline", ws: WebSocket) -> None:
+        """Poll one session's output queues and send to its client."""
+        output_queue = pipeline.send_audio
+        text_output_queue = pipeline.text_output
+        cancel_scope = pipeline.cancel_scope
+        response_playing = pipeline.response_playing
+        should_listen = pipeline.should_listen
+        echo_canceller = pipeline.echo_canceller
+        sid = session_id
+
         pending_output_item = None
         deltas_sent = 0  # DEBUG: response.output_audio.delta events emitted this response
         delta_pcm_bytes = 0  # DEBUG: pre-resample PCM bytes encoded into deltas this response
@@ -319,41 +354,31 @@ def create_app(
                         is_speech_start = isinstance(text_msg, SpeechStartedEvent)
 
                         was_in_response = False
-                        if is_speech_start and app.state.active_session:
-                            was_in_response = service._state(app.state.active_session).in_response
+                        if is_speech_start:
+                            was_in_response = service._state(sid).in_response
 
-                        if cancel_scope and cancel_scope.discarding and isinstance(text_msg, AssistantTextEvent):
+                        if cancel_scope.discarding and isinstance(text_msg, AssistantTextEvent):
                             pass
                         elif isinstance(text_msg, PipelineEvent):
-                            # Route to the session that owns the pipeline (the single
-                            # active session today) rather than broadcasting.
-                            sid = app.state.active_session
-                            ws = app.state.websockets.get(sid) if sid else None
-                            if ws:
-                                events = service.dispatch_pipeline_event(sid, text_msg)
-                                if events:
-                                    await _send_events(ws, events)
-                                    last_client_send_t = loop.time()
+                            events = service.dispatch_pipeline_event(sid, text_msg)
+                            if events:
+                                await _send_events(ws, events)
+                                last_client_send_t = loop.time()
 
                         if is_speech_start and was_in_response:
-                            active_cfg = (
-                                service._state(app.state.active_session).runtime_config
-                                if app.state.active_session
-                                else None
-                            )
+                            active_cfg = service._state(sid).runtime_config
                             if active_cfg is None or active_cfg.interrupt_response_enabled:
-                                if cancel_scope:
-                                    cancel_scope.cancel()
+                                cancel_scope.cancel()
                                 echo_canceller.flush_far()  # queued TTS won't be played → don't feed it as render
                                 _flush_queue(output_queue, preserve=_keep_audio_sentinel)
                                 _flush_queue(text_output_queue, preserve=_keep_user_text_event)
-                                if response_playing and response_playing.is_set():
+                                if response_playing.is_set():
                                     response_playing.clear()
                                 logger.warning(
                                     "BARGE-IN FIRED: SpeechStartedEvent while in_response → cancel_scope.cancel() "
                                     "(scope_gen now %s, discarding=True). If this fires spuriously every response, "
                                     "the VAD is likely tripping on echo/tail and this is why audio is dropped.",
-                                    cancel_scope.generation if cancel_scope else None,
+                                    cancel_scope.generation,
                                 )
                             else:
                                 logger.info("Speech during response: interrupt_response disabled, ignoring")
@@ -368,10 +393,7 @@ def create_app(
                         audio_chunk = output_queue.get_nowait()
 
                     if isinstance(audio_chunk, bytes) and audio_chunk == PIPELINE_END:
-                        sid = app.state.active_session
-                        ws = app.state.websockets.get(sid) if sid else None
-                        if ws:
-                            await _send_events(ws, service.finish_audio_response(sid))
+                        await _send_events(ws, service.finish_audio_response(sid))
                         break
 
                     if isinstance(audio_chunk, bytes) and audio_chunk == AUDIO_RESPONSE_DONE:
@@ -399,7 +421,7 @@ def create_app(
                         # finishing on the stale sentinel would close it before it produced
                         # any audio. Skip the finish events; still clear the discard guard
                         # and playback state below.
-                        stale_done = bool(cancel_scope and cancel_scope.discarding)
+                        stale_done = bool(cancel_scope.discarding)
                         if not stale_done:
                             # Hold response.done briefly so the client can drain its playout
                             # buffer. It plays inbound audio at real-time and ends up ~0.3 s
@@ -410,26 +432,20 @@ def create_app(
                             if REALTIME_PACING_ENABLED:
                                 held = 0.0
                                 while held < RESPONSE_DONE_TAIL_S:
-                                    if cancel_scope and cancel_scope.discarding:
+                                    if cancel_scope.discarding:
                                         break
                                     await asyncio.sleep(PACING_SLICE_S)
                                     held += PACING_SLICE_S
-                            sid = app.state.active_session
-                            ws = app.state.websockets.get(sid) if sid else None
-                            if ws:
-                                await _send_events(ws, service.finish_audio_response(sid))
-                                last_client_send_t = loop.time()
-                        if response_playing:
-                            response_playing.clear()
-                        if cancel_scope:
-                            cancel_scope.response_done()
+                            await _send_events(ws, service.finish_audio_response(sid))
+                            last_client_send_t = loop.time()
+                        response_playing.clear()
+                        cancel_scope.response_done()
                         should_listen.set()
                         logger.info(
                             "Response complete, listening re-enabled — sent %d audio delta event(s) "
-                            "carrying %d PCM bytes to %d client(s) this response",
+                            "carrying %d PCM bytes to client this response",
                             deltas_sent,
                             delta_pcm_bytes,
-                            len(service.connection_ids),
                         )
                         deltas_sent = 0
                         delta_pcm_bytes = 0
@@ -439,7 +455,7 @@ def create_app(
                     if is_control_message(audio_chunk):
                         continue
 
-                    if cancel_scope and cancel_scope.discarding:
+                    if cancel_scope.discarding:
                         # A barge-in mid-long-response leaves a big pre-rendered backlog that
                         # drains here one chunk at a time; log per-chunk only under DEBUG_MODE
                         # so production doesn't get ~1000 identical lines per interruption.
@@ -474,22 +490,19 @@ def create_app(
                             break
                         audio_batch.extend(next_audio)
 
-                    if response_playing and not response_playing.is_set():
+                    if not response_playing.is_set():
                         response_playing.set()
                         should_listen.set()
 
-                    sid = app.state.active_session
-                    ws = app.state.websockets.get(sid) if sid else None
-                    if ws:
-                        out_events = service.encode_audio_chunk(sid, bytes(audio_batch))
-                        await _send_events(ws, out_events)
-                        deltas_sent += 1
-                        delta_pcm_bytes += len(audio_batch)
-                        last_client_send_t = loop.time()
-                        if dump_pcm is not None:
-                            for ev in out_events:
-                                if getattr(ev, "type", "") == "response.output_audio.delta":
-                                    dump_pcm += base64.b64decode(ev.delta)
+                    out_events = service.encode_audio_chunk(sid, bytes(audio_batch))
+                    await _send_events(ws, out_events)
+                    deltas_sent += 1
+                    delta_pcm_bytes += len(audio_batch)
+                    last_client_send_t = loop.time()
+                    if dump_pcm is not None:
+                        for ev in out_events:
+                            if getattr(ev, "type", "") == "response.output_audio.delta":
+                                dump_pcm += base64.b64decode(ev.delta)
 
                     # Far-end reference for AEC: the 16 kHz pipeline PCM, fed as it is
                     # sent (≈ when it plays), so the canceller can subtract its echo
@@ -515,7 +528,7 @@ def create_app(
                             if remaining <= 0:
                                 break
                             # A client-initiated cancel sets discarding from another task; bail out fast.
-                            if cancel_scope and cancel_scope.discarding:
+                            if cancel_scope.discarding:
                                 audio_play_deadline = None
                                 break
                             await asyncio.sleep(min(remaining, PACING_SLICE_S))
@@ -526,21 +539,18 @@ def create_app(
                 # (LLM thinking, agent-side tool loop, TTS synth). Tell the client
                 # we're alive so its turn watchdog doesn't false-fire on a slow turn.
                 if HEARTBEAT_S > 0:
-                    sid = app.state.active_session
-                    st = service._conns.get(sid) if sid else None
+                    st = service._conns.get(sid)
                     if st is not None and st.in_response and loop.time() - last_client_send_t >= HEARTBEAT_S:
-                        ws = app.state.websockets.get(sid)
-                        if ws:
-                            try:
-                                await ws.send_json(
-                                    {
-                                        "type": "s2s.keepalive",
-                                        "event_id": _generate_id("event"),
-                                        "response_id": st.current_response_id,
-                                    }
-                                )
-                            except Exception as e:
-                                logger.debug("keepalive send failed: %s", e)
+                        try:
+                            await ws.send_json(
+                                {
+                                    "type": "s2s.keepalive",
+                                    "event_id": _generate_id("event"),
+                                    "response_id": st.current_response_id,
+                                }
+                            )
+                        except Exception as e:
+                            logger.debug("keepalive send failed: %s", e)
                         last_client_send_t = loop.time()
 
                 await asyncio.sleep(0.01)

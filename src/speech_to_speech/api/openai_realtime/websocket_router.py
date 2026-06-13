@@ -69,6 +69,15 @@ RESPONSE_DONE_TAIL_S = int(os.getenv("S2S_RESPONSE_DONE_TAIL_MS", "400")) / 1000
 # a slow turn from a dead connection and refresh its turn watchdog. Clients ignore
 # unknown event types per Realtime convention; set 0 to disable for strict clients.
 HEARTBEAT_S = float(os.getenv("S2S_HEARTBEAT_S", "5"))
+# Reap a session this many seconds after its last inbound client traffic. 0 (the
+# default) never reaps — warm connections (smart speakers) hold idle sessions
+# indefinitely. Deployments that want to reclaim abandoned sessions set a value.
+S2S_IDLE_TIMEOUT_S = float(os.getenv("S2S_IDLE_TIMEOUT_S", "0"))
+# How often the send loop checks that this session's handler threads are still
+# alive (dead-thread supervisor). A crashed handler fails the session fast with a
+# server_error rather than serving a live socket from a half-dead pipeline. 0
+# disables the check.
+S2S_THREAD_SUPERVISOR_S = float(os.getenv("S2S_THREAD_SUPERVISOR_S", "2"))
 # Debug: if set, write each response's exact outbound audio (the base64 PCM deltas the client
 # receives, decoded) to a WAV in this dir, so the real on-wire audio can be auditioned directly.
 TTS_DUMP_DIR = os.getenv("S2S_TTS_DUMP_DIR") or None
@@ -172,6 +181,28 @@ def create_app(
             return chunk.tobytes()
         return chunk
 
+    async def _idle_reaper() -> None:
+        """Close sessions with no inbound client traffic for > S2S_IDLE_TIMEOUT_S.
+
+        Closing the socket makes the connection handler's receive raise
+        WebSocketDisconnect, so the normal disconnect path tears the pipeline
+        down. Reads the module global each tick so it can be tuned (or monkey-
+        patched in tests) without rebuilding the app."""
+        while not stop_event.is_set():
+            timeout = S2S_IDLE_TIMEOUT_S
+            await asyncio.sleep(max(0.05, min(timeout, 5.0)) if timeout > 0 else 1.0)
+            if timeout <= 0:
+                continue
+            for sid in service.idle_session_ids(timeout):
+                ws = app.state.websockets.get(sid)
+                if ws is None:
+                    continue
+                logger.info("Reaping idle session %s (no client traffic for >%.0fs)", sid, timeout)
+                try:
+                    await ws.close(code=1001, reason="idle timeout")
+                except Exception:
+                    pass
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # session_id → SessionPipeline / WebSocket. Each session is independent;
@@ -179,10 +210,18 @@ def create_app(
         # session_id throughout.
         app.state.sessions = {}
         app.state.websockets = {}
+        reaper_task = asyncio.create_task(_idle_reaper()) if S2S_IDLE_TIMEOUT_S > 0 else None
         yield
-        # Server shutdown: stop each session's send task, close its socket, and
-        # tear down its pipeline threads. Shutdowns run in parallel daemon workers
-        # (joined with a bound) so one slow teardown can't stall the others.
+        # Server shutdown: stop the reaper, then stop each session's send task,
+        # close its socket, and tear down its pipeline threads. Shutdowns run in
+        # parallel daemon workers (joined with a bound) so one slow teardown can't
+        # stall the others.
+        if reaper_task is not None:
+            reaper_task.cancel()
+            try:
+                await reaper_task
+            except asyncio.CancelledError:
+                pass
         workers = []
         for session_id, pipeline in list(app.state.sessions.items()):
             if pipeline.send_task is not None:
@@ -378,6 +417,7 @@ def create_app(
         loop = asyncio.get_running_loop()
         audio_play_deadline: float | None = None  # wall-clock time current audio should finish playing
         last_client_send_t = loop.time()  # last time anything was sent to the client (drives keepalive)
+        last_supervise_t = loop.time()  # last dead-thread supervisor check
         dump_pcm = bytearray() if TTS_DUMP_DIR else None  # DEBUG: exact outbound PCM for this response
         dump_seq = 0
         while not stop_event.is_set():
@@ -569,6 +609,30 @@ def create_app(
                             await asyncio.sleep(min(remaining, PACING_SLICE_S))
                 except Empty:
                     pass
+
+                # Dead-thread supervisor: if a handler crashed out of its loop,
+                # fail this session fast (server_error + close) instead of serving
+                # a live socket from a half-dead pipeline. Empty pipelines (test
+                # stubs) have no threads, so this never fires for them.
+                if S2S_THREAD_SUPERVISOR_S > 0 and loop.time() - last_supervise_t >= S2S_THREAD_SUPERVISOR_S:
+                    last_supervise_t = loop.time()
+                    dead = pipeline.dead_threads()
+                    if dead:
+                        logger.error(
+                            "Session %s: handler thread(s) exited unexpectedly (%s) — failing session",
+                            sid, ", ".join(dead),
+                        )
+                        try:
+                            await _send_event(
+                                ws,
+                                service.make_error(
+                                    f"Session pipeline failed: {', '.join(dead)} exited", "server_error"
+                                ),
+                            )
+                            await ws.close(code=1011, reason="pipeline failure")
+                        except Exception as e:
+                            logger.debug("supervisor close failed: %s", e)
+                        break
 
                 # Keepalive: a response is in_progress but the wire has been silent
                 # (LLM thinking, agent-side tool loop, TTS synth). Tell the client

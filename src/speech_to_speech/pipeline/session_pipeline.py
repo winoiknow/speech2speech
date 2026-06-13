@@ -132,6 +132,15 @@ class SessionPipeline:
     def start(self) -> None:
         self.threads.start()
 
+    def dead_threads(self) -> list[str]:
+        """Names of handler threads that have exited unexpectedly.
+
+        In a healthy session every handler loops until teardown, so any
+        not-alive thread (after ``start()``) means a handler crashed out of its
+        loop — the send-loop supervisor uses this to fail the session fast
+        instead of leaving a half-dead pipeline serving a live socket."""
+        return [t.name for t in self.threads.threads if not t.is_alive()]
+
     def wait(self) -> None:
         self.threads.wait()
 

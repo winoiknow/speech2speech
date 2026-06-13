@@ -903,3 +903,88 @@ class TestObservability:
             assert short_sid(sid) == "deadbeef"
         finally:
             tm.stop()
+
+
+class _DeadThreadStubFactory:
+    """Builds a session whose single 'handler' thread exits immediately, so the
+    pipeline is structurally healthy at connect but has a dead thread the
+    supervisor must catch."""
+
+    def __init__(self) -> None:
+        from speech_to_speech.audio.echo_canceller import EchoCanceller
+        from speech_to_speech.pipeline.session_pipeline import SessionPipeline
+        from speech_to_speech.utils.thread_manager import ThreadManager
+
+        class _ExitImmediately(BaseHandler):
+            def process(self, item):
+                yield item
+
+            def run(self):  # exits at once → thread dies → supervisor should fire
+                return
+
+        self._EchoCanceller = EchoCanceller
+        self._SessionPipeline = SessionPipeline
+        self._ThreadManager = ThreadManager
+        self._handler_cls = _ExitImmediately
+        self.built = []
+
+    def build_session_pipeline(self, session_id: str):
+        handler = self._handler_cls(ThreadingEvent(), Queue(), Queue())
+        pipeline = self._SessionPipeline(
+            session_id=session_id,
+            recv_audio=Queue(),
+            spoken_prompt=Queue(),
+            stt_output=Queue(),
+            text_prompt=Queue(),
+            lm_response=Queue(),
+            lm_processed=Queue(),
+            send_audio=Queue(),
+            text_output=Queue(),
+            stop_event=ThreadingEvent(),
+            should_listen=ThreadingEvent(),
+            response_playing=ThreadingEvent(),
+            cancel_scope=CancelScope(),
+            echo_canceller=self._EchoCanceller(sample_rate=16000, enabled=False),
+            handlers=[handler],
+            threads=self._ThreadManager([handler], daemon=True),
+        )
+        self.built.append(pipeline)
+        return pipeline
+
+
+class TestHardening:
+    def test_idle_session_is_reaped(self, monkeypatch):
+        import speech_to_speech.api.openai_realtime.websocket_router as router_mod
+
+        monkeypatch.setattr(router_mod, "S2S_IDLE_TIMEOUT_S", 0.3)
+        factory = IndependentSessionStubFactory()
+        app, service = _multi_app(factory, max_sessions=2)
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()  # session.created; no further client traffic → idle
+                assert _wait_until(lambda: len(service._conns) == 0, timeout=5.0)
+
+    def test_idle_reaper_off_by_default_keeps_session(self, monkeypatch):
+        import speech_to_speech.api.openai_realtime.websocket_router as router_mod
+
+        monkeypatch.setattr(router_mod, "S2S_IDLE_TIMEOUT_S", 0.0)
+        factory = IndependentSessionStubFactory()
+        app, service = _multi_app(factory, max_sessions=2)
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                time.sleep(0.4)
+                assert len(service._conns) == 1  # never reaped with timeout=0
+
+    def test_dead_handler_thread_fails_session(self, monkeypatch):
+        import speech_to_speech.api.openai_realtime.websocket_router as router_mod
+
+        monkeypatch.setattr(router_mod, "S2S_THREAD_SUPERVISOR_S", 0.1)
+        factory = _DeadThreadStubFactory()
+        app, service = _multi_app(factory, max_sessions=1)
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()  # session.created
+                err = _recv_until(ws, "error")
+                assert err["error"]["type"] == "server_error"
+            assert _wait_until(lambda: len(service._conns) == 0, timeout=5.0)

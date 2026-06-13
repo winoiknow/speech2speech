@@ -11,14 +11,19 @@ class ThreadManager:
     Manages multiple threads used to execute given handler tasks.
     """
 
-    def __init__(self, handlers: Sequence[Any]) -> None:
+    def __init__(self, handlers: Sequence[Any], daemon: bool = False) -> None:
         self.handlers = handlers
+        # Per-session pipelines pass daemon=True so a handler stuck in a blocking
+        # call (e.g. an in-flight HTTP read at disconnect) can never wedge process
+        # exit; the long-lived startup pipeline keeps daemon=False so its threads
+        # are waited for on graceful shutdown.
+        self.daemon = daemon
         self.threads: list[threading.Thread] = []
 
     def start(self) -> None:
         for handler in self.handlers:
             thread = threading.Thread(target=handler.run)
-            thread.daemon = False  # Ensure threads are waited for on shutdown
+            thread.daemon = self.daemon
             self.threads.append(thread)
             thread.start()
 

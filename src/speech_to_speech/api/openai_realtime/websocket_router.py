@@ -2,6 +2,7 @@ import asyncio
 import base64
 import logging
 import os
+import threading
 import time
 import wave
 from collections.abc import AsyncIterator
@@ -95,11 +96,29 @@ def _keep_user_text_event(item: Any) -> bool:
     return isinstance(item, (SpeechStoppedEvent, TokenUsageEvent))
 
 
+def _shutdown_pipeline_async(session_id: str, pipeline: "SessionPipeline") -> threading.Thread:
+    """Tear a session's pipeline down in a fire-and-forget daemon worker.
+
+    Deliberately NOT ``loop.run_in_executor``: awaiting the executor future from
+    the disconnect handler can hang if the event loop stops servicing the result
+    callback mid-teardown. A plain daemon thread sidesteps asyncio entirely — it
+    sets ``stop_event`` and drains the chain so the handler threads exit promptly.
+    Returns the worker so callers (server shutdown) can join it if they want to
+    wait. The handler threads are daemonised too, so nothing can wedge exit.
+    """
+    worker = threading.Thread(
+        target=pipeline.shutdown, name=f"shutdown-{session_id[:8]}", daemon=True
+    )
+    worker.start()
+    return worker
+
+
 def create_app(
     service: RealtimeService,
     session_factory: "HandlerFactory",
     stop_event: ThreadingEvent,
     server_api_key: Optional[str] = None,
+    max_sessions: int = 1,
 ) -> FastAPI:
     """Build the realtime FastAPI app.
 
@@ -107,7 +126,9 @@ def create_app(
     :class:`SessionPipeline` via ``session_factory`` at connect time and tears it
     down at disconnect. ``session_factory`` only needs a
     ``build_session_pipeline(session_id) -> SessionPipeline`` method, so tests can
-    pass a lightweight stub.
+    pass a lightweight stub. Up to ``max_sessions`` connections are accepted
+    concurrently; each is fully isolated (its own queues/events/cancel scope/AEC/
+    send loop), so they share nothing mutable beyond the read-only service config.
     """
 
     def _flush_queue(q: Queue[QItem], *, preserve: Callable[[QItem], bool] | None = None) -> None:
@@ -153,15 +174,16 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        # session_id → SessionPipeline / WebSocket. active_session is retained
-        # while the single-session guard is in force (Phase B); Phase C replaces it.
+        # session_id → SessionPipeline / WebSocket. Each session is independent;
+        # there is no "active" session — the send loop and dispatch are keyed by
+        # session_id throughout.
         app.state.sessions = {}
         app.state.websockets = {}
-        app.state.active_session: Optional[str] = None  # type: ignore[misc]
         yield
         # Server shutdown: stop each session's send task, close its socket, and
-        # tear down its pipeline threads.
-        loop = asyncio.get_running_loop()
+        # tear down its pipeline threads. Shutdowns run in parallel daemon workers
+        # (joined with a bound) so one slow teardown can't stall the others.
+        workers = []
         for session_id, pipeline in list(app.state.sessions.items()):
             if pipeline.send_task is not None:
                 pipeline.send_task.cancel()
@@ -175,7 +197,9 @@ def create_app(
                     await ws.close(code=1001)
                 except Exception:
                     pass
-            await loop.run_in_executor(None, pipeline.shutdown)
+            workers.append(_shutdown_pipeline_async(session_id, pipeline))
+        for worker in workers:
+            worker.join(timeout=6.0)
 
     app = FastAPI(lifespan=lifespan)
 
@@ -191,17 +215,20 @@ def create_app(
                 await ws.close(code=4001, reason="Unauthorized")
                 return
 
-        # Single-session guard (lifted behind S2S_MAX_SESSIONS in Phase C).
-        if app.state.sessions:
-            logger.warning("Rejected connection: a session is already active")
+        # Capacity guard: accept up to max_sessions concurrent connections.
+        if len(app.state.sessions) >= max_sessions:
+            logger.warning(
+                "Rejected connection: at session capacity (%d/%d)", len(app.state.sessions), max_sessions
+            )
             await _send_event(
                 ws,
                 service.make_error(
-                    "Only one concurrent session is supported. Disconnect the existing client first.",
+                    f"Session limit reached ({max_sessions} concurrent "
+                    f"{'session' if max_sessions == 1 else 'sessions'}). Disconnect an existing client first.",
                     _type="session_limit_reached",
                 ),
             )
-            await ws.close(code=1008, reason="Only one concurrent session is supported")
+            await ws.close(code=1008, reason=f"Session limit reached ({max_sessions})")
             return
 
         session_id = service.register()
@@ -218,7 +245,6 @@ def create_app(
         service.attach_pipeline(session_id, pipeline)
         app.state.sessions[session_id] = pipeline
         app.state.websockets[session_id] = ws
-        app.state.active_session = session_id
         pipeline.echo_canceller.reset()  # fresh far-end buffer for a new call
         logger.info(f"Client connected (session {session_id})")
 
@@ -308,19 +334,20 @@ def create_app(
                     await pipeline.send_task
                 except asyncio.CancelledError:
                     pass
-            # Bookkeeping first so the session is observably gone (and the
-            # single-session slot freed) immediately — the handler-thread join
-            # below must not gate that.
+            # Bookkeeping first so the session is observably gone (and a session
+            # slot freed) immediately — the handler-thread join below must not
+            # gate that.
             service.detach_pipeline(session_id)
             clean_session(pipeline)
             service.unregister(session_id)
             app.state.sessions.pop(session_id, None)
             app.state.websockets.pop(session_id, None)
-            app.state.active_session = None
-            # Join the handler threads off the event loop so a slow teardown can't
-            # block the connection handler from returning.
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, pipeline.shutdown)
+            # Join the handler threads in a fire-and-forget daemon worker, NOT via
+            # loop.run_in_executor: awaiting the executor future here can wedge the
+            # connection handler if the event loop stops servicing the result
+            # callback during teardown. The worker sets stop_event + drains the
+            # chain so the (non-daemon) handler threads exit promptly on their own.
+            _shutdown_pipeline_async(session_id, pipeline)
             logger.info(f"Client {session_id} removed")
 
     @app.get("/v1/usage")

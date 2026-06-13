@@ -62,6 +62,30 @@ AEC_ENABLED = os.getenv("AEC_ENABLED", "0").lower() in ("1", "true", "on", "yes"
 AEC_BACKEND = os.getenv("AEC_BACKEND", "aec3")
 AEC_FILTER_LENGTH_MS = int(os.getenv("AEC_FILTER_LENGTH_MS", "250"))
 
+# Concurrent realtime session cap. 1 ⇒ exactly today's single-session semantics.
+# Raise deliberately after load-testing the shared STT/TTS/LLM endpoints. Forced
+# to 1 with a warning when an in-process (local) model is selected — multi-session
+# with local models means putting the model behind a serving endpoint instead.
+S2S_MAX_SESSIONS = max(1, int(os.getenv("S2S_MAX_SESSIONS", "1")))
+
+# Backends with no in-process model state (safe to run N sessions in one process).
+# Anything else loads a model into this process and is pinned to one session.
+_REMOTE_STT = {"openai-remote"}
+_REMOTE_TTS = {"openai-remote", "elevenlabs", "minimax"}
+_REMOTE_LLM = {"responses-api"}
+
+
+def local_model_selected(module_kwargs: Any) -> str | None:
+    """Return a human description of the first in-process model selected, or None
+    if STT, TTS and the LLM are all remote/cloud (i.e. multi-session is safe)."""
+    if module_kwargs.stt not in _REMOTE_STT:
+        return f"STT={module_kwargs.stt}"
+    if module_kwargs.tts not in _REMOTE_TTS:
+        return f"TTS={module_kwargs.tts}"
+    if module_kwargs.llm_backend not in _REMOTE_LLM:
+        return f"LLM={module_kwargs.llm_backend}"
+    return None
+
 
 @dataclass
 class SessionPipeline:
@@ -548,8 +572,26 @@ class HandlerFactory:
                 backend=AEC_BACKEND,
             ),
             handlers=core_handlers,
-            threads=ThreadManager(core_handlers),
+            # daemon=True: a per-session handler is torn down at disconnect; if one
+            # is briefly stuck in a blocking call it must never hold up process exit.
+            threads=ThreadManager(core_handlers, daemon=True),
         )
+
+    def effective_max_sessions(self) -> int:
+        """The concurrent-session cap to enforce, forcing 1 when an in-process
+        model is selected (multi-session needs the model behind a serving
+        endpoint, not in this process)."""
+        local = local_model_selected(self.args.module_kwargs)
+        if local is not None and S2S_MAX_SESSIONS > 1:
+            logger.warning(
+                "S2S_MAX_SESSIONS=%d ignored: in-process model selected (%s). Forcing 1 — run the "
+                "model behind a serving endpoint (openai-remote/elevenlabs/minimax/responses-api) "
+                "to enable multi-session.",
+                S2S_MAX_SESSIONS,
+                local,
+            )
+            return 1
+        return S2S_MAX_SESSIONS
 
     def build_realtime_server(self) -> Any:
         """Build the shared realtime server (uvicorn + FastAPI app). Per-session
@@ -564,6 +606,10 @@ class HandlerFactory:
         else:
             chat_size = vars(args.language_model_handler_kwargs).get("chat_size", 10)
 
+        max_sessions = self.effective_max_sessions()
+        if max_sessions > 1:
+            logger.info("Multi-session enabled: up to %d concurrent realtime sessions", max_sessions)
+
         return RealtimeServer(
             stop_event=Event(),
             session_factory=self,
@@ -573,4 +619,5 @@ class HandlerFactory:
             server_api_key=module_kwargs.server_api_key,
             speaker_client=self.speaker_client,
             speaker_diarize_enabled=self.speaker_args.speaker_diarize_enabled,
+            max_sessions=max_sessions,
         )

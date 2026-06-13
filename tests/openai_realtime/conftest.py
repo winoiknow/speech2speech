@@ -67,6 +67,38 @@ class FixedQueueSessionFactory:
         return pipeline
 
 
+class IndependentSessionStubFactory:
+    """Multi-session test factory: every ``build_session_pipeline`` call gets its
+    own fresh, independent queues/events/cancel-scope (no real handlers, AEC off).
+    Concurrent sessions therefore share nothing, so tests can prove isolation.
+    ``built`` records pipelines in connect order for inspection."""
+
+    def __init__(self) -> None:
+        self.built: list[SessionPipeline] = []
+
+    def build_session_pipeline(self, session_id: str) -> SessionPipeline:
+        pipeline = SessionPipeline(
+            session_id=session_id,
+            recv_audio=Queue(),
+            spoken_prompt=Queue(),
+            stt_output=Queue(),
+            text_prompt=Queue(),
+            lm_response=Queue(),
+            lm_processed=Queue(),
+            send_audio=Queue(),
+            text_output=Queue(),
+            stop_event=ThreadingEvent(),
+            should_listen=ThreadingEvent(),
+            response_playing=ThreadingEvent(),
+            cancel_scope=CancelScope(),
+            echo_canceller=EchoCanceller(sample_rate=16000, enabled=False),
+            handlers=[],
+            threads=ThreadManager([]),
+        )
+        self.built.append(pipeline)
+        return pipeline
+
+
 def _session_16k() -> RealtimeSessionCreateRequest:
     """Build a test session with 16 kHz audio rates (matches PIPELINE_SAMPLE_RATE)."""
     fmt = AudioPCM.model_construct(rate=16000, type="audio/pcm")

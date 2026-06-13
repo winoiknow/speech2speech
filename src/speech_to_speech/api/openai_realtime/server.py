@@ -33,6 +33,7 @@ class RealtimeServer:
         server_api_key: str | None = None,
         speaker_client: object | None = None,
         speaker_diarize_enabled: bool = False,
+        max_sessions: int = 1,
     ) -> None:
         self.stop_event = stop_event
         self.session_factory = session_factory
@@ -40,6 +41,7 @@ class RealtimeServer:
         self.port = port
         self.chat_size = chat_size
         self.server_api_key = server_api_key
+        self.max_sessions = max_sessions
         # Phase 4: the same speaker-id client + flag the service uses to run the
         # off-hot-path diarize and emit corrections. None/False → no-op.
         self.speaker_client = speaker_client
@@ -57,6 +59,7 @@ class RealtimeServer:
             session_factory=self.session_factory,
             stop_event=self.stop_event,
             server_api_key=self.server_api_key,
+            max_sessions=self.max_sessions,
         )
 
         if self.server_api_key:

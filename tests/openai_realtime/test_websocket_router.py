@@ -18,7 +18,7 @@ from speech_to_speech.api.openai_realtime.websocket_router import create_app
 from speech_to_speech.baseHandler import BaseHandler
 from speech_to_speech.pipeline.cancel_scope import CancelScope
 
-from .conftest import FixedQueueSessionFactory
+from .conftest import FixedQueueSessionFactory, IndependentSessionStubFactory
 from speech_to_speech.pipeline.control import SESSION_END, is_control_message
 from speech_to_speech.pipeline.events import (
     AssistantTextEvent,
@@ -645,7 +645,7 @@ class _ThreadedStubFactory:
             cancel_scope=CancelScope(),
             echo_canceller=EchoCanceller(sample_rate=16000, enabled=False),
             handlers=handlers,
-            threads=ThreadManager(handlers),
+            threads=ThreadManager(handlers, daemon=True),
         )
         self.built.append(pipeline)
         return pipeline
@@ -689,3 +689,142 @@ class TestThreadLifecycle:
         for pipeline in factory.built:
             assert not any(t.is_alive() for t in pipeline.threads.threads)
         assert len(factory.built) == 3
+
+
+# ===================================================================
+# Phase C: multiple concurrent sessions, fully isolated
+# ===================================================================
+
+
+TRANSCRIPTION_COMPLETED_TYPE = "conversation.item.input_audio_transcription.completed"
+
+
+def _recv_until(ws, target_type: str, limit: int = 10) -> dict:
+    """Read events from *ws* until one of *target_type* arrives (or *limit* tried)."""
+    for _ in range(limit):
+        msg = ws.receive_json()
+        if msg["type"] == target_type:
+            return msg
+    raise AssertionError(f"{target_type} not received within {limit} events")
+
+
+def _multi_app(factory, max_sessions: int):
+    service = RealtimeService()
+    stop_event = ThreadingEvent()
+    app = create_app(service, factory, stop_event, max_sessions=max_sessions)
+    return app, service
+
+
+class TestMultiSession:
+    def test_capacity_allows_concurrent_sessions(self):
+        factory = IndependentSessionStubFactory()
+        app, service = _multi_app(factory, max_sessions=2)
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws_a:
+                assert ws_a.receive_json()["type"] == "session.created"
+                with client.websocket_connect("/v1/realtime") as ws_b:
+                    assert ws_b.receive_json()["type"] == "session.created"
+                    assert len(service._conns) == 2
+                    assert len(factory.built) == 2
+
+    def test_session_limit_reached_at_capacity(self):
+        factory = IndependentSessionStubFactory()
+        app, service = _multi_app(factory, max_sessions=1)
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws_a:
+                ws_a.receive_json()  # session.created
+                with client.websocket_connect("/v1/realtime") as ws_b:
+                    msg = ws_b.receive_json()
+                    assert msg["type"] == "error"
+                    assert msg["error"]["type"] == "session_limit_reached"
+                    assert "1" in msg["error"]["message"]
+                # the rejected connection never registered
+                assert len(service._conns) == 1
+
+    def test_no_cross_talk_between_sessions(self):
+        """Each session's transcription routes only to its own socket."""
+        factory = IndependentSessionStubFactory()
+        app, _service = _multi_app(factory, max_sessions=2)
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws_a:
+                ws_a.receive_json()
+                with client.websocket_connect("/v1/realtime") as ws_b:
+                    ws_b.receive_json()
+                    pa, pb = factory.built[0], factory.built[1]
+
+                    pa.text_output.put(TranscriptionCompletedEvent(transcript="alpha"))
+                    pb.text_output.put(TranscriptionCompletedEvent(transcript="bravo"))
+
+                    a_done = _recv_until(ws_a, TRANSCRIPTION_COMPLETED_TYPE)
+                    b_done = _recv_until(ws_b, TRANSCRIPTION_COMPLETED_TYPE)
+                    assert a_done["transcript"] == "alpha"
+                    assert b_done["transcript"] == "bravo"
+
+    def test_barge_in_isolated_between_sessions(self):
+        """Speech (barge-in) in session A cancels A only; B keeps streaming."""
+        factory = IndependentSessionStubFactory()
+        app, service = _multi_app(factory, max_sessions=2)
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws_a:
+                ws_a.receive_json()
+                with client.websocket_connect("/v1/realtime") as ws_b:
+                    ws_b.receive_json()
+                    pa, pb = factory.built[0], factory.built[1]
+                    conn_a, conn_b = service.connection_ids
+
+                    # Both sessions are mid-response.
+                    service.response._ensure_response(conn_a)
+                    service.response._ensure_response(conn_b)
+                    pa.response_playing.set()
+                    pb.response_playing.set()
+
+                    # User speaks in A → A cancels.
+                    pa.text_output.put(SpeechStartedEvent())
+                    assert _wait_until(lambda: pa.cancel_scope.discarding)
+
+                    # B is untouched: not discarding, still "playing".
+                    assert not pb.cancel_scope.discarding
+                    assert pb.response_playing.is_set()
+                    assert service._state(conn_b).in_response
+
+    def test_disconnect_one_session_leaves_other_running(self):
+        """B disconnects mid-response; its pipeline tears down, A keeps working."""
+        factory = IndependentSessionStubFactory()
+        app, service = _multi_app(factory, max_sessions=2)
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws_a:
+                ws_a.receive_json()
+                with client.websocket_connect("/v1/realtime") as ws_b:
+                    ws_b.receive_json()
+                    assert len(service._conns) == 2
+                    conn_b = service.connection_ids[1]
+                    service.response._ensure_response(conn_b)  # B mid-response
+                    factory.built[1].response_playing.set()
+                # B disconnected
+                assert _wait_until(lambda: len(service._conns) == 1)
+                assert conn_b not in service._pipelines
+
+                # A still fully functional.
+                pa = factory.built[0]
+                pa.text_output.put(TranscriptionCompletedEvent(transcript="still-here"))
+                a_done = _recv_until(ws_a, TRANSCRIPTION_COMPLETED_TYPE)
+                assert a_done["transcript"] == "still-here"
+
+    def test_keepalive_fires_independently_per_session(self, monkeypatch):
+        """Each in-flight session gets its own keepalive on the silent gap."""
+        import speech_to_speech.api.openai_realtime.websocket_router as router_mod
+
+        monkeypatch.setattr(router_mod, "HEARTBEAT_S", 0.2)
+        factory = IndependentSessionStubFactory()
+        app, service = _multi_app(factory, max_sessions=2)
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws_a:
+                ws_a.receive_json()
+                with client.websocket_connect("/v1/realtime") as ws_b:
+                    ws_b.receive_json()
+                    conn_a, conn_b = service.connection_ids
+                    service.response._ensure_response(conn_a)
+                    service.response._ensure_response(conn_b)
+                    # Each socket independently sees a keepalive during its gap.
+                    assert _recv_until(ws_a, "s2s.keepalive")["response_id"] == service._state(conn_a).current_response_id
+                    assert _recv_until(ws_b, "s2s.keepalive")["response_id"] == service._state(conn_b).current_response_id

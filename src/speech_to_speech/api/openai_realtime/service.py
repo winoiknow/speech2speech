@@ -1,4 +1,5 @@
 import logging
+import threading
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
@@ -197,6 +198,12 @@ class RealtimeService:
         # read from here in preference to the startup singletons.
         self._pipelines: dict[str, Any] = {}
         self.total_usage = GlobalUsageMetrics()
+        # Serializes server-wide usage rollups. Connection register/unregister and
+        # error recording all happen on the asyncio event-loop thread today, but
+        # with N concurrent sessions this guards the cumulative counters against a
+        # future off-loop writer (e.g. a metrics exporter) and gives /v1/usage a
+        # consistent snapshot.
+        self._usage_lock = threading.Lock()
 
         # Phase 4 (Tier 2): async diarization correction, OFF the hot path. The
         # corrected event is emitted onto the session's text_output queue from a
@@ -229,7 +236,8 @@ class RealtimeService:
         """Register a new connection and return its session_id."""
         state = ConnState(runtime_config=RuntimeConfig(chat=Chat(self._chat_size)))
         self._conns[state.session_id] = state
-        self.total_usage.connections += 1
+        with self._usage_lock:
+            self.total_usage.connections += 1
         return state.session_id
 
     def unregister(self, conn_id: str) -> None:
@@ -239,7 +247,8 @@ class RealtimeService:
             # mutate a Chat tied to a closed session, and don't make further
             # billable LLM calls on its behalf once the splice is suppressed.
             st.runtime_config.chat.close()
-            self.total_usage += st.response_usage
+            with self._usage_lock:
+                self.total_usage += st.response_usage
             logger.info(
                 "Session %s unregistered — cumulative: input_tokens=%d, output_tokens=%d, audio=%.2fs",
                 conn_id,
@@ -424,15 +433,17 @@ class RealtimeService:
 
     def get_usage(self) -> dict[str, Any]:
         """Return cumulative usage metrics across all completed responses."""
-        data = self.total_usage.model_dump()
+        with self._usage_lock:
+            data = self.total_usage.model_dump()
+            data["total_errors"] = self.total_usage.total_errors
         data["total_tokens"] = data["input_tokens"] + data["output_tokens"]
-        data["total_errors"] = self.total_usage.total_errors
         return data
 
     # ── Error ───────────────────────────────────
 
     def make_error(self, message: str, _type: str) -> RealtimeErrorEvent:
-        self.total_usage.record_error(_type)
+        with self._usage_lock:
+            self.total_usage.record_error(_type)
         return RealtimeErrorEvent(
             type="error",
             error=RealtimeError(message=message, type=_type),

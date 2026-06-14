@@ -50,6 +50,21 @@ services:
       # ── Server authentication ──────────────────────────────────────────
       SERVER_API_KEY: ${SERVER_API_KEY:-}
 
+      # ── Multi-session (remote profile only) ────────────────────────────
+      # Concurrent realtime sessions. 1 = today's single-session behavior;
+      # raise after load-testing the shared STT/TTS/LLM endpoints (LATENCY.md §7).
+      # Forced back to 1 if any of STT/TTS/LLM is a local in-process model.
+      S2S_MAX_SESSIONS: ${S2S_MAX_SESSIONS:-1}
+      # Reap a session after this many seconds of no client traffic (0 = never).
+      S2S_IDLE_TIMEOUT_S: ${S2S_IDLE_TIMEOUT_S:-0}
+      # Send-loop dead-thread supervisor check period in seconds (0 = disable).
+      S2S_THREAD_SUPERVISOR_S: ${S2S_THREAD_SUPERVISOR_S:-2}
+      # Per-service caps on concurrent in-flight requests across all sessions
+      # (0 = unlimited). Tune with the endpoints' own concurrency (LATENCY.md §7.3).
+      STT_MAX_CONCURRENCY: ${STT_MAX_CONCURRENCY:-0}
+      TTS_MAX_CONCURRENCY: ${TTS_MAX_CONCURRENCY:-0}
+      LLM_MAX_CONCURRENCY: ${LLM_MAX_CONCURRENCY:-0}
+
       # ── General ────────────────────────────────────────────────────────
       LOG_LEVEL: ${LOG_LEVEL:-info}
       # Re-enable verbose diagnostics (VAD heartbeat, drop/TTS timing logs)

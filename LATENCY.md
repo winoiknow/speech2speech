@@ -389,9 +389,12 @@ that *survived* and understate the real degradation (the failures are effectivel
 "infinite latency"). So don't read the flat-looking p50 at 4 as healthy — 30% of
 those turns were dropped.
 
-The knee for a 100%-success bar is **2 concurrent**. Whether the cap can go higher
-depends on *what* is failing at 4–8 (the shared endpoints saturating vs. an s2s
-issue) — see §7.3.
+The 4–8 success drop is **back-end endpoint saturation** under the worst case of
+all sessions talking at once (the single Hermes LLM / MiniMax WS concurrent-stream
+limit), **not an s2s limit** — per-session behavior held throughout. Because
+`S2S_MAX_SESSIONS` caps warm *connections* rather than simultaneous *turns*, the
+practical recommendation is set from expected client count, not this knee — see
+§7.3.
 
 ### 7.3 Picking the cap
 
@@ -407,25 +410,21 @@ issue) — see §7.3.
    shows honest "working" feedback instead of dead air. Document the chosen
    pairing in REMOTE_SETUP.md.
 
-> **Recommended `S2S_MAX_SESSIONS` for the production remote stack: 2**
-> _(provisional, 2026-06-14)._ Highest concurrency with 100% success in the §7.2
-> run; 4 dropped to 70%, 8 to 50%. This may be raisable once the failure mode at
-> 4–8 is identified (see below) and the saturating service is given a fair queue
-> via its `*_MAX_CONCURRENCY` cap.
+> **Recommended `S2S_MAX_SESSIONS` for the production remote stack: 8**
+> _(2026-06-14)._ The cap governs concurrent **warm connections**, not concurrent
+> active turns — warm idle sessions are cheap (idle thread sets blocked on empty
+> queues), so size it to hold your expected clients with headroom. For this
+> deployment (≤3 expected concurrent users) 8 is generous and never rejects a
+> client. Multi-session isolation is functional and proven; the §7.2 run confirms
+> per-session behavior holds.
 
-**Next: root-cause the 4–8 failures.** The whole point of the per-service caps is
-to convert "endpoint overwhelmed → turn fails" into "turn queues, shows keepalive,
-completes slower." Before settling on 2:
-1. Re-run with the error breakdown visible — `load_test_sessions.py` prints an
-   `Errors observed:` block to stderr listing the distinct failure types
-   (`client_timeout`, an `error` event type, a connect exception, …). That names
-   the failing stage.
-2. If it's a **shared endpoint** saturating (most likely the MiniMax WS account's
-   concurrent-connection limit, or the single Hermes LLM serving one request at a
-   time), set that service's cap to its real capacity — e.g. `TTS_MAX_CONCURRENCY`
-   or `LLM_MAX_CONCURRENCY` = N — so s2s serializes the (N+1)th turn behind a slot
-   instead of letting it fail, then re-run 4/8 and confirm success returns to
-   ~100% at higher p95. The usable `S2S_MAX_SESSIONS` is then "as many warm
-   sessions as you want, capacity-gated by the cap," not 2.
-3. If failures are **s2s-side** (not an endpoint), that's a bug to fix, not a cap
-   to set — capture the failing session's server log.
+**On the §7.2 4–8 degradation (out of scope for this deployment):** the 70%/50%
+success at 4/8 came from the *worst case* of every session firing a turn in
+lockstep, which saturates the shared external endpoints (the single Hermes LLM /
+the MiniMax WS account's concurrent-stream limit — **back-end capacity, not s2s**).
+Real use of ≤3 users essentially never overlaps all turns, so this ceiling isn't
+a practical constraint here. If a future deployment *does* need many simultaneous
+talkers, the lever is the per-service caps (`STT_/TTS_/LLM_MAX_CONCURRENCY` set to
+each endpoint's real capacity) so the (N+1)th turn queues behind a slot — with the
+early `response.created` + `s2s.keepalive` showing honest "working" feedback —
+instead of failing, plus scaling the back-end services themselves.

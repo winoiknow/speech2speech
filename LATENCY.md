@@ -178,49 +178,183 @@ knee** — the point where p95 first-audio crosses your latency budget.
 > Status: **measure first.** The harness below is wired; the tables are
 > placeholders until filled from a real run against the production remote stack.
 
-### 7.1 How to run
+### 7.1 How to run — step by step
 
-**Run this against the full remote stack, not a local-model profile.** Multi-
-session is only honored when STT, TTS, and the LLM are all remote endpoints (a
-local in-process model hard-forces `S2S_MAX_SESSIONS=1`). So configure all three
-remote endpoints in your `.env` (copy from `.env.sample`: `STT_OPENAI_*`,
-`TTS_SOURCE` + `TTS_OPENAI_*`/`ELEVENLABS_*`/`MINIMAX_*`, `LLM_BASE_URL` /
-`LLM_MODEL`), and **set `S2S_MAX_SESSIONS=8`** (at least as large as the biggest
-concurrency level you'll drive) in that same `.env`.
+This is a complete runbook. Two roles are involved and they can be the **same
+machine or two different machines**:
 
-Then bring up the server with the remote compose — it already passes all the
-`--stt/--tts/--llm_backend …` flags, so `.env` is the only thing you edit:
+- **Server host** — runs the s2s container (needs Docker; typically Linux).
+- **Load box** — runs the test scripts (needs Python 3.11+; can be the server
+  host itself, another Linux machine, a Mac, or **Windows via WSL**).
 
-```bash
-# 1) edit .env: remote STT/TTS/LLM endpoints + S2S_MAX_SESSIONS=8
-docker compose -f docker-compose.remote.yml up         # serves ws://localhost:8765
-# confirm the cap took effect:
-curl -s localhost:8765/v1/sessions                      # → {"count":0,"max_sessions":8,...}
-```
+The harness measures **speech_stopped → first audio delta** (the §1 first-audio
+number) per turn.
 
-The harness streams a real speech WAV per turn (server-VAD endpoints it) and
-measures **speech_stopped → first audio delta** — the same first-audio number as
-§1. It is pure stdlib except for one package — `websockets` — so it can run on a
-separate load box: either use the project env (`uv run python scripts/…` or
-`.venv/bin/python scripts/…`, which already has it) or `pip install websockets`
-into whatever Python you invoke. The `--wav` is any 16-bit PCM WAV of a spoken
-utterance (mono/stereo and any sample rate; it's downmixed/resampled to 16 kHz).
+#### Prerequisites (have these ready before you start)
+
+1. Your three remote inference endpoints are already running and reachable from
+   the server host: a Whisper-compatible STT, an F5/OpenAI-compatible TTS (or
+   ElevenLabs/MiniMax), and an OpenAI-compatible LLM. You know each one's URL.
+2. This repo is checked out on the server host, and Docker + the Docker Compose
+   plugin are installed there.
+3. A WAV file of a person speaking one or two sentences (any sample rate, mono or
+   stereo, 16-bit PCM — the harness downmixes/resamples to 16 kHz). Call it
+   `sample.wav`. **Silence will not work** — the server VAD needs real speech to
+   trigger a turn.
+
+#### Step 1 — Configure `.env` on the server host
 
 ```bash
-# load test: 2 / 4 / 8 concurrent turns, 5 waves each, emit a markdown table
-python scripts/load_test_sessions.py --wav sample.wav --concurrencies 2,4,8 --rounds 5 --markdown
-
-# soak: 8 warm sessions, one random active talker, 5-minute smoke (24 h for real)
-python scripts/soak_sessions.py --wav sample.wav --sessions 8 \
-    --duration-s 300 --turn-interval-s 8 --server-pid $(pgrep -f s2s_pipeline)
+cd /path/to/speech2speech          # the repo root on the server host
+cp -n .env.sample .env             # create .env from the sample (keeps an existing .env)
+nano .env                          # or any editor
 ```
 
-`load_test_sessions.py` reads `/v1/sessions` to warn if `max_sessions` is below
-the requested concurrency. `soak_sessions.py` samples server RSS/threads/fds via
-`/proc` when `--server-pid` is given and fails if any of them trend upward
-(warm-connection leak check, §6.3 of MULTI_SESSION_PLAN.md). For the bare
-`python -m speech_to_speech.s2s_pipeline --mode realtime …` invocation (without
-Docker), pass the same backend flags the compose `command:` block lists.
+In `.env`, set these exactly (replace the example IPs/ports with **your** real
+endpoint addresses; keep `sk-unused` if your endpoints don't check the key):
+
+```ini
+# Disable auth for the test: put a '#' in front so no Bearer token is required.
+#SERVER_API_KEY=
+
+# STT — your Whisper-compatible endpoint
+STT_OPENAI_BASE_URL=http://192.168.1.10:8000
+STT_OPENAI_API_KEY=sk-unused
+STT_OPENAI_MODEL=Systran/faster-whisper-large-v3
+
+# TTS — your F5/OpenAI-compatible endpoint (or set TTS_SOURCE=elevenlabs/minimax
+# and fill that block instead)
+TTS_SOURCE=openai-remote
+TTS_OPENAI_BASE_URL=http://192.168.1.10:8880
+TTS_OPENAI_API_KEY=sk-unused
+TTS_OPENAI_VOICE=default
+
+# LLM — your OpenAI-compatible endpoint
+LLM_BASE_URL=http://192.168.1.10:7860/v1
+LLM_API_KEY=sk-unused
+LLM_MODEL=hermes-agent
+
+# Multi-session: accept up to 8 concurrent sessions for the test
+S2S_MAX_SESSIONS=8
+```
+
+Two things people miss:
+
+- **`#SERVER_API_KEY=` must be commented out (or empty).** If a token is set, the
+  server rejects every connection that doesn't send it and the test fails at
+  connect. (If you must keep auth on, instead pass `--api-key YOUR_TOKEN` to both
+  scripts in Steps 5–6.)
+- **`S2S_MAX_SESSIONS` must be ≥ the largest `--concurrencies` value** you drive
+  (8 here). It only takes effect with all-remote backends; a local in-process
+  model forces it back to 1.
+
+#### Step 2 — Start the server (on the server host)
+
+```bash
+cd /path/to/speech2speech
+docker compose -f docker-compose.remote.yml up
+```
+
+Leave this terminal running (it streams the server log). It listens on
+**port 8765**.
+
+#### Step 3 — Verify the server and the cap (on the server host)
+
+In a second terminal on the server host:
+
+```bash
+curl -s localhost:8765/v1/sessions
+```
+
+Expected output (the important part is `"max_sessions":8`):
+
+```json
+{"count":0,"max_sessions":8,"sessions":[]}
+```
+
+If you see `"max_sessions":1`, your `.env` change didn't take effect — stop the
+server (Ctrl-C in the Step 2 terminal) and bring it up again with
+`docker compose -f docker-compose.remote.yml up` (this re-reads `.env`).
+
+#### Step 4 — Prepare the load box
+
+On whichever machine will run the scripts (the server host, another machine, or
+Windows + WSL):
+
+```bash
+cd /path/to/speech2speech          # the repo checkout (or just copy the scripts/ dir)
+python3 -m pip install websockets  # the harness's only third-party dependency
+```
+
+Put your `sample.wav` somewhere on this machine (e.g. the repo root). Confirm
+Python sees it:
+
+```bash
+ls -l sample.wav
+```
+
+#### Step 5 — Run the load test (from the load box)
+
+If the load box **is** the server host, use `127.0.0.1`:
+
+```bash
+cd /path/to/speech2speech
+python3 scripts/load_test_sessions.py \
+  --host 127.0.0.1 --port 8765 \
+  --wav sample.wav \
+  --concurrencies 2,4,8 --rounds 5 --markdown
+```
+
+If the load box is a **different machine or WSL**, replace `127.0.0.1` with the
+server host's IP address (see "Connecting from another machine / WSL" below):
+
+```bash
+python3 scripts/load_test_sessions.py \
+  --host 192.168.1.50 --port 8765 \
+  --wav sample.wav \
+  --concurrencies 2,4,8 --rounds 5 --markdown
+```
+
+It prints a per-concurrency latency table and, because of `--markdown`, a block
+you paste straight into §7.2. It exits non-zero if the success rate drops below
+95%, and warns first if the server's `max_sessions` is below your concurrency.
+
+#### Step 6 — Run the soak test (optional leak check)
+
+A 5-minute smoke (use `--duration-s 86400` for the full 24 h):
+
+```bash
+python3 scripts/soak_sessions.py \
+  --host 127.0.0.1 --port 8765 \
+  --wav sample.wav \
+  --sessions 8 --duration-s 300 --turn-interval-s 8
+```
+
+To also track server RSS/threads/file-descriptors for the leak check, add
+`--server-pid` **only when you run this on the server host** (it reads `/proc` of
+that PID locally):
+
+```bash
+  --server-pid "$(pgrep -f s2s_pipeline | head -n1)"
+```
+
+Off-box (different machine / WSL) you can't read the server's `/proc`, so omit
+`--server-pid`; the soak then tracks only the live session count.
+
+#### Connecting from another machine / WSL
+
+- **What IP to use:** on the server host run `hostname -I` and take the first
+  address (e.g. `192.168.1.50`). Use that as `--host` from the load box.
+- **Reachability:** from the load box, `curl -s http://SERVER_IP:8765/v1/sessions`
+  must return the JSON from Step 3. If it hangs or refuses, port 8765 is blocked —
+  open it in the server host's firewall (e.g. `sudo ufw allow 8765/tcp`).
+- **WSL specifics:** if the server runs in Docker Desktop on the *same* Windows
+  machine as your WSL distro, `--host 127.0.0.1` usually works (WSL2 forwards
+  localhost to Windows). If the server is on a *different* machine, use that
+  machine's LAN IP as above.
+
+The networked load/soak runs are operator-run on the real remote stack; fill the
+§7.2 tables and the §7.3 recommendation from their output.
 
 ### 7.2 Results — fill in from runs
 

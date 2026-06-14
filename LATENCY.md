@@ -180,15 +180,29 @@ knee** — the point where p95 first-audio crosses your latency budget.
 
 ### 7.1 How to run
 
-Start a server with the remote profile and a cap at least as large as the biggest
-level you'll test, then drive it. The harness streams a real speech WAV per turn
-(server-VAD endpoints it) and measures **speech_stopped → first audio delta** —
-the same first-audio number as §1.
+**Run this against the full remote stack, not a local-model profile.** Multi-
+session is only honored when STT, TTS, and the LLM are all remote endpoints (a
+local in-process model hard-forces `S2S_MAX_SESSIONS=1`). So configure all three
+remote endpoints in your `.env` (copy from `.env.sample`: `STT_OPENAI_*`,
+`TTS_SOURCE` + `TTS_OPENAI_*`/`ELEVENLABS_*`/`MINIMAX_*`, `LLM_BASE_URL` /
+`LLM_MODEL`), and **set `S2S_MAX_SESSIONS=8`** (at least as large as the biggest
+concurrency level you'll drive) in that same `.env`.
+
+Then bring up the server with the remote compose — it already passes all the
+`--stt/--tts/--llm_backend …` flags, so `.env` is the only thing you edit:
 
 ```bash
-# server (remote profile), capacity 8
-S2S_MAX_SESSIONS=8 python -m speech_to_speech.s2s_pipeline --mode realtime ... &
+# 1) edit .env: remote STT/TTS/LLM endpoints + S2S_MAX_SESSIONS=8
+docker compose -f docker-compose.remote.yml up         # serves ws://localhost:8765
+# confirm the cap took effect:
+curl -s localhost:8765/v1/sessions                      # → {"count":0,"max_sessions":8,...}
+```
 
+The harness streams a real speech WAV per turn (server-VAD endpoints it) and
+measures **speech_stopped → first audio delta** — the same first-audio number as
+§1:
+
+```bash
 # load test: 2 / 4 / 8 concurrent turns, 5 waves each, emit a markdown table
 python scripts/load_test_sessions.py --wav sample.wav --concurrencies 2,4,8 --rounds 5 --markdown
 
@@ -200,7 +214,9 @@ python scripts/soak_sessions.py --wav sample.wav --sessions 8 \
 `load_test_sessions.py` reads `/v1/sessions` to warn if `max_sessions` is below
 the requested concurrency. `soak_sessions.py` samples server RSS/threads/fds via
 `/proc` when `--server-pid` is given and fails if any of them trend upward
-(warm-connection leak check, §6.3 of MULTI_SESSION_PLAN.md).
+(warm-connection leak check, §6.3 of MULTI_SESSION_PLAN.md). For the bare
+`python -m speech_to_speech.s2s_pipeline --mode realtime …` invocation (without
+Docker), pass the same backend flags the compose `command:` block lists.
 
 ### 7.2 Results — fill in from runs
 

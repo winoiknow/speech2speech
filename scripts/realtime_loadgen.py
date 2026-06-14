@@ -14,34 +14,76 @@
 
 from __future__ import annotations
 
+import array
 import asyncio
 import base64
 import json
 import os
 import statistics
+import sys
 import time
 import urllib.request
 import wave
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-import numpy as np
-import websockets
+import websockets  # the harness's only third-party dependency
 
 PIPELINE_RATE = 16000
 BYTES_PER_SAMPLE = 2
 
 
-# ── Audio ────────────────────────────────────────────────────────────────────
+# ── Audio (stdlib only — no numpy, so the client env just needs `websockets`) ─
 
 
-def _resample(audio: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
-    if src_rate == dst_rate:
-        return audio
-    n_dst = int(round(len(audio) * dst_rate / src_rate))
-    x_src = np.linspace(0.0, 1.0, num=len(audio), endpoint=False)
-    x_dst = np.linspace(0.0, 1.0, num=n_dst, endpoint=False)
-    return np.interp(x_dst, x_src, audio.astype(np.float64)).astype(np.int16)
+def _samples_from_wav_bytes(frames: bytes) -> array.array:
+    """Decode little-endian 16-bit PCM bytes into a signed-short array."""
+    a = array.array("h")
+    a.frombytes(frames)
+    if sys.byteorder == "big":  # WAV is little-endian; array uses native order
+        a.byteswap()
+    return a
+
+
+def _to_le_int16_bytes(samples: array.array) -> bytes:
+    a = array.array("h", samples)
+    if sys.byteorder == "big":
+        a.byteswap()
+    return a.tobytes()
+
+
+def _downmix(samples: array.array, channels: int) -> array.array:
+    if channels <= 1:
+        return samples
+    n = len(samples) // channels
+    out = array.array("h", bytes(2 * n))
+    for i in range(n):
+        acc = 0
+        base = i * channels
+        for c in range(channels):
+            acc += samples[base + c]
+        out[i] = int(acc / channels)
+    return out
+
+
+def _resample(samples: array.array, src_rate: int, dst_rate: int) -> array.array:
+    """Linear-interpolation resample (good enough to drive VAD/STT for a test)."""
+    if src_rate == dst_rate or len(samples) == 0:
+        return samples
+    n_src = len(samples)
+    n_dst = int(round(n_src * dst_rate / src_rate))
+    out = array.array("h", bytes(2 * n_dst))
+    if n_dst <= 1:
+        out[0] = samples[0]
+        return out
+    ratio = (n_src - 1) / (n_dst - 1)
+    for i in range(n_dst):
+        x = i * ratio
+        lo = int(x)
+        hi = min(lo + 1, n_src - 1)
+        frac = x - lo
+        out[i] = int(samples[lo] + (samples[hi] - samples[lo]) * frac)
+    return out
 
 
 def load_wav_16k_mono(path: str) -> bytes:
@@ -53,11 +95,10 @@ def load_wav_16k_mono(path: str) -> bytes:
         frames = w.readframes(w.getnframes())
     if sampwidth != 2:
         raise ValueError(f"{path}: only 16-bit PCM WAV is supported (got sampwidth={sampwidth})")
-    audio = np.frombuffer(frames, dtype="<i2")
-    if n_channels > 1:
-        audio = audio.reshape(-1, n_channels).mean(axis=1).astype(np.int16)
-    audio = _resample(audio, rate, PIPELINE_RATE)
-    return audio.astype("<i2").tobytes()
+    samples = _samples_from_wav_bytes(frames)
+    samples = _downmix(samples, n_channels)
+    samples = _resample(samples, rate, PIPELINE_RATE)
+    return _to_le_int16_bytes(samples)
 
 
 # ── WS protocol ──────────────────────────────────────────────────────────────

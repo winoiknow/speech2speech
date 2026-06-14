@@ -200,7 +200,11 @@ curl -s localhost:8765/v1/sessions                      # → {"count":0,"max_se
 
 The harness streams a real speech WAV per turn (server-VAD endpoints it) and
 measures **speech_stopped → first audio delta** — the same first-audio number as
-§1:
+§1. It is pure stdlib except for one package — `websockets` — so it can run on a
+separate load box: either use the project env (`uv run python scripts/…` or
+`.venv/bin/python scripts/…`, which already has it) or `pip install websockets`
+into whatever Python you invoke. The `--wav` is any 16-bit PCM WAV of a spoken
+utterance (mono/stereo and any sample rate; it's downmixed/resampled to 16 kHz).
 
 ```bash
 # load test: 2 / 4 / 8 concurrent turns, 5 waves each, emit a markdown table

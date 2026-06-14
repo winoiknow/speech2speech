@@ -370,13 +370,28 @@ First-audio latency (speech_stopped → first audio delta), seconds:
 
 | Concurrent turns | Turns | OK% | p50 (s) | p95 (s) | p99 (s) | max (s) |
 |---|---|---|---|---|---|---|
-| 1 (baseline) | — | — | — | — | — | — |
-| 2 | — | — | — | — | — | — |
-| 4 | — | — | — | — | — | — |
-| 8 | — | — | — | — | — | — |
+| 1 (baseline) | 5 | 100.0% | 7.245 | 8.819 | 9.009 | 9.056 |
+| 2 | 10 | 100.0% | 7.562 | 12.834 | 14.697 | 15.163 |
+| 4 | 20 | 70.0% | 8.491 | 12.604 | 14.022 | 14.377 |
+| 8 | 40 | 50.0% | 11.900 | 15.352 | 18.061 | 18.738 |
 
-Soak (8 warm, 1 active talker): threads / fds / RSS baseline → peak, turns
-ok/fail. Expect **flat** resource lines.
+_Run: 2026-06-14, remote stack (whisper.anteon.group STT, MiniMax WS TTS, Hermes
+responses-api LLM @ 192.168.1.36), `--rounds 5`, direct-to-container._
+
+**Reading it:** the binding constraint is the **success rate**, not latency.
+Baseline first-audio (~7.2 s p50 / 8.8 s p95) is LLM/TTS-bound as in §1. It holds
+**100% through 2 concurrent**, then collapses: **70% at 4, 50% at 8** — i.e. at 8
+concurrent turns half never produced audio.
+
+Note the latency columns at 4 and 8 are **survivorship-biased**: a failed turn
+contributes no first-audio sample, so the p50/p95 there describe only the turns
+that *survived* and understate the real degradation (the failures are effectively
+"infinite latency"). So don't read the flat-looking p50 at 4 as healthy — 30% of
+those turns were dropped.
+
+The knee for a 100%-success bar is **2 concurrent**. Whether the cap can go higher
+depends on *what* is failing at 4–8 (the shared endpoints saturating vs. an s2s
+issue) — see §7.3.
 
 ### 7.3 Picking the cap
 
@@ -392,5 +407,25 @@ ok/fail. Expect **flat** resource lines.
    shows honest "working" feedback instead of dead air. Document the chosen
    pairing in REMOTE_SETUP.md.
 
-> **Recommended `S2S_MAX_SESSIONS` for the production remote stack: _TBD_**
-> (fill once §7.2 has numbers).
+> **Recommended `S2S_MAX_SESSIONS` for the production remote stack: 2**
+> _(provisional, 2026-06-14)._ Highest concurrency with 100% success in the §7.2
+> run; 4 dropped to 70%, 8 to 50%. This may be raisable once the failure mode at
+> 4–8 is identified (see below) and the saturating service is given a fair queue
+> via its `*_MAX_CONCURRENCY` cap.
+
+**Next: root-cause the 4–8 failures.** The whole point of the per-service caps is
+to convert "endpoint overwhelmed → turn fails" into "turn queues, shows keepalive,
+completes slower." Before settling on 2:
+1. Re-run with the error breakdown visible — `load_test_sessions.py` prints an
+   `Errors observed:` block to stderr listing the distinct failure types
+   (`client_timeout`, an `error` event type, a connect exception, …). That names
+   the failing stage.
+2. If it's a **shared endpoint** saturating (most likely the MiniMax WS account's
+   concurrent-connection limit, or the single Hermes LLM serving one request at a
+   time), set that service's cap to its real capacity — e.g. `TTS_MAX_CONCURRENCY`
+   or `LLM_MAX_CONCURRENCY` = N — so s2s serializes the (N+1)th turn behind a slot
+   instead of letting it fail, then re-run 4/8 and confirm success returns to
+   ~100% at higher p95. The usable `S2S_MAX_SESSIONS` is then "as many warm
+   sessions as you want, capacity-gated by the cap," not 2.
+3. If failures are **s2s-side** (not an endpoint), that's a bug to fix, not a cap
+   to set — capture the failing session's server log.

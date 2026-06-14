@@ -279,15 +279,23 @@ server (Ctrl-C in the Step 2 terminal) and bring it up again with
 #### Step 4 — Prepare the load box
 
 On whichever machine will run the scripts (the server host, another machine, or
-Windows + WSL):
+Windows + WSL), create and activate a virtual environment, then install the
+harness's only third-party dependency into it:
 
 ```bash
 cd /path/to/speech2speech          # the repo checkout (or just copy the scripts/ dir)
+python3 -m venv venv               # create the virtual environment (one time)
+source venv/bin/activate           # activate it  (Windows: venv\Scripts\activate)
+python3 -m pip install --upgrade pip
 python3 -m pip install websockets  # the harness's only third-party dependency
 ```
 
-Put your `sample.wav` somewhere on this machine (e.g. the repo root). Confirm
-Python sees it:
+If `python3 -m venv` errors that the `venv` module is missing, install it first
+(Debian/Ubuntu: `sudo apt install python3-venv`), then re-run the command above.
+
+Keep this terminal (with `venv` activated) for Steps 5–6 — the `python3` there now
+has `websockets`. Put your `sample.wav` somewhere on this machine (e.g. the repo
+root) and confirm it's there:
 
 ```bash
 ls -l sample.wav

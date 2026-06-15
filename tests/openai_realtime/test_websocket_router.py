@@ -17,8 +17,6 @@ from speech_to_speech.api.openai_realtime.service import CHUNK_SIZE_BYTES, Realt
 from speech_to_speech.api.openai_realtime.websocket_router import create_app
 from speech_to_speech.baseHandler import BaseHandler
 from speech_to_speech.pipeline.cancel_scope import CancelScope
-
-from .conftest import FixedQueueSessionFactory, IndependentSessionStubFactory
 from speech_to_speech.pipeline.control import SESSION_END, is_control_message
 from speech_to_speech.pipeline.events import (
     AssistantTextEvent,
@@ -27,6 +25,8 @@ from speech_to_speech.pipeline.events import (
     TranscriptionCompletedEvent,
 )
 from speech_to_speech.pipeline.messages import AUDIO_RESPONSE_DONE, PIPELINE_END
+
+from .conftest import FixedQueueSessionFactory, IndependentSessionStubFactory
 
 # ---------------------------------------------------------------------------
 # Fixtures

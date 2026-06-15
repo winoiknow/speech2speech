@@ -88,9 +88,11 @@ class WS:
         if n < 126:
             frame.append(0x80 | n)
         elif n < 65536:
-            frame.append(0x80 | 126); frame += struct.pack(">H", n)
+            frame.append(0x80 | 126)
+            frame += struct.pack(">H", n)
         else:
-            frame.append(0x80 | 127); frame += struct.pack(">Q", n)
+            frame.append(0x80 | 127)
+            frame += struct.pack(">Q", n)
         mask = secrets.token_bytes(4)
         frame += mask
         frame += bytes(b ^ mask[i % 4] for i, b in enumerate(payload))

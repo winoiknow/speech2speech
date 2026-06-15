@@ -27,12 +27,14 @@ from rich.console import Console
 from transformers import HfArgumentParser
 
 from speech_to_speech.arguments_classes.chat_tts_arguments import ChatTTSHandlerArguments
+from speech_to_speech.arguments_classes.elevenlabs_tts_arguments import ElevenLabsTTSHandlerArguments
 from speech_to_speech.arguments_classes.facebookmms_tts_arguments import FacebookMMSTTSHandlerArguments
 from speech_to_speech.arguments_classes.faster_whisper_stt_arguments import (
     FasterWhisperSTTHandlerArguments,
 )
 from speech_to_speech.arguments_classes.kokoro_tts_arguments import KokoroTTSHandlerArguments
 from speech_to_speech.arguments_classes.language_model_arguments import LanguageModelHandlerArguments
+from speech_to_speech.arguments_classes.minimax_tts_arguments import MiniMaxTTSHandlerArguments
 from speech_to_speech.arguments_classes.mlx_audio_whisper_arguments import (
     MLXAudioWhisperSTTHandlerArguments,
 )
@@ -41,8 +43,6 @@ from speech_to_speech.arguments_classes.paraformer_stt_arguments import Paraform
 from speech_to_speech.arguments_classes.parakeet_tdt_arguments import (
     ParakeetTDTSTTHandlerArguments,
 )
-from speech_to_speech.arguments_classes.elevenlabs_tts_arguments import ElevenLabsTTSHandlerArguments
-from speech_to_speech.arguments_classes.minimax_tts_arguments import MiniMaxTTSHandlerArguments
 from speech_to_speech.arguments_classes.pocket_tts_arguments import PocketTTSHandlerArguments
 from speech_to_speech.arguments_classes.qwen3_tts_arguments import Qwen3TTSHandlerArguments
 from speech_to_speech.arguments_classes.remote_openai_stt_arguments import RemoteOpenAISTTHandlerArguments

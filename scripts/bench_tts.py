@@ -148,7 +148,9 @@ def run(engine_name: str, fn, iters: int) -> None:
             except Exception as e:
                 print(f"{label:<30}  ERROR: {e}")
                 break
-            ttfbs.append(r.ttfb); totals.append(r.total); last = r
+            ttfbs.append(r.ttfb)
+            totals.append(r.total)
+            last = r
         else:
             print(f"{label:<30} {statistics.median(ttfbs):>9.3f} "
                   f"{statistics.median(totals):>9.3f} {last.audio_s:>9.2f} {last.rtf:>6.2f}")

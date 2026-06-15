@@ -207,9 +207,11 @@ class EchoCanceller:
         # clock. The far-end leads the acoustic echo by the (bounded, ~constant)
         # playback+network delay, which AEC3's delay estimator aligns internally.
         while len(self._near_buf) >= self._fb:
-            nframe = bytes(self._near_buf[:self._fb]); del self._near_buf[:self._fb]
+            nframe = bytes(self._near_buf[:self._fb])
+            del self._near_buf[:self._fb]
             if len(self._far_buf) >= self._fb:
-                rframe = bytes(self._far_buf[:self._fb]); del self._far_buf[:self._fb]
+                rframe = bytes(self._far_buf[:self._fb])
+                del self._far_buf[:self._fb]
                 if DEBUG_MODE:
                     self._dbg_far += 1
             else:
@@ -223,7 +225,8 @@ class EchoCanceller:
                 self._dbg_tot += 1
         want = len(near)
         if len(self._clean_buf) >= want:
-            out = bytes(self._clean_buf[:want]); del self._clean_buf[:want]
+            out = bytes(self._clean_buf[:want])
+            del self._clean_buf[:want]
         else:  # startup priming: emit what we have + a little silence to keep lengths matched
             out = bytes(self._clean_buf) + b"\x00" * (want - len(self._clean_buf))
             self._clean_buf.clear()
@@ -239,7 +242,8 @@ class EchoCanceller:
         while off + self._fb <= n:
             rec = near[off : off + self._fb]
             if len(self._far) >= self._fb:
-                play = bytes(self._far[: self._fb]); del self._far[: self._fb]
+                play = bytes(self._far[: self._fb])
+                del self._far[: self._fb]
                 far_frames += 1
             else:
                 play = self._silence

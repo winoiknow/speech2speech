@@ -30,8 +30,6 @@ from openai import AsyncOpenAI
 from speech_to_speech.api.openai_realtime.service import RealtimeService
 from speech_to_speech.api.openai_realtime.websocket_router import create_app
 from speech_to_speech.pipeline.cancel_scope import CancelScope
-
-from .conftest import FixedQueueSessionFactory
 from speech_to_speech.pipeline.events import (
     AssistantTextEvent,
     PartialTranscriptionEvent,
@@ -40,6 +38,8 @@ from speech_to_speech.pipeline.events import (
     TranscriptionCompletedEvent,
 )
 from speech_to_speech.pipeline.messages import AUDIO_RESPONSE_DONE, PIPELINE_END
+
+from .conftest import FixedQueueSessionFactory
 
 # ---------------------------------------------------------------------------
 # Helpers

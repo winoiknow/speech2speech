@@ -6,7 +6,7 @@ from collections import deque
 from collections.abc import Iterator
 from queue import Queue
 from threading import Event
-from typing import TypeAlias
+from typing import Any, TypeAlias
 
 import numpy as np
 import torch
@@ -64,6 +64,7 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         turn_hold_grace_ms: int = 1200,
         smart_turn_model_path: str = "",
         text_output_queue: Queue[TextEventItem] | None = None,
+        vad_model: Any = None,
     ) -> None:
         self.should_listen = should_listen
         self.sample_rate = sample_rate
@@ -80,12 +81,20 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         self.realtime_processing_pause = realtime_processing_pause
         self.text_output_queue = text_output_queue
         self._last_turn_detection: dict | None = None
-        self.model, _ = torch.hub.load(
-            "snakers4/silero-vad",
-            "silero_vad",
-            trust_repo=True,
-            skip_validation=True,
-        )
+        # A pre-warmed Silero model (a per-session deepcopy made by the factory at
+        # connect) lets us skip torch.hub.load on the hot connect path. Each copy
+        # is independent — Silero rebinds its RNN state functionally per call, so
+        # concurrent sessions never bleed through it. Fall back to loading here if
+        # none was supplied (single-build / tests / pre-warm failure).
+        if vad_model is not None:
+            self.model = vad_model
+        else:
+            self.model, _ = torch.hub.load(
+                "snakers4/silero-vad",
+                "silero_vad",
+                trust_repo=True,
+                skip_validation=True,
+            )
         self.iterator = VADIterator(
             self.model,
             threshold=thresh,

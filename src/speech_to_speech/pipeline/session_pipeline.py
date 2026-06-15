@@ -12,8 +12,10 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from queue import Queue
 from threading import Event
@@ -185,6 +187,11 @@ class HandlerFactory:
     def __init__(self, args: ParsedArguments) -> None:
         self.args = args
 
+        # Pre-warmed Silero VAD template (loaded once at startup by prewarm_vad();
+        # each session gets an independent copy.deepcopy of it). None until warmed
+        # or if warming failed — in which case sessions load Silero on connect.
+        self._vad_template: Any = None
+
         # ── Speaker-id client (Phase 3 identify + Phase 4 diarize), env-backed,
         # off by default. Built once and shared (read-only HTTP client) across
         # both the STT handler and the realtime service. Flag(s) off → None →
@@ -206,6 +213,44 @@ class HandlerFactory:
                 self.speaker_args.speaker_id_enabled,
                 self.speaker_args.speaker_diarize_enabled,
             )
+
+    def prewarm_vad(self) -> None:
+        """Load the Silero VAD model once at startup so per-connect builds can
+        ``deepcopy`` it (~30 ms) instead of each running ``torch.hub.load`` on the
+        hot connect path (the source of the multi-second connect spike). Each
+        session gets an independent copy; Silero rebinds its RNN state per call,
+        so concurrent copies never bleed. Best-effort: on any failure the template
+        stays None and handlers fall back to loading Silero per session."""
+        if self._vad_template is not None:
+            return
+        try:
+            import torch
+
+            t0 = time.perf_counter()
+            model, _ = torch.hub.load(
+                "snakers4/silero-vad", "silero_vad", trust_repo=True, skip_validation=True
+            )
+            self._vad_template = model
+            logger.info(
+                "Pre-warmed Silero VAD in %.0f ms — per-session connects deepcopy it (~30 ms) "
+                "instead of loading on the connect path",
+                (time.perf_counter() - t0) * 1000,
+            )
+        except Exception as e:
+            logger.warning("VAD pre-warm failed (%s); sessions will load Silero on connect", e)
+            self._vad_template = None
+
+    def _new_vad_model(self) -> Any:
+        """An independent Silero instance for one session: a deepcopy of the
+        pre-warmed template, or None to let the handler load its own. Each copy is
+        bleed-safe (state is rebound per call; weights are read-only)."""
+        if self._vad_template is None:
+            return None
+        try:
+            return copy.deepcopy(self._vad_template)
+        except Exception as e:
+            logger.warning("VAD deepcopy failed (%s); this session will load Silero on connect", e)
+            return None
 
     def build(self, session_id: str = "default") -> SessionPipeline:
         args = self.args
@@ -493,7 +538,9 @@ class HandlerFactory:
             queue_in=recv_audio_chunks_queue,
             queue_out=spoken_prompt_queue,
             setup_args=(should_listen,),
-            setup_kwargs=vars(args.vad_handler_kwargs),
+            # Fresh dict (not the shared args object) so this session's deepcopied
+            # VAD model is never persisted onto the template for the next session.
+            setup_kwargs={**vars(args.vad_handler_kwargs), "vad_model": self._new_vad_model()},
         )
 
         # Realtime path: inline identify labels only when SPEAKER_ID_ENABLED; no
@@ -621,6 +668,11 @@ class HandlerFactory:
         max_sessions = self.effective_max_sessions()
         if max_sessions > 1:
             logger.info("Multi-session enabled: up to %d concurrent realtime sessions", max_sessions)
+
+        # Load Silero once now (startup) so per-connect builds deepcopy it instead
+        # of paying torch.hub.load on the connect path — keeps warm-connection cost
+        # low and avoids the cold first-connect spike.
+        self.prewarm_vad()
 
         return RealtimeServer(
             stop_event=Event(),

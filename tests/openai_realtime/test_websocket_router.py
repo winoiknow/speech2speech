@@ -741,6 +741,31 @@ class TestMultiSession:
                 # the rejected connection never registered
                 assert len(service._conns) == 1
 
+    def test_send_event_swallows_closed_socket(self, caplog):
+        """A send to an already-gone client (Starlette raises RuntimeError once
+        the socket is closed) is benign — logged at debug, never ERROR. This is
+        the post-disconnect path a client that hangs up during the off-loop build
+        takes; it must not look like a server crash."""
+        import asyncio
+        import logging
+
+        from speech_to_speech.api.openai_realtime import websocket_router as wr
+
+        class _GoneWS:
+            async def send_json(self, _payload):
+                raise RuntimeError('WebSocket is not connected. Need to call "accept" first.')
+
+        class _Evt:
+            def model_dump(self):
+                return {"type": "x"}
+
+        logger_name = "speech_to_speech.api.openai_realtime.websocket_router"
+        with caplog.at_level(logging.DEBUG, logger=logger_name):
+            asyncio.run(wr._send_event(_GoneWS(), _Evt()))
+
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert any("disconnected before event could be sent" in r.message for r in caplog.records)
+
     def test_no_cross_talk_between_sessions(self):
         """Each session's transcription routes only to its own socket."""
         factory = IndependentSessionStubFactory()

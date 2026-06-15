@@ -88,6 +88,12 @@ TTS_DUMP_RATE = int(os.getenv("S2S_TTS_DUMP_RATE", "24000"))
 async def _send_event(ws: WebSocket, event: ServerEvent) -> None:
     try:
         await ws.send_json(event.model_dump())
+    except (WebSocketDisconnect, RuntimeError) as e:
+        # Client already gone (socket closed before/while we sent). Starlette
+        # raises RuntimeError once the connection is closed; either way the
+        # receive loop will exit on the same disconnect. Benign — don't log an
+        # error/traceback for a normal hangup.
+        logger.debug("Client disconnected before event could be sent: %s", e)
     except Exception as e:
         logger.error(f"Failed to send event to client: {e}")
 
@@ -254,11 +260,19 @@ def create_app(
                 await ws.close(code=4001, reason="Unauthorized")
                 return
 
-        # Capacity guard: accept up to max_sessions concurrent connections.
-        if len(app.state.sessions) >= max_sessions:
+        session_id = service.register()
+
+        # Capacity guard: accept up to max_sessions concurrent connections. Count
+        # registered connections — a synchronous reservation done by register()
+        # above — rather than attached pipelines: the build below now yields the
+        # event loop (asyncio.to_thread), so a pipeline-keyed count could over-
+        # admit under simultaneous connects. register()→this check has no await
+        # between them, so the count is race-free.
+        if len(service.connection_ids) > max_sessions:
             logger.warning(
-                "Rejected connection: at session capacity (%d/%d)", len(app.state.sessions), max_sessions
+                "Rejected connection: at session capacity (%d/%d)", max_sessions, max_sessions
             )
+            service.unregister(session_id)
             await _send_event(
                 ws,
                 service.make_error(
@@ -270,31 +284,36 @@ def create_app(
             await ws.close(code=1008, reason=f"Session limit reached ({max_sessions})")
             return
 
-        session_id = service.register()
-
-        # Build this connection's pipeline (fresh queues/events/cancel scope/AEC +
-        # the handler threads). Instrumented: warm-connection clients depend on a
-        # low connect cost.
-        build_start = time.perf_counter()
-        pipeline = session_factory.build_session_pipeline(session_id)
-        pipeline.start()
-        build_ms = (time.perf_counter() - build_start) * 1000
-        logger.info("Session %s pipeline built + started in %.0f ms", session_id, build_ms)
-
-        service.attach_pipeline(session_id, pipeline)
-        app.state.sessions[session_id] = pipeline
-        app.state.websockets[session_id] = ws
-        pipeline.echo_canceller.reset()  # fresh far-end buffer for a new call
-        logger.info(f"Client connected (session {session_id})")
-
-        # Per-session send loop: drains this pipeline's output queues to this ws.
-        pipeline.send_task = asyncio.create_task(_session_send_loop(session_id, pipeline, ws))
-
-        # Defensive: drain edge queues and reset events so nothing leaks into the
-        # first turn.
-        clean_session(pipeline)
-
+        pipeline: Optional["SessionPipeline"] = None
         try:
+            # Build this connection's pipeline OFF the event loop. Each handler's
+            # __init__ eagerly runs setup(): the VAD handler loads the Silero model
+            # and (when TURN_DETECTION=smart_turn) the Smart-Turn ONNX session,
+            # which costs seconds. Doing that inline would freeze every other
+            # session's send/receive loop for the whole build — and a client whose
+            # connect timeout is shorter than the build would drop mid-build.
+            # asyncio.to_thread keeps the loop live (other sessions stay served and
+            # this socket's keepalive is answered). Instrumented: warm-connection
+            # clients depend on a low connect cost.
+            build_start = time.perf_counter()
+            pipeline = await asyncio.to_thread(session_factory.build_session_pipeline, session_id)
+            pipeline.start()
+            build_ms = (time.perf_counter() - build_start) * 1000
+            logger.info("Session %s pipeline built + started in %.0f ms", session_id, build_ms)
+
+            service.attach_pipeline(session_id, pipeline)
+            app.state.sessions[session_id] = pipeline
+            app.state.websockets[session_id] = ws
+            pipeline.echo_canceller.reset()  # fresh far-end buffer for a new call
+            logger.info(f"Client connected (session {session_id})")
+
+            # Per-session send loop: drains this pipeline's output queues to this ws.
+            pipeline.send_task = asyncio.create_task(_session_send_loop(session_id, pipeline, ws))
+
+            # Defensive: drain edge queues and reset events so nothing leaks into the
+            # first turn.
+            clean_session(pipeline)
+
             await _send_event(ws, service.build_session_created(session_id))
 
             while not stop_event.is_set():
@@ -363,12 +382,24 @@ def create_app(
 
         except WebSocketDisconnect:
             logger.info(f"Client {session_id} disconnected")
+        except RuntimeError as e:
+            # Starlette raises RuntimeError("WebSocket is not connected...") when
+            # the peer has already closed — e.g. it timed out and hung up while the
+            # pipeline was still building. That's a normal disconnect, not a server
+            # error, so don't log a scary traceback for it.
+            if "not connected" in str(e).lower():
+                logger.info(f"Client {session_id} disconnected before the session was ready")
+            else:
+                logger.error(f"Client {session_id} error: {type(e).__name__}: {e}", exc_info=True)
         except Exception as e:
             logger.error(f"Client {session_id} error: {type(e).__name__}: {e}", exc_info=True)
         finally:
+            # pipeline may be None if the build (now off-loop) was cancelled before
+            # it attached — e.g. server shutdown during connect. Tear down only
+            # what exists; the registration is always cleaned up below.
             # Stop sending to this socket before tearing the pipeline down so a
             # PIPELINE_END draining through the send loop can't race the close.
-            if pipeline.send_task is not None:
+            if pipeline is not None and pipeline.send_task is not None:
                 pipeline.send_task.cancel()
                 try:
                     await pipeline.send_task
@@ -378,7 +409,8 @@ def create_app(
             # slot freed) immediately — the handler-thread join below must not
             # gate that.
             service.detach_pipeline(session_id)
-            clean_session(pipeline)
+            if pipeline is not None:
+                clean_session(pipeline)
             service.unregister(session_id)
             app.state.sessions.pop(session_id, None)
             app.state.websockets.pop(session_id, None)
@@ -387,7 +419,8 @@ def create_app(
             # connection handler if the event loop stops servicing the result
             # callback during teardown. The worker sets stop_event + drains the
             # chain so the (non-daemon) handler threads exit promptly on their own.
-            _shutdown_pipeline_async(session_id, pipeline)
+            if pipeline is not None:
+                _shutdown_pipeline_async(session_id, pipeline)
             logger.info(f"Client {session_id} removed")
 
     @app.get("/v1/usage")

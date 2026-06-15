@@ -275,6 +275,22 @@ class EchoCanceller:
         self._far_buf.clear()
         self._clean_buf.clear()
 
+    def close(self) -> None:
+        """Release the aec3 backend's native object on the CALLING thread.
+
+        ``aec3_py.Aec3`` is PyO3-``unsendable`` — it must be dropped on the thread
+        that created and used it (the event loop, where ``process()`` /
+        ``add_far_end`` run). Session teardown hands the pipeline to a worker
+        thread, which would otherwise be the last reference holder and GC the Aec3
+        on the wrong thread → ``RuntimeError: aec3_py::Aec3 is unsendable, but is
+        being dropped on another thread``. Call this from the event-loop thread
+        before teardown so the drop happens here. Idempotent; safe to call when no
+        Aec3 was ever created (AEC disabled / speex backend)."""
+        # Dropping the sole reference frees the Rust object synchronously on this
+        # thread. process() would lazily recreate it, but teardown makes no more
+        # process() calls.
+        self._aec3 = None
+
     # ── diagnostic ──────────────────────────────────────────────────────────
     def _diag(self, near_b: bytes, out_b: bytes) -> None:
         now = time.time()

@@ -414,12 +414,22 @@ def create_app(
             service.unregister(session_id)
             app.state.sessions.pop(session_id, None)
             app.state.websockets.pop(session_id, None)
-            # Join the handler threads in a fire-and-forget daemon worker, NOT via
-            # loop.run_in_executor: awaiting the executor future here can wedge the
-            # connection handler if the event loop stops servicing the result
-            # callback during teardown. The worker sets stop_event + drains the
-            # chain so the (non-daemon) handler threads exit promptly on their own.
             if pipeline is not None:
+                # Release the AEC backend's unsendable native object now, on the
+                # event-loop thread that created it (process()/add_far_end run on
+                # the loop). The teardown worker below would otherwise be the last
+                # holder and GC the pipeline — and its Aec3 — on the wrong thread:
+                # "aec3_py::Aec3 is unsendable, but is being dropped on another
+                # thread".
+                try:
+                    pipeline.echo_canceller.close()
+                except Exception:
+                    pass
+                # Join the handler threads in a fire-and-forget daemon worker, NOT
+                # via loop.run_in_executor: awaiting the executor future here can
+                # wedge the connection handler if the event loop stops servicing the
+                # result callback during teardown. The worker sets stop_event +
+                # drains the chain so the (non-daemon) handler threads exit promptly.
                 _shutdown_pipeline_async(session_id, pipeline)
             logger.info(f"Client {session_id} removed")
 

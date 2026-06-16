@@ -50,6 +50,38 @@ def test_handler_uses_injected_model_without_loading(monkeypatch):
     assert stub.reset_calls == 1
 
 
+def test_vad_uses_injected_turn_detector(monkeypatch):
+    """When TURN_DETECTION=smart_turn and a shared detector is injected, the
+    handler uses it as-is and never constructs/loads its own ONNX session."""
+    from speech_to_speech.VAD import vad_handler as vh
+
+    def _no_load(*a, **k):
+        raise AssertionError("Silero must not load when a vad_model is injected")
+
+    monkeypatch.setattr(vh.torch.hub, "load", _no_load)
+
+    class _Detector:
+        available = True
+
+    class _Model:
+        def reset_states(self):
+            pass
+
+    shared = _Detector()
+    handler = vh.VADHandler(
+        ThreadingEvent(),
+        queue_in=Queue(),
+        queue_out=Queue(),
+        setup_args=(ThreadingEvent(),),
+        setup_kwargs={
+            "vad_model": _Model(),
+            "turn_detection": "smart_turn",
+            "turn_detector": shared,
+        },
+    )
+    assert handler.turn_detector is shared
+
+
 def test_new_vad_model_none_without_template():
     f = HandlerFactory.__new__(HandlerFactory)  # bypass heavy __init__
     f._vad_template = None

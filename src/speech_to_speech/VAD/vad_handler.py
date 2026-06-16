@@ -65,6 +65,7 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         smart_turn_model_path: str = "",
         text_output_queue: Queue[TextEventItem] | None = None,
         vad_model: Any = None,
+        turn_detector: Any = None,
     ) -> None:
         self.should_listen = should_listen
         self.sample_rate = sample_rate
@@ -117,9 +118,14 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         self._hold_deadline: float | None = None
         self._turn_carry: list[np.ndarray] = []
         if (turn_detection or "vad").strip().lower() == "smart_turn":
-            from speech_to_speech.VAD.smart_turn import SmartTurnDetector
+            # A shared, pre-warmed detector (loaded once by the factory) avoids the
+            # per-session ONNX load on the connect path. It's stateless — is_complete()
+            # only reads the session/feature-extractor — so all sessions can share one.
+            detector = turn_detector
+            if detector is None:
+                from speech_to_speech.VAD.smart_turn import SmartTurnDetector
 
-            detector = SmartTurnDetector(smart_turn_model_path, threshold=turn_threshold, sample_rate=sample_rate)
+                detector = SmartTurnDetector(smart_turn_model_path, threshold=turn_threshold, sample_rate=sample_rate)
             if detector.available:
                 self.turn_detector = detector
                 # Finalize on a short pause; Smart Turn makes the real end-of-turn call.

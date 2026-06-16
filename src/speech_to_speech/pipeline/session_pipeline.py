@@ -192,6 +192,11 @@ class HandlerFactory:
         # or if warming failed — in which case sessions load Silero on connect.
         self._vad_template: Any = None
 
+        # Shared Smart Turn detector (loaded once at startup by prewarm_smart_turn()
+        # when TURN_DETECTION=smart_turn). Stateless inference → all sessions share
+        # the one instance. None when disabled/unavailable → sessions load their own.
+        self._smart_turn: Any = None
+
         # ── Speaker-id client (Phase 3 identify + Phase 4 diarize), env-backed,
         # off by default. Built once and shared (read-only HTTP client) across
         # both the STT handler and the realtime service. Flag(s) off → None →
@@ -251,6 +256,55 @@ class HandlerFactory:
         except Exception as e:
             logger.warning("VAD deepcopy failed (%s); this session will load Silero on connect", e)
             return None
+
+    def prewarm_smart_turn(self) -> None:
+        """Load the Smart Turn ONNX detector once at startup (only when
+        TURN_DETECTION=smart_turn) so per-connect builds don't pay the ONNX load.
+        Inference is stateless and ONNX Runtime is thread-safe, so all sessions
+        share the single instance. Best-effort: on failure sessions load their own."""
+        vk = vars(self.args.vad_handler_kwargs)
+        if (vk.get("turn_detection") or "vad").strip().lower() != "smart_turn":
+            return
+        try:
+            from speech_to_speech.VAD.smart_turn import SmartTurnDetector
+
+            t0 = time.perf_counter()
+            det = SmartTurnDetector(
+                vk.get("smart_turn_model_path", ""),
+                threshold=vk.get("turn_threshold", 0.5),
+                sample_rate=vk.get("sample_rate", 16000),
+            )
+            self._smart_turn = det if det.available else None
+            if self._smart_turn is not None:
+                logger.info("Pre-warmed shared Smart Turn detector in %.0f ms", (time.perf_counter() - t0) * 1000)
+        except Exception as e:
+            logger.warning("Smart Turn pre-warm failed (%s); sessions will load it on connect", e)
+            self._smart_turn = None
+
+    def prewarm_llm(self) -> None:
+        """Warm the remote LLM once at startup so the first session's build doesn't
+        pay the warmup round-trip (and reconnects skip it via the process-global
+        guard in ResponsesApiModelHandler.warmup). Builds a throwaway handler purely
+        to trigger that one-time warmup, then drops it. Best-effort."""
+        if self.args.module_kwargs.llm_backend != "responses-api":
+            return
+        try:
+            t0 = time.perf_counter()
+            handler = get_llm_handler(
+                self.args.module_kwargs,
+                Event(),
+                Queue(),
+                Queue(),
+                self.args.language_model_handler_kwargs,
+                self.args.responses_api_language_model_handler_kwargs,
+            )
+            del handler  # only constructed to run its one-time warmup
+            logger.info(
+                "Pre-warmed remote LLM in %.0f ms — session builds skip the warmup round-trip",
+                (time.perf_counter() - t0) * 1000,
+            )
+        except Exception as e:
+            logger.warning("LLM pre-warm failed (%s); the first session will warm on connect", e)
 
     def build(self, session_id: str = "default") -> SessionPipeline:
         args = self.args
@@ -540,7 +594,12 @@ class HandlerFactory:
             setup_args=(should_listen,),
             # Fresh dict (not the shared args object) so this session's deepcopied
             # VAD model is never persisted onto the template for the next session.
-            setup_kwargs={**vars(args.vad_handler_kwargs), "vad_model": self._new_vad_model()},
+            # turn_detector is the shared (stateless) Smart Turn instance, if warmed.
+            setup_kwargs={
+                **vars(args.vad_handler_kwargs),
+                "vad_model": self._new_vad_model(),
+                "turn_detector": self._smart_turn,
+            },
         )
 
         # Realtime path: inline identify labels only when SPEAKER_ID_ENABLED; no
@@ -669,10 +728,13 @@ class HandlerFactory:
         if max_sessions > 1:
             logger.info("Multi-session enabled: up to %d concurrent realtime sessions", max_sessions)
 
-        # Load Silero once now (startup) so per-connect builds deepcopy it instead
-        # of paying torch.hub.load on the connect path — keeps warm-connection cost
-        # low and avoids the cold first-connect spike.
+        # Pre-warm the per-connect heavy bits at startup so a session build (and any
+        # reconnect) is cheap: Silero (deepcopied per session), the shared Smart Turn
+        # detector, and the remote LLM (warmed once, guarded). Keeps warm-connection
+        # cost low and avoids the cold first-connect spike.
         self.prewarm_vad()
+        self.prewarm_smart_turn()
+        self.prewarm_llm()
 
         return RealtimeServer(
             stop_event=Event(),

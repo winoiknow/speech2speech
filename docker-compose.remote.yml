@@ -46,6 +46,10 @@ services:
       # Sentences accumulated before the first TTS batch fires. Lower = lower
       # time-to-first-audio. A/B this (1 vs 2 vs 3) for the latency test.
       STREAM_BATCH_SENTENCES: ${STREAM_BATCH_SENTENCES:-3}
+      # The LLM warmup round-trip runs once per process by default (warmed at
+      # startup; per-session builds skip it). Set 1 to warm on every session build
+      # (the old behavior) — only needed if the remote model goes cold between turns.
+      S2S_LLM_WARMUP_PER_SESSION: ${S2S_LLM_WARMUP_PER_SESSION:-0}
 
       # ── Server authentication ──────────────────────────────────────────
       SERVER_API_KEY: ${SERVER_API_KEY:-}

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import threading
 import time
 from collections.abc import Iterator
 from typing import Any, Optional
@@ -41,6 +43,16 @@ from speech_to_speech.utils.concurrency import LLM_LIMITER
 from speech_to_speech.utils.utils import _generate_id
 
 logger = logging.getLogger(__name__)
+
+# Warm the remote model once per process by default. warmup() is a full round-trip
+# to the serving endpoint (seconds, while it loads/queues the model); re-running it
+# on every per-session pipeline build — e.g. a client that opens a new connection
+# per turn — just re-pays that cost for an already-warm remote. The process-global
+# guard below makes only the first build warm; the rest skip. Set
+# S2S_LLM_WARMUP_PER_SESSION=1 to restore the old per-session behavior.
+_WARMUP_PER_SESSION = os.getenv("S2S_LLM_WARMUP_PER_SESSION", "0").lower() in ("1", "true", "on", "yes")
+_warmed = False
+_warmed_lock = threading.Lock()
 
 
 class ResponsesApiModelHandler(BaseHandler[LLMIn, LLMOut]):
@@ -94,6 +106,22 @@ class ResponsesApiModelHandler(BaseHandler[LLMIn, LLMOut]):
         self.warmup()
 
     def warmup(self) -> None:
+        global _warmed
+        if _WARMUP_PER_SESSION:
+            self._do_warmup()
+            return
+        # Warm once per process. Hold the lock across the warmup so a concurrent
+        # first build waits and then sees _warmed=True (rather than double-warming).
+        # In practice the factory pre-warms at startup before serving, so by the
+        # time clients connect _warmed is already True and this returns immediately.
+        with _warmed_lock:
+            if _warmed:
+                logger.info("%s: skipping warmup (remote already warmed this process)", self.__class__.__name__)
+                return
+            self._do_warmup()
+            _warmed = True
+
+    def _do_warmup(self) -> None:
         logger.info(f"Warming up {self.__class__.__name__}")
         start = time.time()
         self.client.responses.create(

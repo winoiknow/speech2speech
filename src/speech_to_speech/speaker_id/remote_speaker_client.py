@@ -36,32 +36,43 @@ class RemoteSpeakerClient:
         self._diar_client = httpx.Client(timeout=diarize_timeout)
         # identify failures are fail-safe (→ unknown) and otherwise only log at
         # debug, which makes an unreachable/broken endpoint invisible at info
-        # level. Surface it: warn on the first failure and at most every
-        # _FAIL_WARN_INTERVAL_S after, and log a one-line recovery on the next
-        # success. State is single-writer (the STT identify pool is max_workers=1).
+        # level. Surface it — but only once it's *sustained*: a single slow
+        # identify (the service occasionally exceeds the hot-path timeout and the
+        # turn is fail-safe-labeled 'unknown', then recovers) must not look like an
+        # outage. Warn only after _FAIL_WARN_AFTER consecutive failures, then at
+        # most every _FAIL_WARN_INTERVAL_S, and log a one-line recovery once it
+        # succeeds again. State is single-writer (STT identify pool is max_workers=1).
         self._identify_failing = False
+        self._consecutive_failures = 0
         self._last_fail_warn = 0.0
         logger.info("RemoteSpeakerClient ready → %s (timeout=%.2fs, diarize_timeout=%.2fs)",
                     self.endpoint, timeout, diarize_timeout)
 
     _FAIL_WARN_INTERVAL_S = 30.0
+    # Consecutive identify failures before we warn — keeps a one-off slow/timed-out
+    # identify (which recovers on the next turn) from logging a scary outage line.
+    _FAIL_WARN_AFTER = 3
 
     def _note_identify_failure(self, exc: Exception) -> None:
+        self._consecutive_failures += 1
         now = time.monotonic()
-        if not self._identify_failing or (now - self._last_fail_warn) >= self._FAIL_WARN_INTERVAL_S:
+        sustained = self._consecutive_failures >= self._FAIL_WARN_AFTER
+        due = not self._identify_failing or (now - self._last_fail_warn) >= self._FAIL_WARN_INTERVAL_S
+        if sustained and due:
             logger.warning(
-                "speaker identify is failing → all turns labeled 'unknown'. "
-                "Endpoint %s unreachable/erroring: %s: %s. "
+                "speaker identify is failing → all turns labeled 'unknown' "
+                "(%d consecutive failures). Endpoint %s unreachable/erroring: %s: %s. "
                 "(SPEAKER_ID_ENABLED is on; check the speaker-id service and SPEAKER_ID_BASE_URL reachability.)",
-                self.endpoint, type(exc).__name__, exc,
+                self._consecutive_failures, self.endpoint, type(exc).__name__, exc,
             )
             self._last_fail_warn = now
-        self._identify_failing = True
+            self._identify_failing = True
 
     def _note_identify_success(self) -> None:
         if self._identify_failing:
             logger.info("speaker identify recovered → %s reachable again", self.endpoint)
         self._identify_failing = False
+        self._consecutive_failures = 0
 
     def identify(self, wav_bytes: bytes) -> SpeakerLabel:
         try:

@@ -28,28 +28,61 @@ def _client():
     return RemoteSpeakerClient("http://speaker-id:9100", api_key="", timeout=0.1)
 
 
-def test_identify_failure_is_failsafe_and_warns_once(caplog):
+def test_transient_failures_below_threshold_are_silent(caplog):
+    """A one-off slow/timed-out identify that recovers must NOT warn — it's
+    fail-safe (→ unknown) and not an outage."""
+    c = _client()
+    c._client.post = lambda *a, **k: (_ for _ in ()).throw(httpx.ReadTimeout("timed out"))
+
+    with caplog.at_level(logging.WARNING, logger="speech_to_speech.speaker_id.remote_speaker_client"):
+        first = c.identify(b"wav")
+        second = c.identify(b"wav")  # still below _FAIL_WARN_AFTER (3)
+
+    assert first.decision == "unknown"
+    assert second.decision == "unknown"
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+    assert c._identify_failing is False  # not flagged as a sustained outage yet
+
+
+def test_sustained_failures_warn_once(caplog):
     c = _client()
     c._client.post = lambda *a, **k: (_ for _ in ()).throw(httpx.ConnectError("no route"))
 
     with caplog.at_level(logging.WARNING, logger="speech_to_speech.speaker_id.remote_speaker_client"):
-        first = c.identify(b"wav")
-        second = c.identify(b"wav")  # within the rate-limit window
+        for _ in range(5):  # >= _FAIL_WARN_AFTER, all within the rate-limit window
+            assert c.identify(b"wav").decision == "unknown"
 
-    # Fail-safe: never raises, always 'unknown'.
-    assert first.decision == "unknown"
-    assert second.decision == "unknown"
-    # Exactly one warning despite two failures (rate-limited).
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-    assert len(warnings) == 1
+    assert len(warnings) == 1  # warned once it became sustained, then rate-limited
     assert "speaker identify is failing" in warnings[0].message
+    assert "consecutive failures" in warnings[0].message
     assert c._identify_failing is True
+
+
+def test_one_success_resets_the_failure_streak(caplog):
+    """A success between failures clears the streak, so it takes another full run
+    of consecutive failures (not just one more) to warn."""
+    c = _client()
+    c._client.post = lambda *a, **k: (_ for _ in ()).throw(httpx.ReadTimeout("slow"))
+    c.identify(b"wav")
+    c.identify(b"wav")  # streak = 2, still silent
+
+    c._client.post = lambda *a, **k: _FakeResp({"decision": "known", "name": "Eric"})
+    c.identify(b"wav")  # success resets streak to 0
+    assert c._consecutive_failures == 0
+
+    c._client.post = lambda *a, **k: (_ for _ in ()).throw(httpx.ReadTimeout("slow"))
+    with caplog.at_level(logging.WARNING, logger="speech_to_speech.speaker_id.remote_speaker_client"):
+        c.identify(b"wav")
+        c.identify(b"wav")  # streak only back to 2 → still no warning
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
 
 
 def test_identify_recovers_logs_info(caplog):
     c = _client()
     c._client.post = lambda *a, **k: (_ for _ in ()).throw(httpx.ConnectError("down"))
-    c.identify(b"wav")  # mark failing
+    for _ in range(3):  # reach the warn threshold so it's flagged failing
+        c.identify(b"wav")
     assert c._identify_failing is True
 
     c._client.post = lambda *a, **k: _FakeResp({"decision": "known", "name": "Eric", "score": 0.9})
@@ -59,16 +92,8 @@ def test_identify_recovers_logs_info(caplog):
     assert label.decision == "known"
     assert label.name == "Eric"
     assert c._identify_failing is False
+    assert c._consecutive_failures == 0
     assert any("speaker identify recovered" in r.message for r in caplog.records)
-
-
-def test_repeated_failures_rate_limited(caplog):
-    c = _client()
-    c._client.post = lambda *a, **k: (_ for _ in ()).throw(httpx.ConnectError("down"))
-    with caplog.at_level(logging.WARNING, logger="speech_to_speech.speaker_id.remote_speaker_client"):
-        for _ in range(5):
-            c.identify(b"wav")
-    assert sum(1 for r in caplog.records if r.levelno == logging.WARNING) == 1
 
 
 @pytest.mark.parametrize("decision_in,expected", [("weird", "unknown"), ("ambiguous", "ambiguous")])

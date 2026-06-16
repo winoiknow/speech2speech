@@ -154,8 +154,11 @@ class RemoteOpenAISTTHandler(BaseHandler[STTIn, STTOut]):
         yield Transcription(text=pred_text, language_code=language_code, speaker=speaker, audio_wav=audio_wav)
 
     def cleanup(self) -> None:
-        self._client.close()
+        self._client.close()  # this handler's own transcription client — safe to close
         if self._spk_pool is not None:
             self._spk_pool.shutdown(wait=False)
-        if self.speaker_client is not None:
-            self.speaker_client.close()
+        # Do NOT close self.speaker_client here: it is the SHARED RemoteSpeakerClient
+        # built once by HandlerFactory and handed to every session. Closing it on one
+        # session's teardown closes its httpx client process-wide, so every later
+        # identify fails with "Cannot send a request, as the client has been closed"
+        # until restart. The factory owns it; it's closed once at server shutdown.

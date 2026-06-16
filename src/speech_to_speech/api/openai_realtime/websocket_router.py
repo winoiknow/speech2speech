@@ -246,6 +246,17 @@ def create_app(
         for worker in workers:
             worker.join(timeout=6.0)
 
+        # Close the shared speaker-id client once, here, after every session is torn
+        # down. It's built once by the factory and shared across sessions, so a
+        # per-session teardown must NOT close it (that would kill identify
+        # process-wide); the owner closes it exactly once at server shutdown.
+        speaker_client = getattr(session_factory, "speaker_client", None)
+        if speaker_client is not None:
+            try:
+                speaker_client.close()
+            except Exception:
+                pass
+
     app = FastAPI(lifespan=lifespan)
 
     @app.websocket("/v1/realtime")

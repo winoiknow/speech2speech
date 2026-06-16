@@ -63,6 +63,13 @@ services:
       S2S_IDLE_TIMEOUT_S: ${S2S_IDLE_TIMEOUT_S:-0}
       # Send-loop dead-thread supervisor check period in seconds (0 = disable).
       S2S_THREAD_SUPERVISOR_S: ${S2S_THREAD_SUPERVISOR_S:-2}
+      # WebSocket keepalive: server pings idle clients every INTERVAL s and closes
+      # (1011) if no pong within TIMEOUT s. Generous defaults so a warm-connection
+      # client can refresh infrequently and a long tool turn won't trip a false
+      # 1011. Set S2S_WS_PING_INTERVAL=0 to disable server pings (client/TCP own
+      # liveness — pair with a client-side keepalive).
+      S2S_WS_PING_INTERVAL: ${S2S_WS_PING_INTERVAL:-20}
+      S2S_WS_PING_TIMEOUT: ${S2S_WS_PING_TIMEOUT:-60}
       # Per-service caps on concurrent in-flight requests across all sessions
       # (0 = unlimited). Tune with the endpoints' own concurrency (LATENCY.md §7.3).
       STT_MAX_CONCURRENCY: ${STT_MAX_CONCURRENCY:-0}

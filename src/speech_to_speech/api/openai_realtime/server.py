@@ -1,4 +1,5 @@
 import logging
+import os
 import threading
 from threading import Event
 from typing import TYPE_CHECKING
@@ -12,6 +13,24 @@ if TYPE_CHECKING:
     from speech_to_speech.pipeline.session_pipeline import HandlerFactory
 
 logger = logging.getLogger(__name__)
+
+# WebSocket keepalive. uvicorn's defaults (20s/20s) ping idle clients and close
+# (1011) on no pong — fine for a browser, but for a warm-connection client that
+# tends its own keepalive these defaults force an aggressive client refresh (each
+# reconnect can re-prime the LLM and re-burn the system prompt). Defaults here are
+# generous: still ping for dead-connection detection, but give a busy client loop
+# (a long tool turn) or a relaxed refresh plenty of grace. Set
+# S2S_WS_PING_INTERVAL=0 to disable server-side pings entirely (client/TCP own
+# liveness — note: with the idle reaper also off, a vanished client lingers until
+# TCP timeout).
+_WS_PING_INTERVAL = float(os.getenv("S2S_WS_PING_INTERVAL", "20"))
+_WS_PING_TIMEOUT = float(os.getenv("S2S_WS_PING_TIMEOUT", "60"))
+
+
+def _ping_or_none(seconds: float) -> float | None:
+    """Map a keepalive seconds value to uvicorn's arg: a positive number, or None
+    to disable (0/negative)."""
+    return seconds if seconds > 0 else None
 
 
 class RealtimeServer:
@@ -67,11 +86,22 @@ class RealtimeServer:
 
         logger.info(f"OpenAI Realtime API server starting on ws://{self.host}:{self.port}/v1/realtime")
 
+        # ws_ping_interval=None disables periodic server pings; a 0/negative env
+        # value maps to that. ws_ping_timeout only matters when pinging.
+        ping_interval = _ping_or_none(_WS_PING_INTERVAL)
+        ping_timeout = _ping_or_none(_WS_PING_TIMEOUT)
+        if ping_interval is None:
+            logger.info("WebSocket server pings DISABLED (S2S_WS_PING_INTERVAL=0); client/TCP own liveness")
+        else:
+            logger.info("WebSocket keepalive: ping every %.0fs, %ss pong timeout",
+                        ping_interval, int(ping_timeout) if ping_timeout else "no")
         config = uvicorn.Config(
             app,
             host=self.host,
             port=self.port,
             log_level="info",
+            ws_ping_interval=ping_interval,
+            ws_ping_timeout=ping_timeout,
         )
         server = uvicorn.Server(config)
 

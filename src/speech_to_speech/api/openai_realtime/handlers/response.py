@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Literal, Optional
 
 from openai.types.realtime import (
     RealtimeResponse,
@@ -332,7 +332,7 @@ class ResponseHandler(RealtimeBaseHandler):
             # ``begin_output_item_events`` so strict clients finalize the item.
             if st.output_item_added:
                 transcript = st.assistant_transcript or None
-                item_status = "completed" if status == "completed" else "incomplete"
+                item_status: Literal["completed", "incomplete"] = "completed" if status == "completed" else "incomplete"
                 events.append(
                     ResponseContentPartDoneEvent(
                         type="response.content_part.done",

@@ -8,6 +8,7 @@ Smoke tests for RemoteOpenAISTTHandler and RemoteOpenAITTSHandler.
 Mocks the three external HTTP endpoints and exercises one full turn through
 the pipeline: VADAudio → STT → text, text → TTS → PCM chunks.
 """
+
 from __future__ import annotations
 
 from queue import Queue
@@ -184,8 +185,8 @@ class TestRemoteOpenAISTTHandler:
         pcm_data = wav_bytes[44:]
         assert len(pcm_data) == 3 * 2  # 3 int16 samples
         sent_int16 = np.frombuffer(pcm_data, dtype=np.int16)
-        assert sent_int16[0] > 0   # 0.5 → positive
-        assert sent_int16[1] < 0   # -0.5 → negative
+        assert sent_int16[0] > 0  # 0.5 → positive
+        assert sent_int16[1] < 0  # -0.5 → negative
         assert sent_int16[2] == 0  # 0.0 → zero
 
     def test_language_code_propagated(self):

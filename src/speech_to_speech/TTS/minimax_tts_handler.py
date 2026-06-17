@@ -23,9 +23,9 @@ from speech_to_speech.utils.ws_client import WSClient
 logger = logging.getLogger(__name__)
 console = Console()
 
-SAMPLE_RATE = 16000          # MiniMax pcm @ 16000 == pipeline rate (no resample)
-BYTES_PER_SAMPLE = 2         # int16
-CHUNK_SAMPLES = 320          # 20 ms @ 16 kHz
+SAMPLE_RATE = 16000  # MiniMax pcm @ 16000 == pipeline rate (no resample)
+BYTES_PER_SAMPLE = 2  # int16
+CHUNK_SAMPLES = 320  # 20 ms @ 16 kHz
 CHUNK_BYTES = CHUNK_SAMPLES * BYTES_PER_SAMPLE
 
 
@@ -38,6 +38,7 @@ def _extract_audio(ev: dict) -> bytes:
         return bytes.fromhex(a)
     except ValueError:
         import base64
+
         try:
             return base64.b64decode(a)
         except Exception:
@@ -83,12 +84,13 @@ class MiniMaxTTSHandler(BaseHandler[TTSIn, TTSOut]):
             sep = "&" if "?" in ws_url else "?"
             self.connect_url = f"{ws_url}{sep}GroupId={group_id}"
         if not api_key or not voice_id:
-            logger.warning(
-                "MiniMaxTTSHandler: MINIMAX_API_KEY and/or MINIMAX_VOICE_ID is unset — requests will fail"
-            )
+            logger.warning("MiniMaxTTSHandler: MINIMAX_API_KEY and/or MINIMAX_VOICE_ID is unset — requests will fail")
         logger.info(
             "MiniMaxTTSHandler ready → %s (model=%s, voice=%s, pcm@%d Hz)",
-            ws_url, self.model, self.voice_id, SAMPLE_RATE,
+            ws_url,
+            self.model,
+            self.voice_id,
+            SAMPLE_RATE,
         )
 
     def _emit(self, samples: np.ndarray) -> Iterator[np.ndarray]:
@@ -115,23 +117,25 @@ class MiniMaxTTSHandler(BaseHandler[TTSIn, TTSOut]):
 
         ws: WSClient | None = None
         pipeline_start = perf_counter()
-        remainder = b""        # leftover bytes that don't fill a CHUNK
+        remainder = b""  # leftover bytes that don't fill a CHUNK
         first_audio = True
         total = 0
         try:
-            ws = WSClient(self.connect_url, {"Authorization": f"Bearer {self.api_key}"},
-                          timeout=self.timeout)
+            ws = WSClient(self.connect_url, {"Authorization": f"Bearer {self.api_key}"}, timeout=self.timeout)
             ws.recv()  # connected_success
             if DEBUG_MODE:
                 logger.info("MiniMaxTTS: stream opened (gen=%s, model=%s)", gen, self.model)
 
-            ws.send_text(json.dumps({
-                "event": "task_start",
-                "model": self.model,
-                "voice_setting": {"voice_id": self.voice_id, "speed": self.speed,
-                                  "vol": 1.0, "pitch": 0},
-                "audio_setting": {"sample_rate": SAMPLE_RATE, "format": "pcm", "channel": 1},
-            }))
+            ws.send_text(
+                json.dumps(
+                    {
+                        "event": "task_start",
+                        "model": self.model,
+                        "voice_setting": {"voice_id": self.voice_id, "speed": self.speed, "vol": 1.0, "pitch": 0},
+                        "audio_setting": {"sample_rate": SAMPLE_RATE, "format": "pcm", "channel": 1},
+                    }
+                )
+            )
             kind, msg = ws.recv()  # task_started (or error)
             ev = json.loads(msg)
             if ev.get("event") == "task_failed" or ev.get("base_resp", {}).get("status_code") not in (0, None):
@@ -147,7 +151,9 @@ class MiniMaxTTSHandler(BaseHandler[TTSIn, TTSOut]):
                         logger.info(
                             "MiniMaxTTS: ABORT on is_stale (captured gen=%s, current scope_gen=%s) "
                             "after %d bytes — barge-in, closing WS",
-                            gen, self.cancel_scope.generation, total,
+                            gen,
+                            self.cancel_scope.generation,
+                            total,
                         )
                     return
 
@@ -160,8 +166,10 @@ class MiniMaxTTSHandler(BaseHandler[TTSIn, TTSOut]):
                     total += len(chunk)
                     if first_audio:
                         if DEBUG_MODE:
-                            logger.info("MiniMaxTTS: time-to-first-byte %.3fs (first audio chunk)",
-                                        perf_counter() - pipeline_start)
+                            logger.info(
+                                "MiniMaxTTS: time-to-first-byte %.3fs (first audio chunk)",
+                                perf_counter() - pipeline_start,
+                            )
                         first_audio = False
                     buf = remainder + chunk
                     usable = (len(buf) // CHUNK_BYTES) * CHUNK_BYTES
@@ -174,14 +182,18 @@ class MiniMaxTTSHandler(BaseHandler[TTSIn, TTSOut]):
 
             # Flush any trailing partial chunk (zero-padded for alignment).
             if remainder:
-                tail = np.frombuffer(remainder, dtype=np.int16) if len(remainder) % BYTES_PER_SAMPLE == 0 \
+                tail = (
+                    np.frombuffer(remainder, dtype=np.int16)
+                    if len(remainder) % BYTES_PER_SAMPLE == 0
                     else np.frombuffer(remainder[:-1], dtype=np.int16)
+                )
                 if tail.size:
                     yield from self._emit(tail)
 
             if DEBUG_MODE:
-                logger.info("MiniMaxTTS: stream done — %d bytes (%.2fs audio)",
-                            total, (total / BYTES_PER_SAMPLE) / SAMPLE_RATE)
+                logger.info(
+                    "MiniMaxTTS: stream done — %d bytes (%.2fs audio)", total, (total / BYTES_PER_SAMPLE) / SAMPLE_RATE
+                )
         except Exception as exc:
             logger.error("MiniMaxTTS request failed: %s", exc)
             return

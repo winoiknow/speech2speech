@@ -21,10 +21,14 @@ from openai.types.realtime import (
     ResponseAudioDoneEvent,
     ResponseAudioTranscriptDoneEvent,
     ResponseCancelEvent,
+    ResponseContentPartAddedEvent,
+    ResponseContentPartDoneEvent,
     ResponseCreatedEvent,
     ResponseCreateEvent,
     ResponseDoneEvent,
     ResponseFunctionCallArgumentsDoneEvent,
+    ResponseOutputItemAddedEvent,
+    ResponseOutputItemDoneEvent,
     SessionCreatedEvent,
     SessionUpdatedEvent,
     SessionUpdateEvent,
@@ -82,6 +86,7 @@ ClientEvent = Union[
 
 ServerEvent = Union[
     SessionCreatedEvent,
+    SessionUpdatedEvent,
     RealtimeErrorEvent,
     InputAudioBufferSpeechStartedEvent,
     InputAudioBufferSpeechStoppedEvent,
@@ -90,6 +95,10 @@ ServerEvent = Union[
     ConversationItemInputAudioTranscriptionCompletedEvent,
     ResponseCreatedEvent,
     ResponseDoneEvent,
+    ResponseOutputItemAddedEvent,
+    ResponseOutputItemDoneEvent,
+    ResponseContentPartAddedEvent,
+    ResponseContentPartDoneEvent,
     ResponseAudioDeltaEvent,
     ResponseAudioDoneEvent,
     ResponseAudioTranscriptDoneEvent,
@@ -458,10 +467,15 @@ class RealtimeService:
         one-line follow-up.
         """
         try:
+            assert self.speaker_client is not None  # only scheduled when diarize is enabled
             corr = self.speaker_client.diarize(wav, item_id=item_id, revision=1)
-            logger.info("diarize correction for %s: rev=%d, %d span(s) %s",
-                        item_id, corr.revision, len(corr.segments),
-                        [f"{s.label}:{s.decision}" for s in corr.segments])
+            logger.info(
+                "diarize correction for %s: rev=%d, %d span(s) %s",
+                item_id,
+                corr.revision,
+                len(corr.segments),
+                [f"{s.label}:{s.decision}" for s in corr.segments],
+            )
             if not corr.segments:
                 return  # nothing to correct → don't emit a no-op
             event = TranscriptionCorrectedEvent(
@@ -498,9 +512,7 @@ class RealtimeService:
             data["total_errors"] = self.total_usage.total_errors
         data["total_tokens"] = data["input_tokens"] + data["output_tokens"]
         data["active_sessions"] = len(self._conns)
-        data["per_session"] = {
-            conn_id: st.response_usage.model_dump() for conn_id, st in list(self._conns.items())
-        }
+        data["per_session"] = {conn_id: st.response_usage.model_dump() for conn_id, st in list(self._conns.items())}
         return data
 
     # ── Error ───────────────────────────────────

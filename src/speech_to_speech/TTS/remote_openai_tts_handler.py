@@ -69,7 +69,11 @@ class RemoteOpenAITTSHandler(BaseHandler[TTSIn, TTSOut]):
         self._client = httpx.Client(timeout=self.timeout)
         logger.info(
             "RemoteOpenAITTSHandler ready → %s (voice=%s, model=%s, source_rate=%d→%d Hz)",
-            self.stream_endpoint, self.voice, self.model, self.source_sample_rate, SAMPLE_RATE,
+            self.stream_endpoint,
+            self.voice,
+            self.model,
+            self.source_sample_rate,
+            SAMPLE_RATE,
         )
 
     def process(self, tts_input: TTSIn) -> Iterator[TTSOut]:
@@ -105,12 +109,15 @@ class RemoteOpenAITTSHandler(BaseHandler[TTSIn, TTSOut]):
             # Cap concurrent in-flight TTS streams across all sessions (no-op
             # unless TTS_MAX_CONCURRENCY is set); the slot is held for the whole
             # stream, since the synthesis cost spans the streaming response.
-            with TTS_LIMITER.slot(), self._client.stream(
-                "POST",
-                self.stream_endpoint,
-                headers={**self.headers, "Content-Type": "application/json"},
-                json=payload,
-            ) as response:
+            with (
+                TTS_LIMITER.slot(),
+                self._client.stream(
+                    "POST",
+                    self.stream_endpoint,
+                    headers={**self.headers, "Content-Type": "application/json"},
+                    json=payload,
+                ) as response,
+            ):
                 response.raise_for_status()
                 # Trust the endpoint's declared rate over our configured default. The
                 # winoiknow/openai-f5-tts /stream endpoint resamples to 16 kHz int16 and

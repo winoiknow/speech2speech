@@ -228,9 +228,7 @@ class HandlerFactory:
             import torch
 
             t0 = time.perf_counter()
-            model, _ = torch.hub.load(
-                "snakers4/silero-vad", "silero_vad", trust_repo=True, skip_validation=True
-            )
+            model, _ = torch.hub.load("snakers4/silero-vad", "silero_vad", trust_repo=True, skip_validation=True)
             self._vad_template = model
             logger.info(
                 "Pre-warmed Silero VAD in %.0f ms — per-session connects deepcopy it (~30 ms) "
@@ -366,7 +364,9 @@ class HandlerFactory:
         transcription_notifier = TranscriptionNotifier(
             stop_event,
             queue_in=stt_output_queue,
-            queue_out=text_prompt_queue,
+            # Queue is invariant: the notifier's declared OutT includes STTOut, but
+            # only LLMIn (GenerateResponseRequest) flows onto text_prompt here.
+            queue_out=text_prompt_queue,  # type: ignore[arg-type]
             setup_kwargs={
                 "text_output_queue": text_output_queue,
                 "should_listen": should_listen,

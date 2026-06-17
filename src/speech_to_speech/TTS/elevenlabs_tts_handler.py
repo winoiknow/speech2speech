@@ -25,9 +25,9 @@ from speech_to_speech.pipeline.messages import AUDIO_RESPONSE_DONE, EndOfRespons
 logger = logging.getLogger(__name__)
 console = Console()
 
-SAMPLE_RATE = 16000          # pipeline rate
-BYTES_PER_SAMPLE = 2         # int16
-CHUNK_SAMPLES = 320          # 20 ms @ 16 kHz — small chunks keep outbound pacing smooth
+SAMPLE_RATE = 16000  # pipeline rate
+BYTES_PER_SAMPLE = 2  # int16
+CHUNK_SAMPLES = 320  # 20 ms @ 16 kHz — small chunks keep outbound pacing smooth
 
 
 def _decode_params(output_format: str) -> tuple[int, bool]:

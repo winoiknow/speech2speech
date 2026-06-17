@@ -93,8 +93,11 @@ class RealtimeServer:
         if ping_interval is None:
             logger.info("WebSocket server pings DISABLED (S2S_WS_PING_INTERVAL=0); client/TCP own liveness")
         else:
-            logger.info("WebSocket keepalive: ping every %.0fs, %ss pong timeout",
-                        ping_interval, int(ping_timeout) if ping_timeout else "no")
+            logger.info(
+                "WebSocket keepalive: ping every %.0fs, %ss pong timeout",
+                ping_interval,
+                int(ping_timeout) if ping_timeout else "no",
+            )
         config = uvicorn.Config(
             app,
             host=self.host,

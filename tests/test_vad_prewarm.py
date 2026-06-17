@@ -111,14 +111,13 @@ def test_new_vad_model_failsafe_on_deepcopy_error():
 
 # ── No-bleed property against the real model (skipped if Silero unavailable) ──
 
+
 def _load_silero():
     try:
         import torch
 
         torch.set_grad_enabled(False)
-        model, _ = torch.hub.load(
-            "snakers4/silero-vad", "silero_vad", trust_repo=True, skip_validation=True
-        )
+        model, _ = torch.hub.load("snakers4/silero-vad", "silero_vad", trust_repo=True, skip_validation=True)
         return torch, model
     except Exception:
         return None, None

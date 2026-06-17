@@ -312,7 +312,7 @@ class ResponsesApiModelHandler(BaseHandler[LLMIn, LLMOut]):
                                     type="message", role="assistant", content=content
                                 )
                             )
-                            for chunk in (message.content or []):
+                            for chunk in message.content or []:
                                 if chunk.type == "output_text":
                                     clean_text += remove_unspeechable(chunk.text)
                         else:

@@ -133,7 +133,10 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
                 logger.info(
                     "Semantic end-of-turn ENABLED (Smart Turn v3): pause=%dms, hold_grace=%.0fms, "
                     "max_turn=%.0fs, threshold=%.2f",
-                    turn_min_silence_ms, self.turn_hold_grace_s * 1000, self.turn_max_s, turn_threshold,
+                    turn_min_silence_ms,
+                    self.turn_hold_grace_s * 1000,
+                    self.turn_max_s,
+                    turn_threshold,
                 )
             else:
                 logger.warning("turn_detection=smart_turn requested but model unavailable — using VAD silence timing")
@@ -219,7 +222,7 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
     def process(self, audio_chunk: VADIn) -> Iterator[VADOut]:
         runtime_config = None
         detect_chunk = None  # echo-cancelled audio for the VAD decision (may differ from raw)
-        far_active = False   # agent currently producing audio (echo present) → residual gate
+        far_active = False  # agent currently producing audio (echo present) → residual gate
         if isinstance(audio_chunk, tuple):
             if len(audio_chunk) == 4:
                 # (raw, cleaned, far_active, runtime_config)
@@ -279,8 +282,8 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
 
         # Normal listening mode
         self._log_chunks += 1
-        raw_int16 = np.frombuffer(audio_chunk, dtype=np.int16)        # buffered for STT
-        detect_int16 = np.frombuffer(detect_chunk, dtype=np.int16)    # scored by silero
+        raw_int16 = np.frombuffer(audio_chunk, dtype=np.int16)  # buffered for STT
+        detect_int16 = np.frombuffer(detect_chunk, dtype=np.int16)  # scored by silero
         self._total_samples += len(raw_int16)
         detect_float32 = int2float(detect_int16)
         raw_float32 = int2float(raw_int16)
@@ -426,7 +429,8 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         self._turn_carry = []
         logger.info(
             "Smart Turn: %.0fms silence after 'incomplete' — user done, finalizing held turn (%.1fs)",
-            self.turn_hold_grace_s * 1000, len(array) / self.sample_rate,
+            self.turn_hold_grace_s * 1000,
+            len(array) / self.sample_rate,
         )
         self.iterator.reset_states()
         yield from self._finalize_emit(array)

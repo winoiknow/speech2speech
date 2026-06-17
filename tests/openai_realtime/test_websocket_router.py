@@ -851,8 +851,12 @@ class TestMultiSession:
                     service.response._ensure_response(conn_a)
                     service.response._ensure_response(conn_b)
                     # Each socket independently sees a keepalive during its gap.
-                    assert _recv_until(ws_a, "s2s.keepalive")["response_id"] == service._state(conn_a).current_response_id
-                    assert _recv_until(ws_b, "s2s.keepalive")["response_id"] == service._state(conn_b).current_response_id
+                    assert (
+                        _recv_until(ws_a, "s2s.keepalive")["response_id"] == service._state(conn_a).current_response_id
+                    )
+                    assert (
+                        _recv_until(ws_b, "s2s.keepalive")["response_id"] == service._state(conn_b).current_response_id
+                    )
 
 
 class TestObservability:

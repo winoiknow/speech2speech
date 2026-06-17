@@ -40,8 +40,8 @@ def _pcm_to_wav(pcm_bytes: bytes, sample_rate: int = SAMPLE_RATE) -> bytes:
         riff_size,
         b"WAVE",
         b"fmt ",
-        16,              # PCM fmt chunk size
-        1,               # PCM format
+        16,  # PCM fmt chunk size
+        1,  # PCM format
         num_channels,
         sample_rate,
         byte_rate,
@@ -85,8 +85,12 @@ class RemoteOpenAISTTHandler(BaseHandler[STTIn, STTOut]):
         # the service layer can run the off-hot-path diarize + emit a correction.
         self.diarize_enabled = diarize_enabled
         self._spk_pool = ThreadPoolExecutor(max_workers=1) if speaker_client is not None else None
-        logger.info("RemoteOpenAISTTHandler ready → %s (model=%s, speaker_id=%s)",
-                    self.endpoint, self.model, "on" if speaker_client is not None else "off")
+        logger.info(
+            "RemoteOpenAISTTHandler ready → %s (model=%s, speaker_id=%s)",
+            self.endpoint,
+            self.model,
+            "on" if speaker_client is not None else "off",
+        )
 
     def process(self, vad_audio: STTIn) -> Iterator[STTOut]:
         # The VAD emits the growing buffer in "progressive" mode (for live partials) and
@@ -145,7 +149,9 @@ class RemoteOpenAISTTHandler(BaseHandler[STTIn, STTOut]):
             except Exception:
                 speaker = None
             if speaker is not None:
-                logger.debug("speaker: decision=%s id=%s score=%.3f", speaker.decision, speaker.speaker_id, speaker.score)
+                logger.debug(
+                    "speaker: decision=%s id=%s score=%.3f", speaker.decision, speaker.speaker_id, speaker.score
+                )
 
         console.print(f"[yellow]USER: {pred_text}")
         # Carry the raw turn WAV forward only when diarization is on, so the service

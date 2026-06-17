@@ -436,6 +436,6 @@ ruff check .
 ```
 
 See also: [`README.md`](../README.md) (overview), [`REMOTE_SETUP.md`](../REMOTE_SETUP.md)
-(original remote-mode runbook), [`LATENCY.md`](../LATENCY.md) (latency + multi-session
-capacity testing), [`MULTI_SESSION_PLAN.md`](../MULTI_SESSION_PLAN.md) (design of
+(original remote-mode runbook), [`LATENCY.md`](LATENCY.md) (latency + multi-session
+capacity testing), [`MULTI_SESSION_PLAN.md`](MULTI_SESSION_PLAN.md) (design of
 record), and [`CHANGELOG.md`](../CHANGELOG.md).

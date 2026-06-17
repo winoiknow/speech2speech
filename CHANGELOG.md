@@ -4,7 +4,7 @@ All notable changes to this fork of [huggingface/speech-to-speech](https://githu
 
 ---
 
-## [Unreleased]
+## [0.4.1] — 2026-06-17
 
 ### Changed
 

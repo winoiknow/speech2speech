@@ -21,10 +21,14 @@ from openai.types.realtime import (
     ResponseAudioDoneEvent,
     ResponseAudioTranscriptDoneEvent,
     ResponseCancelEvent,
+    ResponseContentPartAddedEvent,
+    ResponseContentPartDoneEvent,
     ResponseCreatedEvent,
     ResponseCreateEvent,
     ResponseDoneEvent,
     ResponseFunctionCallArgumentsDoneEvent,
+    ResponseOutputItemAddedEvent,
+    ResponseOutputItemDoneEvent,
     SessionCreatedEvent,
     SessionUpdatedEvent,
     SessionUpdateEvent,
@@ -82,6 +86,7 @@ ClientEvent = Union[
 
 ServerEvent = Union[
     SessionCreatedEvent,
+    SessionUpdatedEvent,
     RealtimeErrorEvent,
     InputAudioBufferSpeechStartedEvent,
     InputAudioBufferSpeechStoppedEvent,
@@ -90,6 +95,10 @@ ServerEvent = Union[
     ConversationItemInputAudioTranscriptionCompletedEvent,
     ResponseCreatedEvent,
     ResponseDoneEvent,
+    ResponseOutputItemAddedEvent,
+    ResponseOutputItemDoneEvent,
+    ResponseContentPartAddedEvent,
+    ResponseContentPartDoneEvent,
     ResponseAudioDeltaEvent,
     ResponseAudioDoneEvent,
     ResponseAudioTranscriptDoneEvent,
@@ -458,6 +467,7 @@ class RealtimeService:
         one-line follow-up.
         """
         try:
+            assert self.speaker_client is not None  # only scheduled when diarize is enabled
             corr = self.speaker_client.diarize(wav, item_id=item_id, revision=1)
             logger.info(
                 "diarize correction for %s: rev=%d, %d span(s) %s",

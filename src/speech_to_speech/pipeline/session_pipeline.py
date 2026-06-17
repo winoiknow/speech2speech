@@ -364,7 +364,9 @@ class HandlerFactory:
         transcription_notifier = TranscriptionNotifier(
             stop_event,
             queue_in=stt_output_queue,
-            queue_out=text_prompt_queue,
+            # Queue is invariant: the notifier's declared OutT includes STTOut, but
+            # only LLMIn (GenerateResponseRequest) flows onto text_prompt here.
+            queue_out=text_prompt_queue,  # type: ignore[arg-type]
             setup_kwargs={
                 "text_output_queue": text_output_queue,
                 "should_listen": should_listen,

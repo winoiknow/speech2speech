@@ -160,7 +160,7 @@ class AudioHandler(RealtimeBaseHandler):
                 delta=b64,
                 item_id=item_id,
                 output_index=0,
-                response_id=resp_id,
+                response_id=resp_id or "",
             )
         )
         return events

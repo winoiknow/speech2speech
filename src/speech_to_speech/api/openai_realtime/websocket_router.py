@@ -520,7 +520,7 @@ def create_app(
                         break
 
                     if isinstance(audio_chunk, bytes) and audio_chunk == AUDIO_RESPONSE_DONE:
-                        if dump_pcm is not None and dump_pcm:
+                        if dump_pcm is not None and dump_pcm and TTS_DUMP_DIR is not None:
                             try:
                                 os.makedirs(TTS_DUMP_DIR, exist_ok=True)
                                 path = os.path.join(TTS_DUMP_DIR, f"out_{dump_seq:03d}.wav")
@@ -628,7 +628,7 @@ def create_app(
                     if dump_pcm is not None:
                         for ev in out_events:
                             if getattr(ev, "type", "") == "response.output_audio.delta":
-                                dump_pcm += base64.b64decode(ev.delta)
+                                dump_pcm += base64.b64decode(getattr(ev, "delta", ""))
 
                     # Far-end reference for AEC: the 16 kHz pipeline PCM, fed as it is
                     # sent (≈ when it plays), so the canceller can subtract its echo

@@ -27,7 +27,9 @@ from speech_to_speech.pipeline.messages import (
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 
 # ── VAD stage ─────────────────────────────────────────────────────────
-VADIn: TypeAlias = bytes | tuple[bytes, RuntimeConfig]
+# Plain bytes, (raw, runtime_config), or the AEC 4-tuple (raw, cleaned, far_active,
+# runtime_config) the realtime router puts on the recv queue when AEC is wired.
+VADIn: TypeAlias = bytes | tuple[bytes, RuntimeConfig] | tuple[bytes, bytes, bool, RuntimeConfig]
 VADOut: TypeAlias = VADAudio
 
 # ── STT stage ─────────────────────────────────────────────────────────

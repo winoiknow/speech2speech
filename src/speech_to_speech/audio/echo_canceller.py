@@ -28,6 +28,7 @@ from __future__ import annotations
 import ctypes
 import logging
 import time
+from typing import Any
 
 from speech_to_speech.debug import DEBUG_MODE
 
@@ -80,9 +81,9 @@ class EchoCanceller:
         self._near_buf = bytearray()
         self._far_buf = bytearray()
         self._clean_buf = bytearray()
-        # aec3 handles
-        self._aec3_mod = None
-        self._aec3 = None
+        # aec3 handles (PyO3 native module + Aec3 object, created lazily)
+        self._aec3_mod: Any = None
+        self._aec3: Any = None
         # speex handles
         self._echo = None
         self._pre = None

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import os
+from typing import Any
 
 import numpy as np
 
@@ -41,8 +42,8 @@ class SmartTurnDetector:
         self.model_path = model_path
         self.threshold = float(threshold)
         self.sample_rate = sample_rate
-        self._sess = None
-        self._fe = None
+        self._sess: Any = None  # onnxruntime.InferenceSession (loaded lazily)
+        self._fe: Any = None  # transformers WhisperFeatureExtractor
         self._ok = False
         self._load()
 

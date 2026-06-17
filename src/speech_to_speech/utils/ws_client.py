@@ -32,9 +32,11 @@ class WSClient:
         if u.scheme == "wss":
             s = ssl.create_default_context().wrap_socket(s, server_hostname=host)
         key = base64.b64encode(secrets.token_bytes(16)).decode()
-        req = (f"GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n"
-               f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
-               f"Sec-WebSocket-Version: 13\r\n")
+        req = (
+            f"GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n"
+            f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n"
+        )
         for k, v in (headers or {}).items():
             req += f"{k}: {v}\r\n"
         s.sendall((req + "\r\n").encode())

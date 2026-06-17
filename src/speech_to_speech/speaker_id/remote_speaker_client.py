@@ -25,8 +25,7 @@ _VALID = {"known", "unknown", "ambiguous"}
 
 
 class RemoteSpeakerClient:
-    def __init__(self, base_url: str, api_key: str = "", timeout: float = 0.8,
-                 diarize_timeout: float = 5.0) -> None:
+    def __init__(self, base_url: str, api_key: str = "", timeout: float = 0.8, diarize_timeout: float = 5.0) -> None:
         base = base_url.rstrip("/")
         self.endpoint = base + "/v1/identify"
         self.diarize_endpoint = base + "/v1/diarize"
@@ -45,8 +44,12 @@ class RemoteSpeakerClient:
         self._identify_failing = False
         self._consecutive_failures = 0
         self._last_fail_warn = 0.0
-        logger.info("RemoteSpeakerClient ready → %s (timeout=%.2fs, diarize_timeout=%.2fs)",
-                    self.endpoint, timeout, diarize_timeout)
+        logger.info(
+            "RemoteSpeakerClient ready → %s (timeout=%.2fs, diarize_timeout=%.2fs)",
+            self.endpoint,
+            timeout,
+            diarize_timeout,
+        )
 
     _FAIL_WARN_INTERVAL_S = 30.0
     # Consecutive identify failures before we warn — keeps a one-off slow/timed-out
@@ -63,7 +66,10 @@ class RemoteSpeakerClient:
                 "speaker identify is failing → all turns labeled 'unknown' "
                 "(%d consecutive failures). Endpoint %s unreachable/erroring: %s: %s. "
                 "(SPEAKER_ID_ENABLED is on; check the speaker-id service and SPEAKER_ID_BASE_URL reachability.)",
-                self._consecutive_failures, self.endpoint, type(exc).__name__, exc,
+                self._consecutive_failures,
+                self.endpoint,
+                type(exc).__name__,
+                exc,
             )
             self._last_fail_warn = now
             self._identify_failing = True
@@ -77,8 +83,7 @@ class RemoteSpeakerClient:
     def identify(self, wav_bytes: bytes) -> SpeakerLabel:
         try:
             headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
-            r = self._client.post(self.endpoint, headers=headers,
-                                  files={"file": ("seg.wav", wav_bytes, "audio/wav")})
+            r = self._client.post(self.endpoint, headers=headers, files={"file": ("seg.wav", wav_bytes, "audio/wav")})
             r.raise_for_status()
             d = r.json()
             decision = d.get("decision", "unknown")
@@ -107,8 +112,9 @@ class RemoteSpeakerClient:
         """
         try:
             headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
-            r = self._diar_client.post(self.diarize_endpoint, headers=headers,
-                                       files={"file": ("turn.wav", wav_bytes, "audio/wav")})
+            r = self._diar_client.post(
+                self.diarize_endpoint, headers=headers, files={"file": ("turn.wav", wav_bytes, "audio/wav")}
+            )
             r.raise_for_status()
             d = r.json()
             segments = []
@@ -116,16 +122,18 @@ class RemoteSpeakerClient:
                 decision = s.get("decision", "unknown")
                 if decision not in _VALID:
                     decision = "unknown"
-                segments.append(SpeakerSpan(
-                    start=float(s.get("start", 0.0) or 0.0),
-                    end=float(s.get("end", 0.0) or 0.0),
-                    decision=decision,
-                    speaker_id=s.get("speaker_id"),
-                    name=s.get("name"),
-                    label=s.get("label", "") or "",
-                    score=float(s.get("score", 0.0) or 0.0),
-                    runner_up_score=float(s.get("runner_up_score", 0.0) or 0.0),
-                ))
+                segments.append(
+                    SpeakerSpan(
+                        start=float(s.get("start", 0.0) or 0.0),
+                        end=float(s.get("end", 0.0) or 0.0),
+                        decision=decision,
+                        speaker_id=s.get("speaker_id"),
+                        name=s.get("name"),
+                        label=s.get("label", "") or "",
+                        score=float(s.get("score", 0.0) or 0.0),
+                        runner_up_score=float(s.get("runner_up_score", 0.0) or 0.0),
+                    )
+                )
             return SpeakerCorrection(item_id=item_id, revision=revision, segments=segments)
         except Exception as e:  # timeout, connect error, bad json, anything → empty
             logger.debug("speaker diarize failed (%s) → no correction", e)

@@ -66,8 +66,9 @@ class TranscriptionNotifier(BaseHandler[STTOut, Union[STTOut, LLMIn]]):
         # speaker-id is off, speaker is None and label_format "" → no-op.
         prefix = ""
         if raw and speaker is not None and speaker.decision == "known" and self.label_format:
-            prefix = self.label_format.format(name=(speaker.name or speaker.speaker_id or ""),
-                                              speaker_id=(speaker.speaker_id or ""))
+            prefix = self.label_format.format(
+                name=(speaker.name or speaker.speaker_id or ""), speaker_id=(speaker.speaker_id or "")
+            )
         transcript = prefix + raw
 
         # Always close the client-visible transcription item. Empty final STT
@@ -75,12 +76,14 @@ class TranscriptionNotifier(BaseHandler[STTOut, Union[STTOut, LLMIn]]):
         # received partial deltas and still need a completed event. The structured
         # label travels even when no inline prefix is applied.
         if self.text_output_queue is not None:
-            self.text_output_queue.put(TranscriptionCompletedEvent(
-                transcript=transcript,
-                language_code=language_code,
-                speaker=(speaker.model_dump() if speaker is not None else None),
-                audio_wav=audio_wav,  # forwarded to the service for off-hot-path diarize
-            ))
+            self.text_output_queue.put(
+                TranscriptionCompletedEvent(
+                    transcript=transcript,
+                    language_code=language_code,
+                    speaker=(speaker.model_dump() if speaker is not None else None),
+                    audio_wav=audio_wav,  # forwarded to the service for off-hot-path diarize
+                )
+            )
 
         if not raw:
             logger.debug("Transcription completed with empty transcript")

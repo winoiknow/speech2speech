@@ -121,9 +121,7 @@ def _shutdown_pipeline_async(session_id: str, pipeline: "SessionPipeline") -> th
     Returns the worker so callers (server shutdown) can join it if they want to
     wait. The handler threads are daemonised too, so nothing can wedge exit.
     """
-    worker = threading.Thread(
-        target=pipeline.shutdown, name=f"shutdown-{session_id[:8]}", daemon=True
-    )
+    worker = threading.Thread(target=pipeline.shutdown, name=f"shutdown-{session_id[:8]}", daemon=True)
     worker.start()
     return worker
 
@@ -280,9 +278,7 @@ def create_app(
         # admit under simultaneous connects. register()→this check has no await
         # between them, so the count is race-free.
         if len(service.connection_ids) > max_sessions:
-            logger.warning(
-                "Rejected connection: at session capacity (%d/%d)", max_sessions, max_sessions
-            )
+            logger.warning("Rejected connection: at session capacity (%d/%d)", max_sessions, max_sessions)
             service.unregister(session_id)
             await _send_event(
                 ws,
@@ -354,9 +350,7 @@ def create_app(
                         # the agent is silent, residual gate while it's speaking).
                         # Payload: (raw, cleaned, far_active, runtime_config).
                         cleaned = pipeline.echo_canceller.process(chunk)
-                        pipeline.recv_audio.put(
-                            (bytes(chunk), cleaned, pipeline.echo_canceller.far_active, rt_cfg)
-                        )
+                        pipeline.recv_audio.put((bytes(chunk), cleaned, pipeline.echo_canceller.far_active, rt_cfg))
 
                 elif isinstance(event, InputAudioBufferCommitEvent):
                     err = service.handle_audio_commit(session_id)
@@ -537,7 +531,10 @@ def create_app(
                                     w.writeframes(bytes(dump_pcm))
                                 logger.info(
                                     "Wrote outbound audio dump %s (%d bytes, %.2fs @ %d Hz)",
-                                    path, len(dump_pcm), len(dump_pcm) / 2 / TTS_DUMP_RATE, TTS_DUMP_RATE,
+                                    path,
+                                    len(dump_pcm),
+                                    len(dump_pcm) / 2 / TTS_DUMP_RATE,
+                                    TTS_DUMP_RATE,
                                 )
                             except Exception as e:
                                 logger.error("TTS dump failed: %s", e)
@@ -674,7 +671,8 @@ def create_app(
                     if dead:
                         logger.error(
                             "Session %s: handler thread(s) exited unexpectedly (%s) — failing session",
-                            sid, ", ".join(dead),
+                            sid,
+                            ", ".join(dead),
                         )
                         try:
                             await _send_event(

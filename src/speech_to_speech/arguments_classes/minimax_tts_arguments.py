@@ -41,7 +41,9 @@ class MiniMaxTTSHandlerArguments:
     )
     tts_minimax_group_id: str = field(
         default_factory=lambda: os.environ.get("MINIMAX_GROUP_ID", ""),
-        metadata={"help": "Optional GroupId (appended as ?GroupId=…) if your account requires it. Env: MINIMAX_GROUP_ID."},
+        metadata={
+            "help": "Optional GroupId (appended as ?GroupId=…) if your account requires it. Env: MINIMAX_GROUP_ID."
+        },
     )
     tts_minimax_speed: float = field(
         default_factory=lambda: float(os.environ.get("MINIMAX_SPEED", "1.0")),

@@ -64,8 +64,9 @@ _SPEEX = _load_speex()
 
 
 class EchoCanceller:
-    def __init__(self, sample_rate: int = 16000, filter_length_ms: int = 250,
-                 enabled: bool = True, backend: str = "aec3") -> None:
+    def __init__(
+        self, sample_rate: int = 16000, filter_length_ms: int = 250, enabled: bool = True, backend: str = "aec3"
+    ) -> None:
         self.sample_rate = sample_rate
         self.backend = (backend or "aec3").strip().lower()
         self.enabled = bool(enabled)
@@ -106,8 +107,9 @@ class EchoCanceller:
     def _init_aec3(self) -> None:
         try:
             import aec3_py  # the PyO3 wheel
+
             self._aec3_mod = aec3_py
-            self.frame = self.sample_rate // 100   # 10 ms frame; confirmed on create
+            self.frame = self.sample_rate // 100  # 10 ms frame; confirmed on create
             self._fb = self.frame * BYTES_PER_SAMPLE
             logger.info("EchoCanceller backend=aec3 (WebRTC AEC3, pure-Rust) — lazy init on first frame")
         except Exception as e:
@@ -148,10 +150,13 @@ class EchoCanceller:
             _SPEEX.speex_echo_ctl(self._echo, SPEEX_ECHO_SET_SAMPLING_RATE, ctypes.byref(rate))
             self._pre = _SPEEX.speex_preprocess_state_init(self.frame, self.sample_rate)
             if self._pre:
-                _SPEEX.speex_preprocess_ctl(self._pre, SPEEX_PREPROCESS_SET_ECHO_STATE,
-                                            ctypes.c_void_p(self._echo))
-            logger.info("EchoCanceller backend=speex (libspeexdsp/ctypes; filter=%d/%d ms, residual=%s)",
-                        self.filter_length, int(self.filter_length / self.sample_rate * 1000), bool(self._pre))
+                _SPEEX.speex_preprocess_ctl(self._pre, SPEEX_PREPROCESS_SET_ECHO_STATE, ctypes.c_void_p(self._echo))
+            logger.info(
+                "EchoCanceller backend=speex (libspeexdsp/ctypes; filter=%d/%d ms, residual=%s)",
+                self.filter_length,
+                int(self.filter_length / self.sample_rate * 1000),
+                bool(self._pre),
+            )
         except Exception as e:
             logger.error("AEC speex init failed (%s) — passing through", e)
             self.enabled = False
@@ -207,11 +212,11 @@ class EchoCanceller:
         # clock. The far-end leads the acoustic echo by the (bounded, ~constant)
         # playback+network delay, which AEC3's delay estimator aligns internally.
         while len(self._near_buf) >= self._fb:
-            nframe = bytes(self._near_buf[:self._fb])
-            del self._near_buf[:self._fb]
+            nframe = bytes(self._near_buf[: self._fb])
+            del self._near_buf[: self._fb]
             if len(self._far_buf) >= self._fb:
-                rframe = bytes(self._far_buf[:self._fb])
-                del self._far_buf[:self._fb]
+                rframe = bytes(self._far_buf[: self._fb])
+                del self._far_buf[: self._fb]
                 if DEBUG_MODE:
                     self._dbg_far += 1
             else:
@@ -301,15 +306,17 @@ class EchoCanceller:
         if now - self._dbg_t < 1.0:
             return
         import numpy as np
+
         nin = np.frombuffer(near_b, dtype=np.int16).astype(np.float64)
         m = (len(out_b) // 2) * 2
         nout = np.frombuffer(out_b[:m], dtype=np.int16).astype(np.float64)
-        rin = float(np.sqrt(np.mean(nin ** 2))) if nin.size else 0.0
-        rout = float(np.sqrt(np.mean(nout ** 2))) if nout.size else 0.0
+        rin = float(np.sqrt(np.mean(nin**2))) if nin.size else 0.0
+        rout = float(np.sqrt(np.mean(nout**2))) if nout.size else 0.0
         red = 20.0 * np.log10(rin / rout) if (rin > 1 and rout > 1) else 0.0
         far_pct = 100.0 * self._dbg_far / max(1, self._dbg_tot)
-        logger.info("AEC[%s]: in_rms=%.0f out_rms=%.0f reduction=%.1f dB | far=%.0f%%",
-                    self.backend, rin, rout, red, far_pct)
+        logger.info(
+            "AEC[%s]: in_rms=%.0f out_rms=%.0f reduction=%.1f dB | far=%.0f%%", self.backend, rin, rout, red, far_pct
+        )
         self._dbg_t = now
         self._dbg_far = 0
         self._dbg_tot = 0

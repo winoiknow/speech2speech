@@ -29,8 +29,7 @@ class ElevenLabsTTSHandlerArguments:
     tts_elevenlabs_model_id: str = field(
         default_factory=lambda: os.environ.get("ELEVENLABS_MODEL_ID", "eleven_flash_v2_5"),
         metadata={
-            "help": "ElevenLabs model id. Default 'eleven_flash_v2_5' (lowest latency). "
-            "Env: ELEVENLABS_MODEL_ID."
+            "help": "ElevenLabs model id. Default 'eleven_flash_v2_5' (lowest latency). Env: ELEVENLABS_MODEL_ID."
         },
     )
     tts_elevenlabs_output_format: str = field(

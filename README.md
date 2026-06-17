@@ -232,7 +232,6 @@ Dockerfile               CPU-only image (no CUDA, no model weights)
 docker-compose.yml       the deployment (s2s-remote + optional speaker-id profile)
 docs/INSTALL_AND_CONFIGURATION.md   full setup + config guide
 REMOTE_SETUP.md          original remote-mode runbook
-LATENCY.md               latency + multi-session capacity
 CHANGELOG.md             change history
 ```
 

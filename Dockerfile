@@ -1,16 +1,97 @@
-FROM pytorch/pytorch:2.4.0-cuda12.1-cudnn9-devel
+# Copyright 2026 winoiknow (Eric Alborn, Anteon Group)
+# Licensed under the Apache License, Version 2.0 (the "License").
+# See the LICENSE file in the repository root for the full license text.
 
-ENV PYTHONUNBUFFERED 1
-ENV PATH="/usr/src/app/.venv/bin:${PATH}"
+# CPU-only image for the remote-only realtime build.
+# No CUDA and no local STT/TTS/LLM model packages (parakeet/qwen3/mlx/kokoro/…).
+# transformers is kept (Smart Turn's WhisperFeatureExtractor + HfArgumentParser);
+# all STT/TTS/LLM inference is delegated to external HTTP services.
 
-WORKDIR /usr/src/app
+# ── Stage 1: build the WebRTC AEC3 wheel (pure-Rust crate `aec3`, via PyO3/maturin) ──
+# Produces a portable abi3 wheel so this (newer-Python) builder and the 3.11 runtime
+# below don't have to match. Pure Rust → no C++/meson, just cargo.
+FROM rust:slim AS aec3builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-dev python3-pip \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --break-system-packages maturin
+COPY rust/aec3_py /build/aec3_py
+RUN cd /build/aec3_py && maturin build --release --out /wheels
 
-# Install packages
-RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
-RUN pip install --no-cache-dir uv
+# ── Stage 2: lean CPU runtime ──
+FROM python:3.11-slim
 
-COPY pyproject.toml ./
-RUN uv sync --no-install-project --no-dev
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
 
-COPY . .
-RUN uv sync --no-dev
+WORKDIR /app
+
+# Runtime system deps: libsndfile for soundfile, git for silero-vad torch.hub load
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libsndfile1 \
+        libspeexdsp-dev \
+        git \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Install a CPU-only torch first so the later package installs don't pull CUDA ──
+# Using the PyTorch CPU index avoids downloading the GPU wheel (~2 GB).
+RUN pip install --index-url https://download.pytorch.org/whl/cpu \
+        torch==2.4.0 \
+        torchaudio==2.4.0
+
+# ── Install the runtime deps (CPU torch already installed above) ──
+# These mirror pyproject's dependency list; we install them explicitly so the
+# `pip install --no-deps -e .` below adds only the package itself and never pulls
+# a CUDA torch wheel over the CPU build.
+RUN pip install \
+        "fastapi>=0.115.0" \
+        "httpx>=0.28.0" \
+        "nltk==3.9.4" \
+        "numpy>=1.26.0" \
+        "openai==2.28.0" \
+        "pydantic>=2.0" \
+        "rich>=13.0" \
+        "scipy>=1.10.0" \
+        "transformers>=4.57.0" \
+        "uvicorn>=0.30.0" \
+        "websockets>=12.0" \
+        "onnxruntime>=1.17.0"
+
+# ── Smart Turn v3 semantic end-of-turn model (TURN_DETECTION=smart_turn) ───────
+# Pipecat Smart Turn v3 (BSD-2): Whisper-tiny encoder + linear head, int8 ONNX,
+# ~12 ms CPU inference. Baked in so the container starts offline. Mel features
+# come from transformers' WhisperFeatureExtractor (already installed above).
+RUN mkdir -p /app/models && \
+    curl -fsSL -o /app/models/smart-turn-v3.2-cpu.onnx \
+        https://huggingface.co/pipecat-ai/smart-turn-v3/resolve/main/smart-turn-v3.2-cpu.onnx
+
+# ── AEC backends (AEC_ENABLED=1) ──────────────────────────────────────────────
+# aec3 (default): WebRTC AEC3 via the abi3 wheel built in stage 1.
+# speex (fallback): libspeexdsp (apt above) via ctypes.
+COPY --from=aec3builder /wheels/*.whl /tmp/
+RUN pip install /tmp/*.whl && rm -f /tmp/*.whl
+
+# ── Copy source and install in no-deps mode (all deps already installed above) ──
+COPY . /app
+
+RUN pip install --no-deps -e .
+
+# ── Download NLTK punkt_tab tokenizer (needed for sentence splitting) ──
+RUN python -c "import nltk; nltk.download('punkt_tab'); nltk.download('averaged_perceptron_tagger_eng')"
+
+# ── Pre-populate the silero-vad model cache ──
+# silero-vad is fetched via torch.hub on first VAD run; cache it at build time
+# so the container starts instantly without an outbound request.
+RUN python -c "import torch; torch.hub.load('snakers4/silero-vad', 'silero_vad', trust_repo=True, skip_validation=True)"
+
+EXPOSE 8765
+
+ENTRYPOINT ["python", "-m", "speech_to_speech.s2s_pipeline"]
+CMD [ \
+    "--mode", "realtime", \
+    "--stt", "openai-remote", \
+    "--tts", "openai-remote", \
+    "--llm_backend", "responses-api" \
+]

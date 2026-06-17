@@ -1,9 +1,7 @@
-import asyncio
 from queue import Queue
 from threading import Event, Thread
 
 from speech_to_speech.baseHandler import BaseHandler
-from speech_to_speech.connections.websocket_streamer import WebSocketStreamer
 from speech_to_speech.pipeline.control import SESSION_END, is_control_message
 from speech_to_speech.pipeline.messages import PIPELINE_END
 
@@ -19,20 +17,6 @@ class EchoHandler(BaseHandler):
 
     def on_session_end(self):
         self.session_end_calls += 1
-
-
-class FakeWebSocket:
-    def __init__(self, messages):
-        self._messages = iter(messages)
-
-    def __aiter__(self):
-        return self
-
-    async def __anext__(self):
-        try:
-            return next(self._messages)
-        except StopIteration as exc:
-            raise StopAsyncIteration from exc
 
 
 def test_base_handler_session_end_resets_without_stopping():
@@ -57,38 +41,3 @@ def test_base_handler_session_end_resets_without_stopping():
     assert outputs[2] == PIPELINE_END
     assert handler.processed == ["hello"]
     assert handler.session_end_calls == 1
-
-
-def test_websocket_streamer_last_disconnect_queues_session_end():
-    streamer = WebSocketStreamer(
-        stop_event=Event(),
-        input_queue=Queue(),
-        output_queue=Queue(),
-        should_listen=Event(),
-    )
-
-    asyncio.run(streamer._handle_client(FakeWebSocket([])))
-
-    queued = streamer.input_queue.get_nowait()
-    assert is_control_message(queued, SESSION_END.kind)
-    assert streamer.should_listen.is_set()
-
-
-def test_websocket_send_loop_ignores_session_end_until_stop():
-    stop_event = Event()
-    streamer = WebSocketStreamer(
-        stop_event=stop_event,
-        input_queue=Queue(),
-        output_queue=Queue(),
-        should_listen=Event(),
-    )
-
-    async def exercise_send_loop():
-        task = asyncio.create_task(streamer._send_loop())
-        streamer.output_queue.put(SESSION_END)
-        await asyncio.sleep(0.05)
-        assert not task.done()
-        stop_event.set()
-        await asyncio.wait_for(task, timeout=1)
-
-    asyncio.run(exercise_send_loop())

@@ -8,7 +8,7 @@
 # melting an endpoint, while the default (0 = unlimited) preserves exactly
 # today's single-session behavior. The real capacity knob is still the external
 # service's own concurrency (Whisper batch slots, F5 instances, Hermes workers);
-# see REMOTE_SETUP.md / LATENCY.md before raising these.
+# see REMOTE_SETUP.md / docs/LATENCY.md before raising these.
 
 from __future__ import annotations
 

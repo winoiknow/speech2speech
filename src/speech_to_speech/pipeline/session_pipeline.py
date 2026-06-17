@@ -94,7 +94,7 @@ class SessionPipeline:
     process lifetime (single-session semantics, unchanged). Phase B moves
     construction to WS-connect and teardown to disconnect; the field set here is
     deliberately the per-session unit of isolation called out in
-    MULTI_SESSION_PLAN.md §3.1.
+    docs/MULTI_SESSION_PLAN.md §3.1.
     """
 
     session_id: str

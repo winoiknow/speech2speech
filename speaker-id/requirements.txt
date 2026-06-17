@@ -1,0 +1,19 @@
+# Phase 1 — recognition core. torch/torchaudio are installed CPU-only from the
+# PyTorch CPU index in the Dockerfile (BEFORE this file) so speechbrain doesn't
+# drag in the ~2GB CUDA wheel. For local (non-docker) dev, install CPU torch
+# first: pip install --index-url https://download.pytorch.org/whl/cpu torch torchaudio
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9
+pydantic>=2.0
+numpy>=1.26.0
+soundfile>=0.12.0
+scipy>=1.10.0
+speechbrain>=1.0.0
+# Phase 5 admin access gate: in-app OIDC (authlib) + signed session cookies
+# (itsdangerous via Starlette SessionMiddleware). authlib's async client uses httpx.
+# <2 because the OIDC callback uses a couple of authlib internals (framework
+# state helpers, _format_state_params) to skip id_token signature verification.
+authlib>=1.3,<2
+itsdangerous>=2.1.0
+httpx>=0.27.0

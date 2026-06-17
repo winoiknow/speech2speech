@@ -1,0 +1,9 @@
+# Phase 4 (Tier 2) conference diarization — OPT-IN, heavy. Installed only when the
+# image is built with --build-arg INSTALL_PYANNOTE=1 (see Dockerfile + compose).
+# torch/torchaudio are already CPU-installed in the Dockerfile before this, so
+# pyannote.audio reuses them instead of dragging the CUDA wheel.
+#
+# community-1 (pyannote/speaker-diarization-community-1) needs a recent
+# pyannote.audio; 3.3+ ships the loader for it. The gated weights download at
+# runtime on first use and need HF_TOKEN + accepted gated-access terms.
+pyannote.audio>=3.3.0

@@ -14,7 +14,7 @@ A fork of [huggingface/speech-to-speech](https://github.com/huggingface/speech-t
 ## New in 0.3.0
 
 - **Multi-session** — one process serves up to `S2S_MAX_SESSIONS` concurrent warm connections, each with its own isolated `SessionPipeline`. Defaults to `1` (unchanged single-session behavior); only valid when STT/TTS/LLM are all remote.
-- **Speaker identification & diarization** — optional, concurrent-with-STT `/v1/identify` tagging and off-hot-path conference diarization (both off by default).
+- **Speaker identification & diarization** — optional, concurrent-with-STT `/v1/identify` tagging and off-hot-path conference diarization (both off by default). The speaker-id service is bundled in this repo (`speaker-id/`) and builds from the same compose — see the [Speaker-ID guide](docs/SPEAKER_ID.md).
 - **Acoustic echo cancellation** — WebRTC AEC3 / speex on the input path with far-aware VAD gating, so a full-duplex client can barge in without phantom triggers.
 - **Smart Turn v3 end-of-turn** — optional semantic endpointing (`TURN_DETECTION=smart_turn`) so a mid-thought pause doesn't cut the user off.
 - **Warm-connection friendly** — startup pre-warm (VAD / Smart Turn / LLM), once-per-process LLM warmup, configurable WebSocket keepalive, observability (`/v1/sessions`, `/v1/usage`).
@@ -228,9 +228,11 @@ src/speech_to_speech/
   arguments_classes/     remote handler + module/VAD/speaker-id arg dataclasses
   s2s_pipeline.py        CLI parse + remote handler dispatch + main()
 
+speaker-id/              bundled speaker-id microservice (app/ + Dockerfile), built via the speaker-id profile
 Dockerfile               CPU-only image (no CUDA, no model weights)
-docker-compose.yml       the deployment (s2s-remote + optional speaker-id profile)
+docker-compose.yml       the deployment (s2s-app + optional speaker-id profile)
 docs/INSTALL_AND_CONFIGURATION.md   full setup + config guide
+docs/SPEAKER_ID.md       speaker-id service setup + config
 REMOTE_SETUP.md          original remote-mode runbook
 CHANGELOG.md             change history
 ```

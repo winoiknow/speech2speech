@@ -4,6 +4,7 @@
 
 services:
   s2s-remote:
+    container_name: s2s-app
     build:
       context: .
       dockerfile: Dockerfile
@@ -160,25 +161,67 @@ services:
 
   # ── Adjacent speaker-id service (opt-in) ──────────────────────────────────
   # Owns the embedding model + speaker store + enrollment UI (kept out of the lean
-  # s2s-remote image). Opt-in so the default `docker compose up` is unchanged:
-  #   docker compose --profile speaker-id up   (then set SPEAKER_ID_ENABLED=1)
-  # Source repo (sibling layout): ~/workspace/diarization/speaker-id. Override the
-  # build context with SPEAKER_ID_BUILD_CONTEXT if your checkout differs. It also
-  # runs standalone from its own compose; if you do that, just point
-  # SPEAKER_ID_BASE_URL at it and skip this service.
+  # s2s-app image). The source is vendored in this repo under ./speaker-id, so it
+  # builds and runs from this same compose — no sibling checkout needed. Opt-in so
+  # the default `docker compose up` is unchanged (the heavy torch/ECAPA build only
+  # runs when you ask for it):
+  #   docker compose --profile speaker-id up --build   (then set SPEAKER_ID_ENABLED=1)
+  # Config reference: docs/SPEAKER_ID.md.
   speaker-id:
     profiles: ["speaker-id"]
+    container_name: speaker-id
     build:
-      context: ${SPEAKER_ID_BUILD_CONTEXT:-../../diarization/speaker-id}
+      context: ./speaker-id
+      args:
+        # Set INSTALL_PYANNOTE=1 to bake the (heavy) pyannote diarizer into the
+        # image. Default 0 keeps it torch-light (stub diarizer only). Build-time:
+        # changing it needs a rebuild (--build), not just `up`.
+        INSTALL_PYANNOTE: ${INSTALL_PYANNOTE:-0}
     ports:
       - "9100:9100"
     environment:
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      # ── Recognition / embedding ──────────────────────────────────────
+      # ECAPA-TDNN (non-gated, baked into the image). Set EMBEDDING_MODEL=stub
+      # for a torch-free run.
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-speechbrain/spkrec-ecapa-voxceleb}
+      EMBEDDING_DEVICE: ${EMBEDDING_DEVICE:-cpu}
       STORE_BACKEND: ${STORE_BACKEND:-sqlite}
       STORE_PATH: ${STORE_PATH:-/data/speakers.db}
+      # Cosine cutoff for "known" — calibrate per model+channel (docs/SPEAKER_ID.md).
       SIMILARITY_THRESHOLD: ${SIMILARITY_THRESHOLD:-0.65}
       AMBIGUOUS_MARGIN: ${AMBIGUOUS_MARGIN:-0.08}
+      MIN_SAMPLE_SECONDS: ${MIN_SAMPLE_SECONDS:-2.0}
+      # ── Diarization (Phase 4, Tier 2 — off the s2s hot path) ──────────
+      # "stub" = torch-free, one span per clip (default). Set to
+      # pyannote/speaker-diarization-community-1 (gated, needs HF_TOKEN +
+      # INSTALL_PYANNOTE=1) to actually split mixed audio into per-speaker spans.
+      DIARIZATION_MODEL: ${DIARIZATION_MODEL:-stub}
+      DIARIZATION_DEVICE: ${DIARIZATION_DEVICE:-cpu}
+      MIN_SEGMENT_SECONDS: ${MIN_SEGMENT_SECONDS:-0.4}
+      MAX_DIARIZE_SEGMENTS: ${MAX_DIARIZE_SEGMENTS:-64}
+      HF_TOKEN: ${HF_TOKEN:-}        # only for a gated model (pyannote)
+      HF_HOME: ${HF_HOME:-/data/hf}  # cache gated weights in the volume
+      # ── Admin gate (Phase 5) — UNAUTHENTICATED unless one of these is set ──
+      LOCAL_ADMIN_TOKEN: ${LOCAL_ADMIN_TOKEN:-}
+      SESSION_SECRET: ${SESSION_SECRET:-}
+      OIDC_ENABLED: ${OIDC_ENABLED:-0}
+      OIDC_DISCOVERY_URL: ${OIDC_DISCOVERY_URL:-}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-}
+      OIDC_ALLOWED_EMAILS: ${OIDC_ALLOWED_EMAILS:-}
+      OIDC_ALLOWED_DOMAIN: ${OIDC_ALLOWED_DOMAIN:-}
+      # Data-plane key; match s2s SPEAKER_ID_API_KEY. Empty = open.
+      SERVICE_API_KEY: ${SERVICE_API_KEY:-}
+      # ── Email-invite self-enrollment (Phase 5B) ──────────────────────
+      INVITE_TTL_HOURS: ${INVITE_TTL_HOURS:-72}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}   # external URL for the invite link
+      SMTP_HOST: ${SMTP_HOST:-}               # unset → invite email is logged, not sent
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-speaker-id@localhost}
+      SMTP_STARTTLS: ${SMTP_STARTTLS:-1}
     volumes:
       - speaker_data:/data
     restart: unless-stopped

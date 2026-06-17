@@ -4,3 +4,6 @@ Dockerfile
 docker-compose.yml
 .dockerignore
 .gitignore
+# Vendored speaker-id service builds from its own context (./speaker-id) — keep it
+# out of the lean s2s-app image build context.
+speaker-id

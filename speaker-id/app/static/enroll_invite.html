@@ -1,0 +1,229 @@
+<!doctype html>
+<!-- speaker-id SCOPED self-enrollment (Phase 5B). Reached via a one-time-window
+     invite link (/enroll/invite?token=...). The token is the only auth — no login.
+     Shows ONLY the invitee's own speaker: consent, record/upload, test. No list of
+     other speakers, no delete, no admin controls. Records via Web Audio
+     (Float32 -> 16-bit WAV); the server resamples to 16 kHz before embedding. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Voice enrollment</title>
+<style>
+  :root { --bg:#0f1115; --card:#1a1d24; --fg:#e6e8ec; --mut:#9aa3b2; --acc:#4f8cff; --ok:#3ecf8e; --bad:#ff6b6b; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 system-ui,sans-serif; }
+  .wrap { max-width:680px; margin:0 auto; padding:24px 18px 80px; }
+  h1 { font-size:22px; margin:0 0 4px; } h2 { font-size:16px; margin:0 0 14px; color:var(--acc); }
+  .sub { color:var(--mut); margin:0 0 22px; }
+  section { background:var(--card); border:1px solid #262a33; border-radius:12px; padding:18px; margin:0 0 18px; }
+  button { cursor:pointer; border:0; border-radius:8px; padding:10px 16px; font-weight:600; background:#2a2f3a; color:var(--fg); }
+  button.primary { background:var(--acc); color:#fff; } button.rec { background:var(--bad); color:#fff; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .chk { display:flex; gap:8px; align-items:flex-start; margin:12px 0; color:var(--mut); font-size:13px; }
+  .chk input { margin-top:3px; }
+  .badge { display:inline-block; padding:3px 10px; border-radius:20px; background:#22303f; color:var(--acc); font-size:13px; }
+  .prompt { background:#11141a; border:1px dashed #36506f; border-radius:10px; padding:16px; font-size:18px; min-height:58px; margin:10px 0; }
+  .muted { color:var(--mut); font-size:13px; } .hide { display:none; }
+  ul.tips { color:var(--mut); font-size:13px; margin:6px 0 0; padding-left:18px; }
+  .msg { padding:9px 12px; border-radius:8px; margin:10px 0; font-size:14px; display:none; }
+  .msg.ok { background:#10301f; color:var(--ok); display:block; } .msg.bad { background:#3a1414; color:var(--bad); display:block; }
+  .msg.info { background:#0f2030; color:#8fc7ff; display:block; }
+  .big { font-size:26px; font-weight:700; } .dot { color:var(--mut); }
+  progress { width:100%; height:8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Voice enrollment</h1>
+  <p class="sub" id="hello">Loading your invitation…</p>
+
+  <div id="invalid" class="msg bad hide"></div>
+
+  <div id="app" class="hide">
+    <!-- 1. consent -->
+    <section id="consentSection">
+      <h2>1 · Consent</h2>
+      <p class="muted">Your voice recordings are used to recognize you in this system. They are
+      biometric data; you can ask an administrator to delete them at any time.</p>
+      <label class="chk"><input type="checkbox" id="consent">
+        <span>I consent to my voice being recorded and stored for speaker recognition.</span></label>
+      <button class="primary" id="consentBtn" disabled>Give consent &amp; continue</button>
+    </section>
+
+    <!-- 2. record -->
+    <section id="recSection" style="opacity:.5;pointer-events:none">
+      <h2>2 · Record samples <span id="count" class="muted"></span></h2>
+      <p class="muted">Read the sentence aloud, then stop. ~5–10&nbsp;s each, 3–5 clips.</p>
+      <ul class="tips">
+        <li>Quiet room — no music, TV, or background voices.</li>
+        <li>Only you should be speaking.</li>
+        <li>Speak naturally, mic close (a headset is ideal).</li>
+      </ul>
+      <progress id="prog" value="0" max="3"></progress>
+      <div class="prompt" id="prompt"></div>
+      <div class="row">
+        <button id="recBtn">● Record</button>
+        <span id="timer" class="muted"></span>
+        <button id="newSent">↻ New sentence</button>
+        <label style="margin-left:auto" class="muted">or upload:
+          <input type="file" id="upload" accept="audio/*" multiple></label>
+      </div>
+      <div id="recMsg" class="msg"></div>
+    </section>
+
+    <!-- 3. test -->
+    <section id="testSection" style="opacity:.5;pointer-events:none">
+      <h2>3 · Test my voice</h2>
+      <p class="muted">Record a quick clip to check you're recognized.</p>
+      <div class="row"><button id="testBtn">● Record &amp; test</button><span id="testTimer" class="muted"></span></div>
+      <div id="testResult" class="msg"></div>
+    </section>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const TARGET = 3;
+const token = new URLSearchParams(location.search).get('token') || '';
+const base = `/v1/invite/${encodeURIComponent(token)}`;
+
+const SENTENCES = [
+  "The birch canoe slid on the smooth planks.",
+  "Glue the sheet to the dark blue background.",
+  "It's easy to tell the depth of a well.",
+  "The box was thrown beside the parked truck.",
+  "A rod is used to catch pink salmon.",
+  "The source of the huge river is the clear spring.",
+  "Four hours of steady work faced us.",
+  "Large size in stockings is hard to sell.",
+  "The boy was there when the sun rose.",
+  "Two blue fish swam in the tank.",
+];
+const newSentence = () => $('prompt').textContent = SENTENCES[Math.floor(Math.random()*SENTENCES.length)];
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const body = await r.json().catch(()=>({}));
+  if (!r.ok) throw new Error(body.detail || (r.status+' '+r.statusText));
+  return body;
+}
+
+// ── WAV encode (Float32 → 16-bit PCM WAV) ──────────────────────────────
+function encodeWAV(samples, sr) {
+  const buf = new ArrayBuffer(44 + samples.length*2), v = new DataView(buf);
+  const ws = (o,s)=>{ for (let i=0;i<s.length;i++) v.setUint8(o+i, s.charCodeAt(i)); };
+  ws(0,'RIFF'); v.setUint32(4,36+samples.length*2,true); ws(8,'WAVE'); ws(12,'fmt ');
+  v.setUint32(16,16,true); v.setUint16(20,1,true); v.setUint16(22,1,true); v.setUint32(24,sr,true);
+  v.setUint32(28,sr*2,true); v.setUint16(32,2,true); v.setUint16(34,16,true); ws(36,'data'); v.setUint32(40,samples.length*2,true);
+  let o=44; for (let i=0;i<samples.length;i++){ let s=Math.max(-1,Math.min(1,samples[i])); v.setInt16(o, s<0?s*0x8000:s*0x7FFF, true); o+=2; }
+  return new Blob([buf], {type:'audio/wav'});
+}
+
+// ── Recorder (Web Audio raw PCM) ───────────────────────────────────────
+const Rec = {
+  ctx:null, src:null, proc:null, stream:null, buffers:[], recording:false, sr:0, t0:0, maxMs:15000, _tick:null,
+  async start(onTick, onAuto) {
+    this.stream = await navigator.mediaDevices.getUserMedia({audio:true});
+    this.ctx = new (window.AudioContext||window.webkitAudioContext)();
+    this.sr = this.ctx.sampleRate; this.buffers=[]; this.recording=true; this.t0=Date.now();
+    this.src = this.ctx.createMediaStreamSource(this.stream);
+    this.proc = this.ctx.createScriptProcessor(4096,1,1);
+    this.proc.onaudioprocess = e => { if (this.recording) this.buffers.push(new Float32Array(e.inputBuffer.getChannelData(0))); };
+    this.src.connect(this.proc); this.proc.connect(this.ctx.destination);
+    this._tick = setInterval(()=>{ const s=(Date.now()-this.t0)/1000; onTick(s); if (Date.now()-this.t0>this.maxMs) onAuto(); }, 100);
+  },
+  stop() {
+    this.recording=false; clearInterval(this._tick);
+    try { this.proc.disconnect(); this.src.disconnect(); this.stream.getTracks().forEach(t=>t.stop()); this.ctx.close(); } catch(e){}
+    const len=this.buffers.reduce((a,b)=>a+b.length,0), flat=new Float32Array(len); let o=0;
+    for (const b of this.buffers){ flat.set(b,o); o+=b.length; }
+    return { blob: encodeWAV(flat, this.sr), seconds: len/this.sr };
+  }
+};
+
+async function toggleRec(btn, timerEl, msgEl, onDone) {
+  if (Rec.recording) {
+    btn.classList.remove('rec'); btn.textContent='● Record'; timerEl.textContent='';
+    const { blob, seconds } = Rec.stop(); onDone(blob, seconds); return;
+  }
+  try {
+    await Rec.start(s=>timerEl.textContent=s.toFixed(1)+'s', ()=>toggleRec(btn,timerEl,msgEl,onDone));
+    btn.classList.add('rec'); btn.textContent='■ Stop';
+  } catch (e) {
+    if (msgEl) { msgEl.className='msg bad'; msgEl.textContent='Microphone error: ' + (e && e.message || e) + ' — you can upload a clip instead.'; }
+  }
+}
+
+function unlock(sectionId) { const s=$(sectionId); s.style.opacity=1; s.style.pointerEvents='auto'; }
+function setCount(n) { $('count').textContent = `· ${n}/${TARGET}+ samples`; $('prog').value = Math.min(n, TARGET); }
+
+// ── consent ──
+$('consent').onchange = () => $('consentBtn').disabled = !$('consent').checked;
+$('consentBtn').onclick = async () => {
+  try {
+    const p = await api(`${base}/consent`, {method:'POST'});
+    $('consentSection').style.opacity=.6;
+    unlock('recSection'); unlock('testSection'); setCount(p.samples||0); newSentence();
+  } catch(e){ alert('Could not record consent: '+e.message); }
+};
+
+// ── record / upload ──
+$('recBtn').onclick = () => toggleRec($('recBtn'), $('timer'), $('recMsg'), async (blob, seconds) => {
+  const m = $('recMsg'); m.className='msg info'; m.textContent=`Uploading ${seconds.toFixed(1)}s…`;
+  const fd = new FormData(); fd.append('file', blob, 'sample.wav');
+  try {
+    const r = await api(`${base}/samples`, {method:'POST', body:fd});
+    m.className='msg ok'; m.textContent=`✓ accepted (${r.duration_s}s of speech) — ${r.samples} sample(s)`;
+    setCount(r.samples); newSentence();
+  } catch(e){ m.className='msg bad'; m.textContent='✗ '+e.message; }
+});
+
+$('upload').onchange = async (e) => {
+  const m = $('recMsg');
+  for (const f of e.target.files) {
+    m.className='msg info'; m.textContent=`Uploading ${f.name}…`;
+    const fd = new FormData(); fd.append('file', f, f.name);
+    try { const r = await api(`${base}/samples`, {method:'POST', body:fd});
+      m.className='msg ok'; m.textContent=`✓ ${f.name}: ${r.samples} sample(s)`; setCount(r.samples); }
+    catch(err){ m.className='msg bad'; m.textContent=`✗ ${f.name}: ${err.message}`; }
+  }
+  e.target.value='';
+};
+$('newSent').onclick = newSentence;
+
+// ── test ──
+$('testBtn').onclick = () => toggleRec($('testBtn'), $('testTimer'), $('testResult'), async (blob) => {
+  const m = $('testResult'); m.className='msg info'; m.textContent='Checking…';
+  const fd = new FormData(); fd.append('file', blob, 'test.wav');
+  try {
+    const r = await api(`${base}/test`, {method:'POST', body:fd});
+    m.className = 'msg ' + (r.match ? 'ok' : 'bad');
+    m.innerHTML = `<span class="big">${r.match?'RECOGNIZED':'NOT YET'}</span>
+      <div class="muted">score ${r.score} <span class="dot">·</span> threshold ${r.threshold}${r.match?'':' — add a few more clips'}</div>`;
+  } catch(e){ m.className='msg bad'; m.textContent='✗ '+e.message; }
+});
+
+// ── bootstrap: load the invite, or show why it can't be used ──
+(async () => {
+  if (!token) { $('hello').classList.add('hide'); $('invalid').classList.remove('hide'); $('invalid').textContent='This link is missing its token.'; return; }
+  try {
+    const p = await api(base);
+    const exp = (p.expires||'').replace('T',' ').replace('Z',' UTC');
+    $('hello').innerHTML = `Hi <b>${p.name||'there'}</b> — record a few clean voice samples below. This link is valid until <b>${exp}</b>.`;
+    $('app').classList.remove('hide');
+    if (p.consent) {  // already consented earlier — jump straight to recording
+      $('consent').checked = true; $('consentBtn').disabled = true; $('consentSection').style.opacity=.6;
+      unlock('recSection'); unlock('testSection'); newSentence();
+    }
+    setCount(p.samples||0);
+  } catch(e) {
+    $('hello').classList.add('hide'); $('invalid').classList.remove('hide');
+    $('invalid').textContent = 'This invitation cannot be used: ' + e.message + '. Please ask for a new link.';
+  }
+})();
+</script>
+</body>
+</html>

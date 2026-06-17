@@ -4,6 +4,22 @@ All notable changes to this fork of [huggingface/speech-to-speech](https://githu
 
 ---
 
+## [Unreleased]
+
+### Changed
+
+- **Speaker-id service vendored into the repo.** Its source (`app/` + `Dockerfile`
+  + `requirements*.txt`) now lives under `speaker-id/`, so the `speaker-id` compose
+  profile builds from this repo instead of a sibling checkout
+  (`../../diarization/speaker-id`). No external build context, no
+  `SPEAKER_ID_BUILD_CONTEXT`. The compose `speaker-id` service now carries the full
+  env surface (recognition, diarization, admin/OIDC, email-invite, SMTP) and the
+  `INSTALL_PYANNOTE` build arg, and the containers are named `s2s-app` and
+  `speaker-id`. New self-contained guide: `docs/SPEAKER_ID.md` (linked from the
+  README and the Install & Configuration Guide).
+
+---
+
 ## [0.4.0] — 2026-06-17
 
 Streamlined to a **remote-only realtime** build. Everything that loaded an

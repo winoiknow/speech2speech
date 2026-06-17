@@ -112,12 +112,16 @@ The server listens on `ws://0.0.0.0:8765/v1/realtime`.
 > inside the container (`.env` alone only does `${VAR}` substitution in the compose
 > file).
 
-To run the bundled speaker-id service alongside s2s:
+To run the bundled speaker-id service alongside s2s (its source is vendored in this
+repo under `speaker-id/`, so it builds from this same compose):
 
 ```bash
 docker compose --profile speaker-id up --build
 # then set SPEAKER_ID_ENABLED=1 and SPEAKER_ID_BASE_URL=http://speaker-id:9100
 ```
+
+> Full speaker-id setup, endpoints, enrollment, admin/SSO, invites, diarization and
+> its own config options are in **[SPEAKER_ID.md](SPEAKER_ID.md)**.
 
 ### 3.2 Bare metal / venv
 
@@ -289,8 +293,9 @@ Off by default. When on, s2s fires the speaker-id service's `/v1/identify`
 **concurrently** with transcribe (overlapping round-trips → ~0 added latency,
 reusing the raw user audio) and, on a confident `known` match, prefixes the
 dialogue with a tag. Any timeout/error → `unknown`; the turn never blocks. Run the
-speaker-id service first (its own repo, or `docker compose --profile speaker-id`)
-and enroll a voice.
+speaker-id service first (`docker compose --profile speaker-id up --build`) and
+enroll a voice — see **[SPEAKER_ID.md](SPEAKER_ID.md)** for the service's own
+endpoints, enrollment UI, admin/SSO and config.
 
 | Env var | Default | Description |
 |---|---|---|

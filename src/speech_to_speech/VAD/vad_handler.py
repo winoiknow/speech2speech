@@ -6,7 +6,7 @@ from collections import deque
 from collections.abc import Iterator
 from queue import Queue
 from threading import Event
-from typing import TypeAlias
+from typing import Any, TypeAlias
 
 import numpy as np
 import torch
@@ -64,6 +64,8 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         turn_hold_grace_ms: int = 1200,
         smart_turn_model_path: str = "",
         text_output_queue: Queue[TextEventItem] | None = None,
+        vad_model: Any = None,
+        turn_detector: Any = None,
     ) -> None:
         self.should_listen = should_listen
         self.sample_rate = sample_rate
@@ -80,12 +82,20 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         self.realtime_processing_pause = realtime_processing_pause
         self.text_output_queue = text_output_queue
         self._last_turn_detection: dict | None = None
-        self.model, _ = torch.hub.load(
-            "snakers4/silero-vad",
-            "silero_vad",
-            trust_repo=True,
-            skip_validation=True,
-        )
+        # A pre-warmed Silero model (a per-session deepcopy made by the factory at
+        # connect) lets us skip torch.hub.load on the hot connect path. Each copy
+        # is independent — Silero rebinds its RNN state functionally per call, so
+        # concurrent sessions never bleed through it. Fall back to loading here if
+        # none was supplied (single-build / tests / pre-warm failure).
+        if vad_model is not None:
+            self.model = vad_model
+        else:
+            self.model, _ = torch.hub.load(
+                "snakers4/silero-vad",
+                "silero_vad",
+                trust_repo=True,
+                skip_validation=True,
+            )
         self.iterator = VADIterator(
             self.model,
             threshold=thresh,
@@ -108,9 +118,14 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         self._hold_deadline: float | None = None
         self._turn_carry: list[np.ndarray] = []
         if (turn_detection or "vad").strip().lower() == "smart_turn":
-            from speech_to_speech.VAD.smart_turn import SmartTurnDetector
+            # A shared, pre-warmed detector (loaded once by the factory) avoids the
+            # per-session ONNX load on the connect path. It's stateless — is_complete()
+            # only reads the session/feature-extractor — so all sessions can share one.
+            detector = turn_detector
+            if detector is None:
+                from speech_to_speech.VAD.smart_turn import SmartTurnDetector
 
-            detector = SmartTurnDetector(smart_turn_model_path, threshold=turn_threshold, sample_rate=sample_rate)
+                detector = SmartTurnDetector(smart_turn_model_path, threshold=turn_threshold, sample_rate=sample_rate)
             if detector.available:
                 self.turn_detector = detector
                 # Finalize on a short pause; Smart Turn makes the real end-of-turn call.

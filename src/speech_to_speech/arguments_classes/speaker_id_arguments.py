@@ -3,7 +3,7 @@
 
 """Env-backed config for the speaker-id integration (Phase 3).
 
-All from env (no CLI flags) — constructed directly in build_pipeline, like the
+All from env (no CLI flags) — constructed directly in HandlerFactory, like the
 VAD knobs. Off by default: with SPEAKER_ID_ENABLED unset/false, no client is
 built, no call is made, and the pipeline is byte-for-byte today's.
 """

@@ -1,6 +1,11 @@
 # Multi-Session Design & Implementation Plan
 
-Status: **design of record** for TODO item 2 — drawn up 2026-06-12, not yet built.
+Status: **Phases A–D shipped** on the `multi-session` branch (2026-06-13); each
+landed green on the full suite with `S2S_MAX_SESSIONS=1` preserving exact
+single-session behavior. Phase E (replica scale-out) is deferred until a
+measurement demands it. The §6.3/§6.4 soak + load runs are operator-run on the
+real remote stack — see LATENCY.md §7 for the harness and the (to-be-filled)
+recommended `S2S_MAX_SESSIONS`. Original design drawn up 2026-06-12.
 
 ## Goals
 

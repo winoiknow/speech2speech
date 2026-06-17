@@ -46,9 +46,35 @@ services:
       # Sentences accumulated before the first TTS batch fires. Lower = lower
       # time-to-first-audio. A/B this (1 vs 2 vs 3) for the latency test.
       STREAM_BATCH_SENTENCES: ${STREAM_BATCH_SENTENCES:-3}
+      # The LLM warmup round-trip runs once per process by default (warmed at
+      # startup; per-session builds skip it). Set 1 to warm on every session build
+      # (the old behavior) — only needed if the remote model goes cold between turns.
+      S2S_LLM_WARMUP_PER_SESSION: ${S2S_LLM_WARMUP_PER_SESSION:-0}
 
       # ── Server authentication ──────────────────────────────────────────
       SERVER_API_KEY: ${SERVER_API_KEY:-}
+
+      # ── Multi-session (remote profile only) ────────────────────────────
+      # Concurrent realtime sessions. 1 = today's single-session behavior;
+      # raise after load-testing the shared STT/TTS/LLM endpoints (LATENCY.md §7).
+      # Forced back to 1 if any of STT/TTS/LLM is a local in-process model.
+      S2S_MAX_SESSIONS: ${S2S_MAX_SESSIONS:-1}
+      # Reap a session after this many seconds of no client traffic (0 = never).
+      S2S_IDLE_TIMEOUT_S: ${S2S_IDLE_TIMEOUT_S:-0}
+      # Send-loop dead-thread supervisor check period in seconds (0 = disable).
+      S2S_THREAD_SUPERVISOR_S: ${S2S_THREAD_SUPERVISOR_S:-2}
+      # WebSocket keepalive: server pings idle clients every INTERVAL s and closes
+      # (1011) if no pong within TIMEOUT s. Generous defaults so a warm-connection
+      # client can refresh infrequently and a long tool turn won't trip a false
+      # 1011. Set S2S_WS_PING_INTERVAL=0 to disable server pings (client/TCP own
+      # liveness — pair with a client-side keepalive).
+      S2S_WS_PING_INTERVAL: ${S2S_WS_PING_INTERVAL:-20}
+      S2S_WS_PING_TIMEOUT: ${S2S_WS_PING_TIMEOUT:-60}
+      # Per-service caps on concurrent in-flight requests across all sessions
+      # (0 = unlimited). Tune with the endpoints' own concurrency (LATENCY.md §7.3).
+      STT_MAX_CONCURRENCY: ${STT_MAX_CONCURRENCY:-0}
+      TTS_MAX_CONCURRENCY: ${TTS_MAX_CONCURRENCY:-0}
+      LLM_MAX_CONCURRENCY: ${LLM_MAX_CONCURRENCY:-0}
 
       # ── General ────────────────────────────────────────────────────────
       LOG_LEVEL: ${LOG_LEVEL:-info}

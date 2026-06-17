@@ -207,9 +207,11 @@ class EchoCanceller:
         # clock. The far-end leads the acoustic echo by the (bounded, ~constant)
         # playback+network delay, which AEC3's delay estimator aligns internally.
         while len(self._near_buf) >= self._fb:
-            nframe = bytes(self._near_buf[:self._fb]); del self._near_buf[:self._fb]
+            nframe = bytes(self._near_buf[:self._fb])
+            del self._near_buf[:self._fb]
             if len(self._far_buf) >= self._fb:
-                rframe = bytes(self._far_buf[:self._fb]); del self._far_buf[:self._fb]
+                rframe = bytes(self._far_buf[:self._fb])
+                del self._far_buf[:self._fb]
                 if DEBUG_MODE:
                     self._dbg_far += 1
             else:
@@ -223,7 +225,8 @@ class EchoCanceller:
                 self._dbg_tot += 1
         want = len(near)
         if len(self._clean_buf) >= want:
-            out = bytes(self._clean_buf[:want]); del self._clean_buf[:want]
+            out = bytes(self._clean_buf[:want])
+            del self._clean_buf[:want]
         else:  # startup priming: emit what we have + a little silence to keep lengths matched
             out = bytes(self._clean_buf) + b"\x00" * (want - len(self._clean_buf))
             self._clean_buf.clear()
@@ -239,7 +242,8 @@ class EchoCanceller:
         while off + self._fb <= n:
             rec = near[off : off + self._fb]
             if len(self._far) >= self._fb:
-                play = bytes(self._far[: self._fb]); del self._far[: self._fb]
+                play = bytes(self._far[: self._fb])
+                del self._far[: self._fb]
                 far_frames += 1
             else:
                 play = self._silence
@@ -274,6 +278,22 @@ class EchoCanceller:
         self._near_buf.clear()
         self._far_buf.clear()
         self._clean_buf.clear()
+
+    def close(self) -> None:
+        """Release the aec3 backend's native object on the CALLING thread.
+
+        ``aec3_py.Aec3`` is PyO3-``unsendable`` — it must be dropped on the thread
+        that created and used it (the event loop, where ``process()`` /
+        ``add_far_end`` run). Session teardown hands the pipeline to a worker
+        thread, which would otherwise be the last reference holder and GC the Aec3
+        on the wrong thread → ``RuntimeError: aec3_py::Aec3 is unsendable, but is
+        being dropped on another thread``. Call this from the event-loop thread
+        before teardown so the drop happens here. Idempotent; safe to call when no
+        Aec3 was ever created (AEC disabled / speex backend)."""
+        # Dropping the sole reference frees the Rust object synchronously on this
+        # thread. process() would lazily recreate it, but teardown makes no more
+        # process() calls.
+        self._aec3 = None
 
     # ── diagnostic ──────────────────────────────────────────────────────────
     def _diag(self, near_b: bytes, out_b: bytes) -> None:

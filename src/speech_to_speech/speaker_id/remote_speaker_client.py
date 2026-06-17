@@ -13,6 +13,7 @@ No retries: a retry would risk doubling the hot-path latency budget.
 from __future__ import annotations
 
 import logging
+import time
 
 import httpx
 
@@ -33,8 +34,45 @@ class RemoteSpeakerClient:
         self._client = httpx.Client(timeout=timeout)
         # diarization runs off the hot path → its own, looser timeout.
         self._diar_client = httpx.Client(timeout=diarize_timeout)
+        # identify failures are fail-safe (→ unknown) and otherwise only log at
+        # debug, which makes an unreachable/broken endpoint invisible at info
+        # level. Surface it — but only once it's *sustained*: a single slow
+        # identify (the service occasionally exceeds the hot-path timeout and the
+        # turn is fail-safe-labeled 'unknown', then recovers) must not look like an
+        # outage. Warn only after _FAIL_WARN_AFTER consecutive failures, then at
+        # most every _FAIL_WARN_INTERVAL_S, and log a one-line recovery once it
+        # succeeds again. State is single-writer (STT identify pool is max_workers=1).
+        self._identify_failing = False
+        self._consecutive_failures = 0
+        self._last_fail_warn = 0.0
         logger.info("RemoteSpeakerClient ready → %s (timeout=%.2fs, diarize_timeout=%.2fs)",
                     self.endpoint, timeout, diarize_timeout)
+
+    _FAIL_WARN_INTERVAL_S = 30.0
+    # Consecutive identify failures before we warn — keeps a one-off slow/timed-out
+    # identify (which recovers on the next turn) from logging a scary outage line.
+    _FAIL_WARN_AFTER = 3
+
+    def _note_identify_failure(self, exc: Exception) -> None:
+        self._consecutive_failures += 1
+        now = time.monotonic()
+        sustained = self._consecutive_failures >= self._FAIL_WARN_AFTER
+        due = not self._identify_failing or (now - self._last_fail_warn) >= self._FAIL_WARN_INTERVAL_S
+        if sustained and due:
+            logger.warning(
+                "speaker identify is failing → all turns labeled 'unknown' "
+                "(%d consecutive failures). Endpoint %s unreachable/erroring: %s: %s. "
+                "(SPEAKER_ID_ENABLED is on; check the speaker-id service and SPEAKER_ID_BASE_URL reachability.)",
+                self._consecutive_failures, self.endpoint, type(exc).__name__, exc,
+            )
+            self._last_fail_warn = now
+            self._identify_failing = True
+
+    def _note_identify_success(self) -> None:
+        if self._identify_failing:
+            logger.info("speaker identify recovered → %s reachable again", self.endpoint)
+        self._identify_failing = False
+        self._consecutive_failures = 0
 
     def identify(self, wav_bytes: bytes) -> SpeakerLabel:
         try:
@@ -46,6 +84,7 @@ class RemoteSpeakerClient:
             decision = d.get("decision", "unknown")
             if decision not in _VALID:
                 decision = "unknown"
+            self._note_identify_success()
             return SpeakerLabel(
                 decision=decision,
                 speaker_id=d.get("speaker_id"),
@@ -54,7 +93,9 @@ class RemoteSpeakerClient:
                 runner_up_score=float(d.get("runner_up_score", 0.0) or 0.0),
             )
         except Exception as e:  # timeout, connect error, bad json, anything → unknown
-            logger.debug("speaker identify failed (%s) → unknown", e)
+            # Fail-safe (→ unknown), but make a persistently-failing endpoint
+            # visible at info level instead of only debug — see _note_identify_failure.
+            self._note_identify_failure(e)
             return SpeakerLabel(decision="unknown")
 
     def diarize(self, wav_bytes: bytes, item_id: str, revision: int = 1) -> SpeakerCorrection:

@@ -10,6 +10,93 @@ from openai.types.realtime.realtime_audio_formats import AudioPCM
 
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 from speech_to_speech.api.openai_realtime.service import RealtimeService
+from speech_to_speech.audio.echo_canceller import EchoCanceller
+from speech_to_speech.pipeline.cancel_scope import CancelScope
+from speech_to_speech.pipeline.session_pipeline import SessionPipeline
+from speech_to_speech.utils.thread_manager import ThreadManager
+
+
+class FixedQueueSessionFactory:
+    """Test session factory for ``create_app``.
+
+    ``build_session_pipeline`` returns a :class:`SessionPipeline` that wraps
+    pre-created queues/events (so tests can inject into / inspect them exactly as
+    before the connect-time-build refactor) with **no** real handlers and a no-op
+    thread manager. AEC is disabled (pass-through)."""
+
+    def __init__(
+        self,
+        *,
+        recv_audio: Queue,
+        send_audio: Queue,
+        text_output: Queue,
+        should_listen: ThreadingEvent,
+        response_playing: ThreadingEvent,
+        cancel_scope: CancelScope,
+        text_prompt: Queue | None = None,
+    ) -> None:
+        self.recv_audio = recv_audio
+        self.send_audio = send_audio
+        self.text_output = text_output
+        self.should_listen = should_listen
+        self.response_playing = response_playing
+        self.cancel_scope = cancel_scope
+        self.text_prompt = text_prompt if text_prompt is not None else Queue()
+        self.built: list[SessionPipeline] = []
+
+    def build_session_pipeline(self, session_id: str) -> SessionPipeline:
+        pipeline = SessionPipeline(
+            session_id=session_id,
+            recv_audio=self.recv_audio,
+            spoken_prompt=Queue(),
+            stt_output=Queue(),
+            text_prompt=self.text_prompt,
+            lm_response=Queue(),
+            lm_processed=Queue(),
+            send_audio=self.send_audio,
+            text_output=self.text_output,
+            stop_event=ThreadingEvent(),
+            should_listen=self.should_listen,
+            response_playing=self.response_playing,
+            cancel_scope=self.cancel_scope,
+            echo_canceller=EchoCanceller(sample_rate=16000, enabled=False),
+            handlers=[],
+            threads=ThreadManager([]),
+        )
+        self.built.append(pipeline)
+        return pipeline
+
+
+class IndependentSessionStubFactory:
+    """Multi-session test factory: every ``build_session_pipeline`` call gets its
+    own fresh, independent queues/events/cancel-scope (no real handlers, AEC off).
+    Concurrent sessions therefore share nothing, so tests can prove isolation.
+    ``built`` records pipelines in connect order for inspection."""
+
+    def __init__(self) -> None:
+        self.built: list[SessionPipeline] = []
+
+    def build_session_pipeline(self, session_id: str) -> SessionPipeline:
+        pipeline = SessionPipeline(
+            session_id=session_id,
+            recv_audio=Queue(),
+            spoken_prompt=Queue(),
+            stt_output=Queue(),
+            text_prompt=Queue(),
+            lm_response=Queue(),
+            lm_processed=Queue(),
+            send_audio=Queue(),
+            text_output=Queue(),
+            stop_event=ThreadingEvent(),
+            should_listen=ThreadingEvent(),
+            response_playing=ThreadingEvent(),
+            cancel_scope=CancelScope(),
+            echo_canceller=EchoCanceller(sample_rate=16000, enabled=False),
+            handlers=[],
+            threads=ThreadManager([]),
+        )
+        self.built.append(pipeline)
+        return pipeline
 
 
 def _session_16k() -> RealtimeSessionCreateRequest:

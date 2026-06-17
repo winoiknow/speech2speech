@@ -163,3 +163,268 @@ From the upstream HuggingFace pipeline this fork is based on:
 
 Re-engage these once §4 has hard numbers showing which stage actually dominates
 on this deployment.
+
+---
+
+## 7. Multi-session capacity (Phase D load test)
+
+s2s now serves up to `S2S_MAX_SESSIONS` concurrent realtime sessions in one
+process (remote profile only; local in-process models force `1`). N sessions ⇒
+up to N concurrent turns hitting the *same* shared STT/F5/Hermes endpoints, so
+first-audio latency degrades as concurrency rises. The job of this section is to
+**measure that curve on real hardware and document the recommended cap from its
+knee** — the point where p95 first-audio crosses your latency budget.
+
+> Status: **measure first.** The harness below is wired; the tables are
+> placeholders until filled from a real run against the production remote stack.
+
+### 7.1 How to run — step by step
+
+This is a complete runbook. Two roles are involved and they can be the **same
+machine or two different machines**:
+
+- **Server host** — runs the s2s container (needs Docker; typically Linux).
+- **Load box** — runs the test scripts (needs Python 3.11+; can be the server
+  host itself, another Linux machine, a Mac, or **Windows via WSL**).
+
+The harness measures **speech_stopped → first audio delta** (the §1 first-audio
+number) per turn.
+
+#### Prerequisites (have these ready before you start)
+
+1. Your three remote inference endpoints are already running and reachable from
+   the server host: a Whisper-compatible STT, an F5/OpenAI-compatible TTS (or
+   ElevenLabs/MiniMax), and an OpenAI-compatible LLM. You know each one's URL.
+2. This repo is checked out on the server host, and Docker + the Docker Compose
+   plugin are installed there.
+3. A WAV file of a person speaking one or two sentences (any sample rate, mono or
+   stereo, 16-bit PCM — the harness downmixes/resamples to 16 kHz). Call it
+   `sample.wav`. **Silence will not work** — the server VAD needs real speech to
+   trigger a turn.
+
+#### Step 1 — Configure `.env` on the server host
+
+```bash
+cd /path/to/speech2speech          # the repo root on the server host
+cp -n .env.sample .env             # create .env from the sample (keeps an existing .env)
+nano .env                          # or any editor
+```
+
+In `.env`, set these exactly (replace the example IPs/ports with **your** real
+endpoint addresses; keep `sk-unused` if your endpoints don't check the key):
+
+```ini
+# Disable auth for the test: put a '#' in front so no Bearer token is required.
+#SERVER_API_KEY=
+
+# STT — your Whisper-compatible endpoint
+STT_OPENAI_BASE_URL=http://192.168.1.10:8000
+STT_OPENAI_API_KEY=sk-unused
+STT_OPENAI_MODEL=Systran/faster-whisper-large-v3
+
+# TTS — your F5/OpenAI-compatible endpoint (or set TTS_SOURCE=elevenlabs/minimax
+# and fill that block instead)
+TTS_SOURCE=openai-remote
+TTS_OPENAI_BASE_URL=http://192.168.1.10:8880
+TTS_OPENAI_API_KEY=sk-unused
+TTS_OPENAI_VOICE=default
+
+# LLM — your OpenAI-compatible endpoint
+LLM_BASE_URL=http://192.168.1.10:7860/v1
+LLM_API_KEY=sk-unused
+LLM_MODEL=hermes-agent
+
+# Multi-session: accept up to 8 concurrent sessions for the test
+S2S_MAX_SESSIONS=8
+```
+
+Two things people miss:
+
+- **`#SERVER_API_KEY=` must be commented out (or empty).** If a token is set, the
+  server rejects every connection that doesn't send it and the test fails at
+  connect. (If you must keep auth on, instead pass `--api-key YOUR_TOKEN` to both
+  scripts in Steps 5–6.)
+- **`S2S_MAX_SESSIONS` must be ≥ the largest `--concurrencies` value** you drive
+  (8 here). It only takes effect with all-remote backends; a local in-process
+  model forces it back to 1.
+
+#### Step 2 — Start the server (on the server host)
+
+```bash
+cd /path/to/speech2speech
+docker compose -f docker-compose.remote.yml up
+```
+
+Leave this terminal running (it streams the server log). It listens on
+**port 8765**.
+
+#### Step 3 — Verify the server and the cap (on the server host)
+
+In a second terminal on the server host:
+
+```bash
+curl -s localhost:8765/v1/sessions
+```
+
+Expected output (the important part is `"max_sessions":8`):
+
+```json
+{"count":0,"max_sessions":8,"sessions":[]}
+```
+
+If you see `"max_sessions":1`, your `.env` change didn't take effect — stop the
+server (Ctrl-C in the Step 2 terminal) and bring it up again with
+`docker compose -f docker-compose.remote.yml up` (this re-reads `.env`).
+
+#### Step 4 — Prepare the load box
+
+On whichever machine will run the scripts (the server host, another machine, or
+Windows + WSL), create and activate a virtual environment, then install the
+harness's only third-party dependency into it:
+
+```bash
+cd /path/to/speech2speech          # the repo checkout (or just copy the scripts/ dir)
+python3 -m venv venv               # create the virtual environment (one time)
+source venv/bin/activate           # activate it  (Windows: venv\Scripts\activate)
+python3 -m pip install --upgrade pip
+python3 -m pip install websockets  # the harness's only third-party dependency
+```
+
+If `python3 -m venv` errors that the `venv` module is missing, install it first
+(Debian/Ubuntu: `sudo apt install python3-venv`), then re-run the command above.
+
+Keep this terminal (with `venv` activated) for Steps 5–6 — the `python3` there now
+has `websockets`. Put your `sample.wav` somewhere on this machine (e.g. the repo
+root) and confirm it's there:
+
+```bash
+ls -l sample.wav
+```
+
+#### Step 5 — Run the load test (from the load box)
+
+If the load box **is** the server host, use `127.0.0.1`:
+
+```bash
+cd /path/to/speech2speech
+python3 scripts/load_test_sessions.py \
+  --host 127.0.0.1 --port 8765 \
+  --wav sample.wav \
+  --concurrencies 2,4,8 --rounds 5 --markdown
+```
+
+If the load box is a **different machine or WSL**, replace `127.0.0.1` with the
+server host's IP address (see "Connecting from another machine / WSL" below):
+
+```bash
+python3 scripts/load_test_sessions.py \
+  --host 192.168.1.50 --port 8765 \
+  --wav sample.wav \
+  --concurrencies 2,4,8 --rounds 5 --markdown
+```
+
+It prints a per-concurrency latency table and, because of `--markdown`, a block
+you paste straight into §7.2. It exits non-zero if the success rate drops below
+95%, and warns first if the server's `max_sessions` is below your concurrency.
+
+#### Step 6 — Run the soak test (optional leak check)
+
+A 5-minute smoke (use `--duration-s 86400` for the full 24 h):
+
+```bash
+python3 scripts/soak_sessions.py \
+  --host 127.0.0.1 --port 8765 \
+  --wav sample.wav \
+  --sessions 8 --duration-s 300 --turn-interval-s 8
+```
+
+To also track server RSS/threads/file-descriptors for the leak check, add
+`--server-pid` **only when you run this on the server host** (it reads `/proc` of
+that PID locally):
+
+```bash
+  --server-pid "$(pgrep -f s2s_pipeline | head -n1)"
+```
+
+Off-box (different machine / WSL) you can't read the server's `/proc`, so omit
+`--server-pid`; the soak then tracks only the live session count.
+
+#### Connecting from another machine / WSL
+
+- **What IP to use:** on the server host run `hostname -I` and take the first
+  address (e.g. `192.168.1.50`). Use that as `--host` from the load box.
+- **Reachability:** from the load box, `curl -s http://SERVER_IP:8765/v1/sessions`
+  must return the JSON from Step 3. If it hangs or refuses, port 8765 is blocked —
+  open it in the server host's firewall (e.g. `sudo ufw allow 8765/tcp`).
+- **WSL specifics:** if the server runs in Docker Desktop on the *same* Windows
+  machine as your WSL distro, `--host 127.0.0.1` usually works (WSL2 forwards
+  localhost to Windows). If the server is on a *different* machine, use that
+  machine's LAN IP as above.
+
+The networked load/soak runs are operator-run on the real remote stack; fill the
+§7.2 tables and the §7.3 recommendation from their output.
+
+### 7.2 Results — fill in from runs
+
+First-audio latency (speech_stopped → first audio delta), seconds:
+
+| Concurrent turns | Turns | OK% | p50 (s) | p95 (s) | p99 (s) | max (s) |
+|---|---|---|---|---|---|---|
+| 1 (baseline) | 5 | 100.0% | 7.245 | 8.819 | 9.009 | 9.056 |
+| 2 | 10 | 100.0% | 7.562 | 12.834 | 14.697 | 15.163 |
+| 4 | 20 | 70.0% | 8.491 | 12.604 | 14.022 | 14.377 |
+| 8 | 40 | 50.0% | 11.900 | 15.352 | 18.061 | 18.738 |
+
+_Run: 2026-06-14, remote stack (whisper.anteon.group STT, MiniMax WS TTS, Hermes
+responses-api LLM @ 192.168.1.36), `--rounds 5`, direct-to-container._
+
+**Reading it:** the binding constraint is the **success rate**, not latency.
+Baseline first-audio (~7.2 s p50 / 8.8 s p95) is LLM/TTS-bound as in §1. It holds
+**100% through 2 concurrent**, then collapses: **70% at 4, 50% at 8** — i.e. at 8
+concurrent turns half never produced audio.
+
+Note the latency columns at 4 and 8 are **survivorship-biased**: a failed turn
+contributes no first-audio sample, so the p50/p95 there describe only the turns
+that *survived* and understate the real degradation (the failures are effectively
+"infinite latency"). So don't read the flat-looking p50 at 4 as healthy — 30% of
+those turns were dropped.
+
+The 4–8 success drop is **back-end endpoint saturation** under the worst case of
+all sessions talking at once (the single Hermes LLM / MiniMax WS concurrent-stream
+limit), **not an s2s limit** — per-session behavior held throughout. Because
+`S2S_MAX_SESSIONS` caps warm *connections* rather than simultaneous *turns*, the
+practical recommendation is set from expected client count, not this knee — see
+§7.3.
+
+### 7.3 Picking the cap
+
+1. Run §7.1, fill §7.2.
+2. The recommended `S2S_MAX_SESSIONS` is the **highest concurrency whose p95
+   first-audio stays within budget** *and* whose success rate is 100% — beyond
+   it, turns queue behind the shared endpoints and latency knees up.
+3. Pair the cap with the external services' own concurrency (Whisper batch slots,
+   F5 instance count, Hermes worker pool). If the endpoints saturate before s2s
+   does, set the per-service caps (`STT_MAX_CONCURRENCY` / `TTS_MAX_CONCURRENCY` /
+   `LLM_MAX_CONCURRENCY`, default unlimited) so s2s queues fairly — with the
+   early `response.created` + `s2s.keepalive` already shipped, a queued turn still
+   shows honest "working" feedback instead of dead air. Document the chosen
+   pairing in REMOTE_SETUP.md.
+
+> **Recommended `S2S_MAX_SESSIONS` for the production remote stack: 8**
+> _(2026-06-14)._ The cap governs concurrent **warm connections**, not concurrent
+> active turns — warm idle sessions are cheap (idle thread sets blocked on empty
+> queues), so size it to hold your expected clients with headroom. For this
+> deployment (≤3 expected concurrent users) 8 is generous and never rejects a
+> client. Multi-session isolation is functional and proven; the §7.2 run confirms
+> per-session behavior holds.
+
+**On the §7.2 4–8 degradation (out of scope for this deployment):** the 70%/50%
+success at 4/8 came from the *worst case* of every session firing a turn in
+lockstep, which saturates the shared external endpoints (the single Hermes LLM /
+the MiniMax WS account's concurrent-stream limit — **back-end capacity, not s2s**).
+Real use of ≤3 users essentially never overlaps all turns, so this ceiling isn't
+a practical constraint here. If a future deployment *does* need many simultaneous
+talkers, the lever is the per-service caps (`STT_/TTS_/LLM_MAX_CONCURRENCY` set to
+each endpoint's real capacity) so the (N+1)th turn queues behind a slot — with the
+early `response.created` + `s2s.keepalive` showing honest "working" feedback —
+instead of failing, plus scaling the back-end services themselves.

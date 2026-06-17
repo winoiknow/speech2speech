@@ -17,6 +17,7 @@ from rich.console import Console
 from speech_to_speech.baseHandler import BaseHandler
 from speech_to_speech.pipeline.handler_types import STTIn, STTOut
 from speech_to_speech.pipeline.messages import Transcription
+from speech_to_speech.utils.concurrency import STT_LIMITER
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -119,7 +120,10 @@ class RemoteOpenAISTTHandler(BaseHandler[STTIn, STTOut]):
 
         logger.debug("RemoteOpenAISTT: posting %d bytes to %s", len(wav_bytes), self.endpoint)
         try:
-            response = self._client.post(self.endpoint, headers=self.headers, files=files)
+            # Cap concurrent in-flight STT requests across all sessions (no-op
+            # unless STT_MAX_CONCURRENCY is set); the slot covers the blocking POST.
+            with STT_LIMITER.slot():
+                response = self._client.post(self.endpoint, headers=self.headers, files=files)
             response.raise_for_status()
             result = response.json()
             pred_text = result.get("text", "").strip()
@@ -150,8 +154,11 @@ class RemoteOpenAISTTHandler(BaseHandler[STTIn, STTOut]):
         yield Transcription(text=pred_text, language_code=language_code, speaker=speaker, audio_wav=audio_wav)
 
     def cleanup(self) -> None:
-        self._client.close()
+        self._client.close()  # this handler's own transcription client — safe to close
         if self._spk_pool is not None:
             self._spk_pool.shutdown(wait=False)
-        if self.speaker_client is not None:
-            self.speaker_client.close()
+        # Do NOT close self.speaker_client here: it is the SHARED RemoteSpeakerClient
+        # built once by HandlerFactory and handed to every session. Closing it on one
+        # session's teardown closes its httpx client process-wide, so every later
+        # identify fails with "Cannot send a request, as the client has been closed"
+        # until restart. The factory owns it; it's closed once at server shutdown.

@@ -15,6 +15,7 @@ from starlette.testclient import TestClient
 
 from speech_to_speech.api.openai_realtime.service import CHUNK_SIZE_BYTES, RealtimeService
 from speech_to_speech.api.openai_realtime.websocket_router import create_app
+from speech_to_speech.baseHandler import BaseHandler
 from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.control import SESSION_END, is_control_message
 from speech_to_speech.pipeline.events import (
@@ -24,6 +25,8 @@ from speech_to_speech.pipeline.events import (
     TranscriptionCompletedEvent,
 )
 from speech_to_speech.pipeline.messages import AUDIO_RESPONSE_DONE, PIPELINE_END
+
+from .conftest import FixedQueueSessionFactory, IndependentSessionStubFactory
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -46,9 +49,19 @@ def setup():
     stop_event = ThreadingEvent()
     response_playing = ThreadingEvent()
     cancel_scope = CancelScope()
-    app = create_app(
-        service, input_queue, output_queue, text_output_queue, should_listen, response_playing, cancel_scope, stop_event
+    # Connect-time build (Phase B): the pipeline is built by the factory on
+    # connect, wrapping these fixed queues so the test bodies inject/inspect them
+    # unchanged.
+    factory = FixedQueueSessionFactory(
+        recv_audio=input_queue,
+        send_audio=output_queue,
+        text_output=text_output_queue,
+        should_listen=should_listen,
+        response_playing=response_playing,
+        cancel_scope=cancel_scope,
+        text_prompt=text_prompt_queue,
     )
+    app = create_app(service, factory, stop_event)
     return (
         app,
         service,
@@ -580,3 +593,423 @@ class TestCleanup:
         assert text_output_queue.empty()
         end = input_queue.get(timeout=1)
         assert is_control_message(end, SESSION_END.kind)
+
+
+# ===================================================================
+# Phase B: connect-time build / disconnect-time teardown leaks no threads
+# ===================================================================
+
+
+class _IdentityHandler(BaseHandler):
+    """Trivial pass-through handler that runs the real BaseHandler loop, so it
+    starts a thread on connect and must be joined (via PIPELINE_END cascade /
+    stop_event) on disconnect."""
+
+    def process(self, item):
+        yield item
+
+
+class _ThreadedStubFactory:
+    """Session factory that builds a real (but trivial) 3-handler thread chain
+    wired recv_audio → … → send_audio, so a connect/disconnect cycle exercises
+    actual thread start + join."""
+
+    def __init__(self):
+        self.built: list = []
+
+    def build_session_pipeline(self, session_id: str):
+        from speech_to_speech.audio.echo_canceller import EchoCanceller
+        from speech_to_speech.pipeline.session_pipeline import SessionPipeline
+        from speech_to_speech.utils.thread_manager import ThreadManager
+
+        stop_event = ThreadingEvent()
+        recv, q1, q2, send = Queue(), Queue(), Queue(), Queue()
+        handlers = [
+            _IdentityHandler(stop_event, recv, q1),
+            _IdentityHandler(stop_event, q1, q2),
+            _IdentityHandler(stop_event, q2, send),
+        ]
+        pipeline = SessionPipeline(
+            session_id=session_id,
+            recv_audio=recv,
+            spoken_prompt=q1,
+            stt_output=q2,
+            text_prompt=Queue(),
+            lm_response=Queue(),
+            lm_processed=Queue(),
+            send_audio=send,
+            text_output=Queue(),
+            stop_event=stop_event,
+            should_listen=ThreadingEvent(),
+            response_playing=ThreadingEvent(),
+            cancel_scope=CancelScope(),
+            echo_canceller=EchoCanceller(sample_rate=16000, enabled=False),
+            handlers=handlers,
+            threads=ThreadManager(handlers, daemon=True),
+        )
+        self.built.append(pipeline)
+        return pipeline
+
+
+def _wait_until(predicate, timeout: float = 5.0, interval: float = 0.02) -> bool:
+    """Poll *predicate* until true or *timeout*; returns its final value. Used
+    instead of a fixed sleep so the assertion is robust to CPU contention from
+    other tests (the disconnect teardown joins threads asynchronously)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return predicate()
+
+
+class TestThreadLifecycle:
+    def test_reconnect_cycle_leaks_no_threads(self):
+        """connect → disconnect → reconnect, three times: every session's handler
+        threads must be started on connect and fully joined on disconnect."""
+        factory = _ThreadedStubFactory()
+        service = RealtimeService()
+        stop_event = ThreadingEvent()
+        app = create_app(service, factory, stop_event)
+
+        with TestClient(app) as client:
+            for _ in range(3):
+                with client.websocket_connect("/v1/realtime") as ws:
+                    ws.receive_json()  # session.created
+                    # the freshly built pipeline's threads are alive while connected
+                    pipeline = factory.built[-1]
+                    assert all(t.is_alive() for t in pipeline.threads.threads)
+                # after disconnect, that session's threads are all joined (the
+                # teardown join is async, so poll rather than sleep a fixed time)
+                joined = _wait_until(lambda: not any(t.is_alive() for t in pipeline.threads.threads))
+                assert joined, "session handler threads not joined after disconnect"
+
+        assert _wait_until(lambda: len(service._conns) == 0)
+        # No session pipeline left a live thread behind across all three cycles.
+        for pipeline in factory.built:
+            assert not any(t.is_alive() for t in pipeline.threads.threads)
+        assert len(factory.built) == 3
+
+
+# ===================================================================
+# Phase C: multiple concurrent sessions, fully isolated
+# ===================================================================
+
+
+TRANSCRIPTION_COMPLETED_TYPE = "conversation.item.input_audio_transcription.completed"
+
+
+def _recv_until(ws, target_type: str, limit: int = 10) -> dict:
+    """Read events from *ws* until one of *target_type* arrives (or *limit* tried)."""
+    for _ in range(limit):
+        msg = ws.receive_json()
+        if msg["type"] == target_type:
+            return msg
+    raise AssertionError(f"{target_type} not received within {limit} events")
+
+
+def _multi_app(factory, max_sessions: int):
+    service = RealtimeService()
+    stop_event = ThreadingEvent()
+    app = create_app(service, factory, stop_event, max_sessions=max_sessions)
+    return app, service
+
+
+class TestMultiSession:
+    def test_capacity_allows_concurrent_sessions(self):
+        factory = IndependentSessionStubFactory()
+        app, service = _multi_app(factory, max_sessions=2)
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws_a:
+                assert ws_a.receive_json()["type"] == "session.created"
+                with client.websocket_connect("/v1/realtime") as ws_b:
+                    assert ws_b.receive_json()["type"] == "session.created"
+                    assert len(service._conns) == 2
+                    assert len(factory.built) == 2
+
+    def test_session_limit_reached_at_capacity(self):
+        factory = IndependentSessionStubFactory()
+        app, service = _multi_app(factory, max_sessions=1)
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws_a:
+                ws_a.receive_json()  # session.created
+                with client.websocket_connect("/v1/realtime") as ws_b:
+                    msg = ws_b.receive_json()
+                    assert msg["type"] == "error"
+                    assert msg["error"]["type"] == "session_limit_reached"
+                    assert "1" in msg["error"]["message"]
+                # the rejected connection never registered
+                assert len(service._conns) == 1
+
+    def test_send_event_swallows_closed_socket(self, caplog):
+        """A send to an already-gone client (Starlette raises RuntimeError once
+        the socket is closed) is benign — logged at debug, never ERROR. This is
+        the post-disconnect path a client that hangs up during the off-loop build
+        takes; it must not look like a server crash."""
+        import asyncio
+        import logging
+
+        from speech_to_speech.api.openai_realtime import websocket_router as wr
+
+        class _GoneWS:
+            async def send_json(self, _payload):
+                raise RuntimeError('WebSocket is not connected. Need to call "accept" first.')
+
+        class _Evt:
+            def model_dump(self):
+                return {"type": "x"}
+
+        logger_name = "speech_to_speech.api.openai_realtime.websocket_router"
+        with caplog.at_level(logging.DEBUG, logger=logger_name):
+            asyncio.run(wr._send_event(_GoneWS(), _Evt()))
+
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert any("disconnected before event could be sent" in r.message for r in caplog.records)
+
+    def test_no_cross_talk_between_sessions(self):
+        """Each session's transcription routes only to its own socket."""
+        factory = IndependentSessionStubFactory()
+        app, _service = _multi_app(factory, max_sessions=2)
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws_a:
+                ws_a.receive_json()
+                with client.websocket_connect("/v1/realtime") as ws_b:
+                    ws_b.receive_json()
+                    pa, pb = factory.built[0], factory.built[1]
+
+                    pa.text_output.put(TranscriptionCompletedEvent(transcript="alpha"))
+                    pb.text_output.put(TranscriptionCompletedEvent(transcript="bravo"))
+
+                    a_done = _recv_until(ws_a, TRANSCRIPTION_COMPLETED_TYPE)
+                    b_done = _recv_until(ws_b, TRANSCRIPTION_COMPLETED_TYPE)
+                    assert a_done["transcript"] == "alpha"
+                    assert b_done["transcript"] == "bravo"
+
+    def test_barge_in_isolated_between_sessions(self):
+        """Speech (barge-in) in session A cancels A only; B keeps streaming."""
+        factory = IndependentSessionStubFactory()
+        app, service = _multi_app(factory, max_sessions=2)
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws_a:
+                ws_a.receive_json()
+                with client.websocket_connect("/v1/realtime") as ws_b:
+                    ws_b.receive_json()
+                    pa, pb = factory.built[0], factory.built[1]
+                    conn_a, conn_b = service.connection_ids
+
+                    # Both sessions are mid-response.
+                    service.response._ensure_response(conn_a)
+                    service.response._ensure_response(conn_b)
+                    pa.response_playing.set()
+                    pb.response_playing.set()
+
+                    # User speaks in A → A cancels.
+                    pa.text_output.put(SpeechStartedEvent())
+                    assert _wait_until(lambda: pa.cancel_scope.discarding)
+
+                    # B is untouched: not discarding, still "playing".
+                    assert not pb.cancel_scope.discarding
+                    assert pb.response_playing.is_set()
+                    assert service._state(conn_b).in_response
+
+    def test_disconnect_one_session_leaves_other_running(self):
+        """B disconnects mid-response; its pipeline tears down, A keeps working."""
+        factory = IndependentSessionStubFactory()
+        app, service = _multi_app(factory, max_sessions=2)
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws_a:
+                ws_a.receive_json()
+                with client.websocket_connect("/v1/realtime") as ws_b:
+                    ws_b.receive_json()
+                    assert len(service._conns) == 2
+                    conn_b = service.connection_ids[1]
+                    service.response._ensure_response(conn_b)  # B mid-response
+                    factory.built[1].response_playing.set()
+                # B disconnected
+                assert _wait_until(lambda: len(service._conns) == 1)
+                assert conn_b not in service._pipelines
+
+                # A still fully functional.
+                pa = factory.built[0]
+                pa.text_output.put(TranscriptionCompletedEvent(transcript="still-here"))
+                a_done = _recv_until(ws_a, TRANSCRIPTION_COMPLETED_TYPE)
+                assert a_done["transcript"] == "still-here"
+
+    def test_keepalive_fires_independently_per_session(self, monkeypatch):
+        """Each in-flight session gets its own keepalive on the silent gap."""
+        import speech_to_speech.api.openai_realtime.websocket_router as router_mod
+
+        monkeypatch.setattr(router_mod, "HEARTBEAT_S", 0.2)
+        factory = IndependentSessionStubFactory()
+        app, service = _multi_app(factory, max_sessions=2)
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws_a:
+                ws_a.receive_json()
+                with client.websocket_connect("/v1/realtime") as ws_b:
+                    ws_b.receive_json()
+                    conn_a, conn_b = service.connection_ids
+                    service.response._ensure_response(conn_a)
+                    service.response._ensure_response(conn_b)
+                    # Each socket independently sees a keepalive during its gap.
+                    assert _recv_until(ws_a, "s2s.keepalive")["response_id"] == service._state(conn_a).current_response_id
+                    assert _recv_until(ws_b, "s2s.keepalive")["response_id"] == service._state(conn_b).current_response_id
+
+
+class TestObservability:
+    def test_sessions_endpoint_empty(self):
+        factory = IndependentSessionStubFactory()
+        app, _service = _multi_app(factory, max_sessions=2)
+        with TestClient(app) as client:
+            body = client.get("/v1/sessions").json()
+            assert body == {"count": 0, "max_sessions": 2, "sessions": []}
+
+    def test_sessions_endpoint_lists_live_sessions(self):
+        factory = IndependentSessionStubFactory()
+        app, service = _multi_app(factory, max_sessions=2)
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws_a:
+                ws_a.receive_json()
+                with client.websocket_connect("/v1/realtime") as ws_b:
+                    ws_b.receive_json()
+                    body = client.get("/v1/sessions").json()
+                    assert body["count"] == 2
+                    ids = {s["session_id"] for s in body["sessions"]}
+                    assert ids == set(service.connection_ids)
+                    for s in body["sessions"]:
+                        assert s["state"] in {"idle", "listening", "thinking", "speaking"}
+                        assert s["connected_s"] >= 0
+                        assert "usage" in s and "turns" in s
+
+    def test_session_state_reflects_response_lifecycle(self):
+        factory = IndependentSessionStubFactory()
+        app, service = _multi_app(factory, max_sessions=1)
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                conn = service.connection_ids[0]
+                assert service._session_state(conn) == "idle"
+                # thinking: in_response but not yet playing audio
+                service.response._ensure_response(conn)
+                assert service._session_state(conn) == "thinking"
+                # speaking: pipeline is playing audio
+                factory.built[0].response_playing.set()
+                assert service._session_state(conn) == "speaking"
+
+    def test_usage_endpoint_has_per_session_breakdown(self):
+        factory = IndependentSessionStubFactory()
+        app, service = _multi_app(factory, max_sessions=2)
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                conn = service.connection_ids[0]
+                service._state(conn).response_usage.turns = 3
+                body = client.get("/v1/usage").json()
+                assert body["active_sessions"] == 1
+                assert body["per_session"][conn]["turns"] == 3
+
+    def test_handler_thread_names_carry_session_tag(self):
+        """The real session pipeline tags every handler thread with the short sid."""
+        from speech_to_speech.utils.thread_manager import ThreadManager
+        from speech_to_speech.utils.utils import short_sid
+
+        class _Idle(BaseHandler):
+            def setup(self, *a, **k):
+                pass
+
+            def process(self, item):
+                yield item
+
+        sid = "session_deadbeefcafe"
+        tm = ThreadManager([_Idle(ThreadingEvent(), Queue(), Queue())], daemon=True, name_prefix=short_sid(sid))
+        tm.start()
+        try:
+            names = [t.name for t in tm.threads]
+            assert names == [f"_Idle-{short_sid(sid)}"]
+            assert short_sid(sid) == "deadbeef"
+        finally:
+            tm.stop()
+
+
+class _DeadThreadStubFactory:
+    """Builds a session whose single 'handler' thread exits immediately, so the
+    pipeline is structurally healthy at connect but has a dead thread the
+    supervisor must catch."""
+
+    def __init__(self) -> None:
+        from speech_to_speech.audio.echo_canceller import EchoCanceller
+        from speech_to_speech.pipeline.session_pipeline import SessionPipeline
+        from speech_to_speech.utils.thread_manager import ThreadManager
+
+        class _ExitImmediately(BaseHandler):
+            def process(self, item):
+                yield item
+
+            def run(self):  # exits at once → thread dies → supervisor should fire
+                return
+
+        self._EchoCanceller = EchoCanceller
+        self._SessionPipeline = SessionPipeline
+        self._ThreadManager = ThreadManager
+        self._handler_cls = _ExitImmediately
+        self.built = []
+
+    def build_session_pipeline(self, session_id: str):
+        handler = self._handler_cls(ThreadingEvent(), Queue(), Queue())
+        pipeline = self._SessionPipeline(
+            session_id=session_id,
+            recv_audio=Queue(),
+            spoken_prompt=Queue(),
+            stt_output=Queue(),
+            text_prompt=Queue(),
+            lm_response=Queue(),
+            lm_processed=Queue(),
+            send_audio=Queue(),
+            text_output=Queue(),
+            stop_event=ThreadingEvent(),
+            should_listen=ThreadingEvent(),
+            response_playing=ThreadingEvent(),
+            cancel_scope=CancelScope(),
+            echo_canceller=self._EchoCanceller(sample_rate=16000, enabled=False),
+            handlers=[handler],
+            threads=self._ThreadManager([handler], daemon=True),
+        )
+        self.built.append(pipeline)
+        return pipeline
+
+
+class TestHardening:
+    def test_idle_session_is_reaped(self, monkeypatch):
+        import speech_to_speech.api.openai_realtime.websocket_router as router_mod
+
+        monkeypatch.setattr(router_mod, "S2S_IDLE_TIMEOUT_S", 0.3)
+        factory = IndependentSessionStubFactory()
+        app, service = _multi_app(factory, max_sessions=2)
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()  # session.created; no further client traffic → idle
+                assert _wait_until(lambda: len(service._conns) == 0, timeout=5.0)
+
+    def test_idle_reaper_off_by_default_keeps_session(self, monkeypatch):
+        import speech_to_speech.api.openai_realtime.websocket_router as router_mod
+
+        monkeypatch.setattr(router_mod, "S2S_IDLE_TIMEOUT_S", 0.0)
+        factory = IndependentSessionStubFactory()
+        app, service = _multi_app(factory, max_sessions=2)
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                time.sleep(0.4)
+                assert len(service._conns) == 1  # never reaped with timeout=0
+
+    def test_dead_handler_thread_fails_session(self, monkeypatch):
+        import speech_to_speech.api.openai_realtime.websocket_router as router_mod
+
+        monkeypatch.setattr(router_mod, "S2S_THREAD_SUPERVISOR_S", 0.1)
+        factory = _DeadThreadStubFactory()
+        app, service = _multi_app(factory, max_sessions=1)
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()  # session.created
+                err = _recv_until(ws, "error")
+                assert err["error"]["type"] == "server_error"
+            assert _wait_until(lambda: len(service._conns) == 0, timeout=5.0)

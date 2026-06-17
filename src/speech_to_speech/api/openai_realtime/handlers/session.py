@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
 from openai.types.realtime import (
     RealtimeErrorEvent,

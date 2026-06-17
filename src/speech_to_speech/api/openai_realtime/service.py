@@ -1,4 +1,6 @@
 import logging
+import threading
+import time
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
@@ -150,6 +152,11 @@ class ConnState(BaseModel):
     session_id: str = Field(default_factory=lambda: _generate_id("session"))
     conversation_id: str = Field(default_factory=lambda: _generate_id("conv"))
     runtime_config: RuntimeConfig = Field(default_factory=RuntimeConfig)
+    # Observability (Phase D): wall-clock connect time and last-client-activity
+    # time. last_activity_at is bumped on every inbound client event (touch) and
+    # drives both /v1/sessions reporting and the optional idle reaper.
+    connected_at: float = Field(default_factory=time.time)
+    last_activity_at: float = Field(default_factory=time.time)
     in_response: bool = False
     audio_buffer_has_data: bool = False
     audio_remainder: bytes = b""
@@ -184,18 +191,33 @@ class RealtimeService:
         speaker_client: Any | None = None,
         diarize_enabled: bool = False,
     ) -> None:
+        # Startup-time fallbacks. In realtime mode (Phase B) these stay None and
+        # each connection's queues/events come from its bound SessionPipeline via
+        # _pipelines; non-realtime/test callers still pass singletons here and the
+        # per-conn accessors below fall back to them.
         self.text_prompt_queue = text_prompt_queue
         self.should_listen = should_listen
         self._chat_size = chat_size
         self._conns: dict[str, ConnState] = {}
+        # conn_id → SessionPipeline (set by the router at connect, cleared at
+        # disconnect). The per-connection unit of isolation; queues/events are
+        # read from here in preference to the startup singletons.
+        self._pipelines: dict[str, Any] = {}
         self.total_usage = GlobalUsageMetrics()
+        # Serializes server-wide usage rollups. Connection register/unregister and
+        # error recording all happen on the asyncio event-loop thread today, but
+        # with N concurrent sessions this guards the cumulative counters against a
+        # future off-loop writer (e.g. a metrics exporter) and gives /v1/usage a
+        # consistent snapshot.
+        self._usage_lock = threading.Lock()
 
         # Phase 4 (Tier 2): async diarization correction, OFF the hot path. The
-        # corrected event is emitted onto text_output_queue from a worker thread;
-        # the router drops it until a consumer handler is registered (emit-and-drop).
+        # corrected event is emitted onto the session's text_output queue from a
+        # worker thread; the router drops it until a consumer handler is
+        # registered (emit-and-drop).
         self.text_output_queue = text_output_queue
         self.speaker_client = speaker_client
-        self.diarize_enabled = bool(diarize_enabled and speaker_client is not None and text_output_queue is not None)
+        self.diarize_enabled = bool(diarize_enabled and speaker_client is not None)
         self._diarize_pool = ThreadPoolExecutor(max_workers=2) if self.diarize_enabled else None
         if self.diarize_enabled:
             logger.info("Diarization correction ENABLED (async, off hot path)")
@@ -220,7 +242,8 @@ class RealtimeService:
         """Register a new connection and return its session_id."""
         state = ConnState(runtime_config=RuntimeConfig(chat=Chat(self._chat_size)))
         self._conns[state.session_id] = state
-        self.total_usage.connections += 1
+        with self._usage_lock:
+            self.total_usage.connections += 1
         return state.session_id
 
     def unregister(self, conn_id: str) -> None:
@@ -230,7 +253,8 @@ class RealtimeService:
             # mutate a Chat tied to a closed session, and don't make further
             # billable LLM calls on its behalf once the splice is suppressed.
             st.runtime_config.chat.close()
-            self.total_usage += st.response_usage
+            with self._usage_lock:
+                self.total_usage += st.response_usage
             logger.info(
                 "Session %s unregistered — cumulative: input_tokens=%d, output_tokens=%d, audio=%.2fs",
                 conn_id,
@@ -245,6 +269,78 @@ class RealtimeService:
     @property
     def connection_ids(self) -> list[str]:
         return list(self._conns)
+
+    def touch(self, conn_id: str) -> None:
+        """Mark a session as active now (called on each inbound client event)."""
+        st = self._conns.get(conn_id)
+        if st is not None:
+            st.last_activity_at = time.time()
+
+    # ── Observability ────────────────────────────────
+
+    def _session_state(self, conn_id: str) -> str:
+        """Coarse session state for /v1/sessions: speaking | thinking | listening | idle."""
+        st = self._conns.get(conn_id)
+        if st is None:
+            return "gone"
+        pipeline = self._pipelines.get(conn_id)
+        if pipeline is not None and pipeline.response_playing.is_set():
+            return "speaking"
+        if st.in_response:
+            return "thinking"
+        if st.audio_buffer_has_data:
+            return "listening"
+        return "idle"
+
+    def get_sessions(self) -> list[dict[str, Any]]:
+        """Snapshot of every live session for the /v1/sessions endpoint."""
+        now = time.time()
+        sessions: list[dict[str, Any]] = []
+        for conn_id, st in list(self._conns.items()):
+            sessions.append(
+                {
+                    "session_id": conn_id,
+                    "conversation_id": st.conversation_id,
+                    "state": self._session_state(conn_id),
+                    "connected_at": st.connected_at,
+                    "last_activity_at": st.last_activity_at,
+                    "connected_s": round(now - st.connected_at, 1),
+                    "idle_s": round(now - st.last_activity_at, 1),
+                    "turns": st.response_usage.turns,
+                    "in_response": st.in_response,
+                    "usage": st.response_usage.model_dump(),
+                }
+            )
+        return sessions
+
+    def idle_session_ids(self, idle_timeout_s: float) -> list[str]:
+        """Session ids whose last client activity is older than idle_timeout_s."""
+        if idle_timeout_s <= 0:
+            return []
+        cutoff = time.time() - idle_timeout_s
+        return [cid for cid, st in list(self._conns.items()) if st.last_activity_at < cutoff]
+
+    # ── Per-connection pipeline binding ──────────────
+
+    def attach_pipeline(self, conn_id: str, pipeline: Any) -> None:
+        """Bind a connection's SessionPipeline so its queues/events drive this
+        connection's transcription→LLM bridge and diarize emit."""
+        self._pipelines[conn_id] = pipeline
+
+    def detach_pipeline(self, conn_id: str) -> None:
+        self._pipelines.pop(conn_id, None)
+
+    def _text_prompt_queue(self, conn_id: str) -> Queue[TextPromptItem] | None:
+        pipeline = self._pipelines.get(conn_id)
+        return pipeline.text_prompt if pipeline is not None else self.text_prompt_queue
+
+    def _text_output_queue(self, conn_id: str) -> Queue[TextEventItem] | None:
+        pipeline = self._pipelines.get(conn_id)
+        return pipeline.text_output if pipeline is not None else self.text_output_queue
+
+    def _should_listen_for(self, conn_id: str) -> ThreadingEvent | None:
+        pipeline = self._pipelines.get(conn_id)
+        return pipeline.should_listen if pipeline is not None else self.should_listen
 
     # ── Client event parsing ─────────────────────
 
@@ -329,7 +425,7 @@ class RealtimeService:
         # in the completed event.
         input_item_id = self.response._current_item_id(conn_id)
 
-        queue = self.text_prompt_queue
+        queue = self._text_prompt_queue(conn_id)
         if queue and transcript:
             queue.put(
                 GenerateResponseRequest(
@@ -344,19 +440,22 @@ class RealtimeService:
 
         # Phase 4: kick off async diarization AFTER the LLM is already triggered, so
         # it never touches the turn's hot path. Submit-and-forget; the worker emits
-        # a correction (or drops on any failure).
-        if self.diarize_enabled and event.audio_wav and self._diarize_pool is not None:
-            self._diarize_pool.submit(self._diarize_and_emit, input_item_id, event.audio_wav)
+        # a correction (or drops on any failure). The session's text_output queue is
+        # captured now so the worker emits to the right connection.
+        text_output = self._text_output_queue(conn_id)
+        if self.diarize_enabled and event.audio_wav and self._diarize_pool is not None and text_output is not None:
+            self._diarize_pool.submit(self._diarize_and_emit, input_item_id, event.audio_wav, text_output)
 
         return events
 
-    def _diarize_and_emit(self, item_id: str, wav: bytes) -> None:
+    def _diarize_and_emit(self, item_id: str, wav: bytes, text_output: Queue[TextEventItem]) -> None:
         """Worker: diarize off the hot path and emit a correction for ``item_id``.
 
         Runs in the diarize pool thread. Never raises (the client never raises and
         we guard the emit) so a failure can't take down the pool or the turn. The
-        corrected event goes on text_output_queue; with no dispatch handler yet it's
-        logged and dropped (emit-and-drop) — a consumer is a one-line follow-up.
+        corrected event goes on the session's text_output queue; with no dispatch
+        handler yet it's logged and dropped (emit-and-drop) — a consumer is a
+        one-line follow-up.
         """
         try:
             corr = self.speaker_client.diarize(wav, item_id=item_id, revision=1)
@@ -370,8 +469,7 @@ class RealtimeService:
                 revision=corr.revision,
                 segments=[s.model_dump() for s in corr.segments],
             )
-            if self.text_output_queue is not None:
-                self.text_output_queue.put(event)
+            text_output.put(event)
         except Exception as e:  # never let a background failure escape
             logger.debug("diarize correction for %s failed (%s) → dropped", item_id, e)
 
@@ -390,16 +488,26 @@ class RealtimeService:
         return []
 
     def get_usage(self) -> dict[str, Any]:
-        """Return cumulative usage metrics across all completed responses."""
-        data = self.total_usage.model_dump()
+        """Return cumulative usage metrics plus a live per-session breakdown.
+
+        The cumulative totals only fold in a session's counters at unregister, so
+        ``per_session`` surfaces the in-flight usage of sessions that are still
+        connected (which the totals don't yet include)."""
+        with self._usage_lock:
+            data = self.total_usage.model_dump()
+            data["total_errors"] = self.total_usage.total_errors
         data["total_tokens"] = data["input_tokens"] + data["output_tokens"]
-        data["total_errors"] = self.total_usage.total_errors
+        data["active_sessions"] = len(self._conns)
+        data["per_session"] = {
+            conn_id: st.response_usage.model_dump() for conn_id, st in list(self._conns.items())
+        }
         return data
 
     # ── Error ───────────────────────────────────
 
     def make_error(self, message: str, _type: str) -> RealtimeErrorEvent:
-        self.total_usage.record_error(_type)
+        with self._usage_lock:
+            self.total_usage.record_error(_type)
         return RealtimeErrorEvent(
             type="error",
             error=RealtimeError(message=message, type=_type),

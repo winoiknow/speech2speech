@@ -1,10 +1,12 @@
+from __future__ import annotations
+
 import base64
 import io
 import re
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
-import requests  # type: ignore[import-untyped]
-from PIL import Image
+if TYPE_CHECKING:
+    from PIL import Image
 
 SMART_PUNCT_TRANSLATION = str.maketrans(
     {
@@ -66,7 +68,13 @@ def image_url_to_pil(image_url: str) -> Image.Image:
     Accepts:
     - 'data:image/...;base64,<b64>' data URIs
     - 'https://...`` or ``http://...' URLs (fetched with a 10s timeout)
+
+    Imports Pillow/requests lazily: this is a VLM-only helper, so the voice path
+    never pulls those in (and they are not runtime dependencies of this build).
     """
+    import requests  # type: ignore[import-untyped]
+    from PIL import Image
+
     if image_url.startswith("data:"):
         _, b64_data = image_url.split(",", 1)
         return Image.open(io.BytesIO(base64.b64decode(b64_data)))

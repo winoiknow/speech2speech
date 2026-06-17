@@ -4,6 +4,50 @@ All notable changes to this fork of [huggingface/speech-to-speech](https://githu
 
 ---
 
+## [0.4.0] — 2026-06-17
+
+Streamlined to a **remote-only realtime** build. Everything that loaded an
+in-process model or served a non-realtime transport was removed; the package now
+reads as a purpose-built remote realtime server instead of a fork carrying its
+parent's full model zoo. **Breaking** (CLI surface narrows; local modes gone).
+
+### Removed
+
+- **Local STT** handlers + arg classes: whisper, whisper-mlx, mlx-audio-whisper,
+  faster-whisper, paraformer, parakeet-tdt (and `smart_progressive_streaming`).
+- **Local TTS** handlers + arg classes: chatTTS, facebookMMS, pocket, kokoro,
+  qwen3 (and the `ref_audio.wav` asset).
+- **Local LLM**: the transformers / mlx-lm `LanguageModelHandler` + arg class.
+- **Non-realtime modes**: `local` / `socket` / `websocket` transports (the whole
+  `connections/` package) + their arg classes, and `HandlerFactory.build()`.
+- **Dependencies**: the entire Darwin/MLX block and every local-model dep
+  (nano-parakeet, faster-qwen3-tts, kokoro/pocket/chattts/paraformer extras, mlx*,
+  misaki, spacy, phonemizer, lingua, miniaudio, sounddevice, soundfile, pillow).
+  All `[project.optional-dependencies]` extras removed. `uv` now resolves ~99
+  packages and `pip install -e .` is lean.
+- The local `Dockerfile`, `Dockerfile.arm64`, and local `docker-compose.yml`.
+
+### Changed
+
+- `ModuleArguments` is remote-only: `stt=openai-remote`, `llm_backend=responses-api`,
+  `tts=openai-remote|elevenlabs|minimax`, `mode=realtime`. Added `host`/`port`
+  (`S2S_HOST`/`S2S_PORT`) — the realtime server no longer borrows host/port from
+  the removed websocket-streamer args.
+- `Dockerfile.remote` → `Dockerfile` and `docker-compose.remote.yml` →
+  `docker-compose.yml` (now the only build); image pip list aligned with the lean
+  deps; added `onnxruntime` to runtime deps (Smart Turn).
+- `LLM/utils.py` lazy-imports Pillow/requests inside the VLM-only `image_url_to_pil`
+  helper, so the voice path needs neither.
+
+### Kept
+
+- Remote STT (`openai-remote`), TTS (`openai-remote`/`elevenlabs`/`minimax`), LLM
+  (`responses-api`), the realtime server, VAD + Smart Turn, AEC, speaker-id, and
+  multi-session — all unchanged. `torch`/`torchaudio` (silero VAD), `transformers`
+  (Smart Turn + `HfArgumentParser`), and `onnxruntime` remain required.
+
+---
+
 ## [0.3.0] — 2026-06-17
 
 First tagged release. Adds **multi-session** support and a set of capabilities that

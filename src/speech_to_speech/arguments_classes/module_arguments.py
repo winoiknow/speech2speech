@@ -3,7 +3,8 @@
 # See the LICENSE file in the repository root for the full license text.
 #
 # Modifications Copyright 2026 winoiknow (Eric Alborn, Anteon Group)
-# Modified: added "openai-remote" to the stt and tts Literal type sets.
+# Streamlined to a remote-only realtime build: the only valid STT/TTS/LLM backends
+# are the remote handlers, and 'realtime' is the only mode.
 
 import os
 from dataclasses import dataclass, field
@@ -12,41 +13,29 @@ from typing import Literal, Optional
 
 @dataclass
 class ModuleArguments:
-    device: Optional[str] = field(
-        default=None,
-        metadata={"help": "If specified, overrides the device for all handlers."},
-    )
-    mode: Optional[Literal["local", "socket", "websocket", "realtime"]] = field(
+    mode: Literal["realtime"] = field(
         default="realtime",
-        metadata={
-            "help": "The mode to run the pipeline in. Either 'local', 'socket', 'websocket', or 'realtime'. Default is 'realtime'."
-        },
+        metadata={"help": "Run mode. This build only supports 'realtime'."},
     )
-    local_mac_optimal_settings: bool = field(
-        default=False,
-        metadata={
-            "help": "If specified, sets the optimal settings for Mac OS. Sets Parakeet TDT for STT, MLX LM for language model, and Qwen3-TTS for TTS, with MPS device and local mode."
-        },
+    host: str = field(
+        default_factory=lambda: os.environ.get("S2S_HOST", "0.0.0.0"),
+        metadata={"help": "Host the realtime WebSocket server binds to (env S2S_HOST, default 0.0.0.0)."},
     )
-    stt: Optional[
-        Literal["whisper", "whisper-mlx", "mlx-audio-whisper", "faster-whisper", "parakeet-tdt", "paraformer", "openai-remote"]
-    ] = field(
-        default="parakeet-tdt",
-        metadata={
-            "help": "The STT to use. Either 'whisper', 'whisper-mlx', 'mlx-audio-whisper', 'faster-whisper', 'parakeet-tdt', 'paraformer', or 'openai-remote'. Default is 'parakeet-tdt'."
-        },
+    port: int = field(
+        default_factory=lambda: int(os.environ.get("S2S_PORT", "8765")),
+        metadata={"help": "Port the realtime WebSocket server binds to (env S2S_PORT, default 8765)."},
     )
-    llm_backend: Optional[Literal["transformers", "mlx-lm", "responses-api"]] = field(
+    stt: Optional[Literal["openai-remote"]] = field(
+        default="openai-remote",
+        metadata={"help": "STT backend. This build only supports 'openai-remote'."},
+    )
+    llm_backend: Optional[Literal["responses-api"]] = field(
         default="responses-api",
-        metadata={
-            "help": "The LLM backend to use. Either 'transformers', 'mlx-lm', or 'responses-api'. Default is 'responses-api'."
-        },
+        metadata={"help": "LLM backend. This build only supports 'responses-api'."},
     )
-    tts: Optional[Literal["melo", "chatTTS", "facebookMMS", "pocket", "kokoro", "qwen3", "openai-remote", "elevenlabs", "minimax"]] = field(
-        default="qwen3",
-        metadata={
-            "help": "The TTS to use. Either 'chatTTS', 'facebookMMS', 'pocket', 'kokoro', 'qwen3', 'openai-remote', 'elevenlabs', or 'minimax'. Default is 'qwen3'."
-        },
+    tts: Optional[Literal["openai-remote", "elevenlabs", "minimax"]] = field(
+        default="openai-remote",
+        metadata={"help": "TTS backend. Either 'openai-remote' (F5-TTS), 'elevenlabs', or 'minimax'."},
     )
     log_level: str = field(
         default="info",

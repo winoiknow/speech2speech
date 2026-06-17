@@ -100,13 +100,13 @@ cp .env.sample .env
 #   LLM_BASE_URL, and (for any auth'd client) SERVER_API_KEY.
 
 # 3. Build + run
-docker compose -f docker-compose.remote.yml --env-file .env up --build
+docker compose --env-file .env up --build
 ```
 
 The server listens on `ws://0.0.0.0:8765/v1/realtime`.
 
 > **Compose gotcha:** a variable in `.env` only reaches the container if it is
-> listed in the service's `environment:` block in `docker-compose.remote.yml`.
+> listed in the service's `environment:` block in `docker-compose.yml`.
 > All documented knobs are already wired there as `${VAR:-default}`. If you add a
 > brand-new env var, add it to that block too, or it will be silently ignored
 > inside the container (`.env` alone only does `${VAR}` substitution in the compose
@@ -115,7 +115,7 @@ The server listens on `ws://0.0.0.0:8765/v1/realtime`.
 To run the bundled speaker-id service alongside s2s:
 
 ```bash
-docker compose -f docker-compose.remote.yml --profile speaker-id up --build
+docker compose --profile speaker-id up --build
 # then set SPEAKER_ID_ENABLED=1 and SPEAKER_ID_BASE_URL=http://speaker-id:9100
 ```
 

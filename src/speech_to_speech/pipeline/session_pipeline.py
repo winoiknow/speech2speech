@@ -21,12 +21,8 @@ from queue import Queue
 from threading import Event
 from typing import Any
 
-from openai.types.realtime import RealtimeSessionCreateRequest
-
-from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 from speech_to_speech.arguments_classes.speaker_id_arguments import SpeakerIdHandlerArguments
 from speech_to_speech.audio.echo_canceller import EchoCanceller
-from speech_to_speech.LLM.chat import Chat
 from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.control import SESSION_END
 from speech_to_speech.pipeline.messages import PIPELINE_END
@@ -295,7 +291,6 @@ class HandlerFactory:
                 Event(),
                 Queue(),
                 Queue(),
-                self.args.language_model_handler_kwargs,
                 self.args.responses_api_language_model_handler_kwargs,
             )
             del handler  # only constructed to run its one-time warmup
@@ -305,236 +300,6 @@ class HandlerFactory:
             )
         except Exception as e:
             logger.warning("LLM pre-warm failed (%s); the first session will warm on connect", e)
-
-    def build(self, session_id: str = "default") -> SessionPipeline:
-        args = self.args
-        module_kwargs = args.module_kwargs
-        speaker_args = self.speaker_args
-        speaker_client = self.speaker_client
-
-        qe = initialize_queues_and_events()
-        stop_event: Event = qe["stop_event"]
-        should_listen: Event = qe["should_listen"]
-        response_playing: Event = qe["response_playing"]
-        cancel_scope: CancelScope = qe["cancel_scope"]
-        recv_audio_chunks_queue: Queue[AudioInItem] = qe["recv_audio_chunks_queue"]
-        send_audio_chunks_queue: Queue[AudioOutItem] = qe["send_audio_chunks_queue"]
-        spoken_prompt_queue: Queue[VADOutItem] = qe["spoken_prompt_queue"]
-        stt_output_queue: Queue[STTOutItem] = qe["stt_output_queue"]
-        text_prompt_queue: Queue[TextPromptItem] = qe["text_prompt_queue"]
-        lm_response_queue: Queue[LMOutItem] = qe["lm_response_queue"]
-        lm_processed_queue: Queue[TTSInItem] = qe["lm_processed_queue"]
-        # Only set for websocket/realtime modes; kept None otherwise to avoid
-        # unbounded queue growth.
-        text_output_queue: Queue[TextEventItem] | None = None
-
-        comms_handlers: list[Any] = []
-        if module_kwargs.mode == "local":
-            from speech_to_speech.connections.local_audio_streamer import LocalAudioStreamer
-
-            local_audio_streamer = LocalAudioStreamer(
-                input_queue=recv_audio_chunks_queue,
-                output_queue=send_audio_chunks_queue,
-                should_listen=should_listen,
-            )
-            comms_handlers = [local_audio_streamer]
-            should_listen.set()
-        elif module_kwargs.mode == "websocket":
-            from speech_to_speech.connections.websocket_streamer import WebSocketStreamer
-
-            text_output_queue = qe["text_output_queue"]
-            websocket_streamer = WebSocketStreamer(
-                stop_event,
-                input_queue=recv_audio_chunks_queue,
-                output_queue=send_audio_chunks_queue,
-                should_listen=should_listen,
-                text_output_queue=text_output_queue,
-                host=args.websocket_streamer_kwargs.ws_host,
-                port=args.websocket_streamer_kwargs.ws_port,
-            )
-            comms_handlers = [websocket_streamer]
-        elif module_kwargs.mode == "realtime":
-            from speech_to_speech.api.openai_realtime.server import RealtimeServer
-
-            text_output_queue = qe["text_output_queue"]
-
-            vars(args.vad_handler_kwargs)["text_output_queue"] = text_output_queue
-
-            for kw in (
-                args.language_model_handler_kwargs,
-                args.responses_api_language_model_handler_kwargs,
-                args.kokoro_tts_handler_kwargs,
-                args.qwen3_tts_handler_kwargs,
-                args.pocket_tts_handler_kwargs,
-                args.chat_tts_handler_kwargs,
-                args.facebook_mms_tts_handler_kwargs,
-                args.remote_openai_tts_handler_kwargs,
-                args.elevenlabs_tts_handler_kwargs,
-                args.minimax_tts_handler_kwargs,
-            ):
-                vars(kw)["cancel_scope"] = cancel_scope
-
-            if module_kwargs.llm_backend == "responses-api":
-                chat_size = vars(args.responses_api_language_model_handler_kwargs).get("chat_size", 10)
-            else:
-                chat_size = vars(args.language_model_handler_kwargs).get("chat_size", 10)
-
-            realtime_conn = RealtimeServer(
-                stop_event,
-                input_queue=recv_audio_chunks_queue,
-                output_queue=send_audio_chunks_queue,
-                should_listen=should_listen,
-                response_playing=response_playing,
-                cancel_scope=cancel_scope,
-                text_output_queue=text_output_queue,
-                text_prompt_queue=text_prompt_queue,
-                host=args.websocket_streamer_kwargs.ws_host,
-                port=args.websocket_streamer_kwargs.ws_port,
-                chat_size=chat_size,
-                server_api_key=module_kwargs.server_api_key,
-                speaker_client=speaker_client,
-                speaker_diarize_enabled=speaker_args.speaker_diarize_enabled,
-            )
-            comms_handlers = [realtime_conn]
-        else:
-            from speech_to_speech.connections.socket_receiver import SocketReceiver
-            from speech_to_speech.connections.socket_sender import SocketSender
-
-            comms_handlers = [
-                SocketReceiver(
-                    stop_event,
-                    recv_audio_chunks_queue,
-                    should_listen,
-                    host=args.socket_receiver_kwargs.recv_host,
-                    port=args.socket_receiver_kwargs.recv_port,
-                    chunk_size=args.socket_receiver_kwargs.chunk_size,
-                ),
-                SocketSender(
-                    stop_event,
-                    send_audio_chunks_queue,
-                    should_listen,
-                    host=args.socket_sender_kwargs.send_host,
-                    port=args.socket_sender_kwargs.send_port,
-                ),
-            ]
-
-        # Set VAD realtime transcription parameters from module_kwargs
-        if module_kwargs.enable_live_transcription:
-            args.vad_handler_kwargs.enable_realtime_transcription = True
-            args.vad_handler_kwargs.realtime_processing_pause = module_kwargs.live_transcription_update_interval
-
-        vad = VADHandler(
-            stop_event,
-            queue_in=recv_audio_chunks_queue,
-            queue_out=spoken_prompt_queue,
-            setup_args=(should_listen,),
-            setup_kwargs=vars(args.vad_handler_kwargs),
-        )
-
-        # ── Speaker-id notifier wiring (client built in __init__). Inline
-        # identify labels only when SPEAKER_ID_ENABLED; diarize-only deployments
-        # add no inline prefix.
-        transcription_notifier_kwargs: dict[str, Any] = {
-            "text_output_queue": text_output_queue,
-            "should_listen": should_listen,
-            "label_format": speaker_args.speaker_id_label_format if speaker_args.speaker_id_enabled else "",
-        }
-        if module_kwargs.mode != "realtime":
-            if module_kwargs.llm_backend == "responses-api":
-                _lm_vars = vars(args.responses_api_language_model_handler_kwargs)
-            else:
-                _lm_vars = vars(args.language_model_handler_kwargs)
-            transcription_notifier_kwargs["runtime_config"] = RuntimeConfig(
-                chat=Chat(_lm_vars.get("chat_size", 30)),
-                session=RealtimeSessionCreateRequest(
-                    type="realtime",
-                    instructions=_lm_vars.get("init_chat_prompt"),
-                ),
-            )
-
-        transcription_notifier = TranscriptionNotifier(
-            stop_event,
-            queue_in=stt_output_queue,
-            queue_out=text_prompt_queue,
-            setup_kwargs=transcription_notifier_kwargs,
-        )
-
-        stt = get_stt_handler(
-            module_kwargs,
-            stop_event,
-            spoken_prompt_queue,
-            stt_output_queue,
-            args.whisper_stt_handler_kwargs,
-            args.faster_whisper_stt_handler_kwargs,
-            args.paraformer_stt_handler_kwargs,
-            args.mlx_audio_whisper_stt_handler_kwargs,
-            args.parakeet_tdt_stt_handler_kwargs,
-            args.remote_openai_stt_handler_kwargs,
-            # Concurrent identify only when SPEAKER_ID_ENABLED; a diarize-only
-            # deploy still attaches the turn audio (diarize_enabled) but runs no
-            # per-turn identify.
-            speaker_client=speaker_client if speaker_args.speaker_id_enabled else None,
-            speaker_timeout=speaker_args.speaker_id_timeout,
-            diarize_enabled=speaker_args.speaker_diarize_enabled,
-        )
-
-        lm = get_llm_handler(
-            module_kwargs,
-            stop_event,
-            text_prompt_queue,
-            lm_response_queue,
-            args.language_model_handler_kwargs,
-            args.responses_api_language_model_handler_kwargs,
-        )
-
-        # LM output processor extracts tools and forwards clean text to TTS.
-        from speech_to_speech.LLM.lm_output_processor import LMOutputProcessor
-
-        lm_processor = LMOutputProcessor(
-            stop_event,
-            queue_in=lm_response_queue,
-            queue_out=lm_processed_queue,
-            setup_kwargs={"text_output_queue": text_output_queue},
-        )
-
-        tts = get_tts_handler(
-            module_kwargs,
-            stop_event,
-            lm_processed_queue,
-            send_audio_chunks_queue,
-            should_listen,
-            args.chat_tts_handler_kwargs,
-            args.facebook_mms_tts_handler_kwargs,
-            args.pocket_tts_handler_kwargs,
-            args.kokoro_tts_handler_kwargs,
-            args.qwen3_tts_handler_kwargs,
-            args.remote_openai_tts_handler_kwargs,
-            args.elevenlabs_tts_handler_kwargs,
-            args.minimax_tts_handler_kwargs,
-        )
-
-        pipeline_handlers: list[Any] = [*comms_handlers, vad, stt, transcription_notifier, lm, lm_processor, tts]
-
-        return SessionPipeline(
-            session_id=session_id,
-            recv_audio=recv_audio_chunks_queue,
-            spoken_prompt=spoken_prompt_queue,
-            stt_output=stt_output_queue,
-            text_prompt=text_prompt_queue,
-            lm_response=lm_response_queue,
-            lm_processed=lm_processed_queue,
-            send_audio=send_audio_chunks_queue,
-            text_output=text_output_queue,
-            stop_event=stop_event,
-            should_listen=should_listen,
-            response_playing=response_playing,
-            cancel_scope=cancel_scope,
-            # Non-realtime modes don't run the AEC input path; a disabled
-            # canceller is a no-op passthrough that just satisfies the field.
-            echo_canceller=EchoCanceller(sample_rate=PIPELINE_SAMPLE_RATE, enabled=False),
-            handlers=pipeline_handlers,
-            threads=ThreadManager(pipeline_handlers),
-        )
 
     def build_session_pipeline(self, session_id: str) -> SessionPipeline:
         """Build one realtime session's pipeline: fresh queues/events/cancel
@@ -570,13 +335,7 @@ class HandlerFactory:
         # setup_kwargs; the VAD emits protocol events onto text_output.
         vars(args.vad_handler_kwargs)["text_output_queue"] = text_output_queue
         for kw in (
-            args.language_model_handler_kwargs,
             args.responses_api_language_model_handler_kwargs,
-            args.kokoro_tts_handler_kwargs,
-            args.qwen3_tts_handler_kwargs,
-            args.pocket_tts_handler_kwargs,
-            args.chat_tts_handler_kwargs,
-            args.facebook_mms_tts_handler_kwargs,
             args.remote_openai_tts_handler_kwargs,
             args.elevenlabs_tts_handler_kwargs,
             args.minimax_tts_handler_kwargs,
@@ -620,11 +379,6 @@ class HandlerFactory:
             stop_event,
             spoken_prompt_queue,
             stt_output_queue,
-            args.whisper_stt_handler_kwargs,
-            args.faster_whisper_stt_handler_kwargs,
-            args.paraformer_stt_handler_kwargs,
-            args.mlx_audio_whisper_stt_handler_kwargs,
-            args.parakeet_tdt_stt_handler_kwargs,
             args.remote_openai_stt_handler_kwargs,
             speaker_client=speaker_client if speaker_args.speaker_id_enabled else None,
             speaker_timeout=speaker_args.speaker_id_timeout,
@@ -636,7 +390,6 @@ class HandlerFactory:
             stop_event,
             text_prompt_queue,
             lm_response_queue,
-            args.language_model_handler_kwargs,
             args.responses_api_language_model_handler_kwargs,
         )
 
@@ -655,11 +408,6 @@ class HandlerFactory:
             lm_processed_queue,
             send_audio_chunks_queue,
             should_listen,
-            args.chat_tts_handler_kwargs,
-            args.facebook_mms_tts_handler_kwargs,
-            args.pocket_tts_handler_kwargs,
-            args.kokoro_tts_handler_kwargs,
-            args.qwen3_tts_handler_kwargs,
             args.remote_openai_tts_handler_kwargs,
             args.elevenlabs_tts_handler_kwargs,
             args.minimax_tts_handler_kwargs,
@@ -719,10 +467,7 @@ class HandlerFactory:
 
         args = self.args
         module_kwargs = args.module_kwargs
-        if module_kwargs.llm_backend == "responses-api":
-            chat_size = vars(args.responses_api_language_model_handler_kwargs).get("chat_size", 10)
-        else:
-            chat_size = vars(args.language_model_handler_kwargs).get("chat_size", 10)
+        chat_size = vars(args.responses_api_language_model_handler_kwargs).get("chat_size", 10)
 
         max_sessions = self.effective_max_sessions()
         if max_sessions > 1:
@@ -739,8 +484,8 @@ class HandlerFactory:
         return RealtimeServer(
             stop_event=Event(),
             session_factory=self,
-            host=args.websocket_streamer_kwargs.ws_host,
-            port=args.websocket_streamer_kwargs.ws_port,
+            host=module_kwargs.host,
+            port=module_kwargs.port,
             chat_size=chat_size,
             server_api_key=module_kwargs.server_api_key,
             speaker_client=self.speaker_client,

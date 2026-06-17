@@ -252,7 +252,7 @@ Two things people miss:
 
 ```bash
 cd /path/to/speech2speech
-docker compose -f docker-compose.remote.yml up
+docker compose up
 ```
 
 Leave this terminal running (it streams the server log). It listens on
@@ -274,7 +274,7 @@ Expected output (the important part is `"max_sessions":8`):
 
 If you see `"max_sessions":1`, your `.env` change didn't take effect — stop the
 server (Ctrl-C in the Step 2 terminal) and bring it up again with
-`docker compose -f docker-compose.remote.yml up` (this re-reads `.env`).
+`docker compose up` (this re-reads `.env`).
 
 #### Step 4 — Prepare the load box
 

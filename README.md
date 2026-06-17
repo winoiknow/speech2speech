@@ -30,7 +30,7 @@ See the [Install & Configuration Guide](docs/INSTALL_AND_CONFIGURATION.md) and [
 | STT | Loads Whisper / Parakeet / Paraformer locally | `--stt openai-remote` — HTTP POST to any OpenAI-compatible `/v1/audio/transcriptions` endpoint |
 | TTS | Loads Qwen3 / Pocket / Kokoro / ChatTTS locally | `TTS_SOURCE` toggle: `openai-remote` (F5-TTS `/v1/audio/speech/stream`), `elevenlabs` (cloud), or `minimax` (T2A v2 WebSocket, streaming pcm@16k, voice cloning) |
 | LLM | Local transformers or OpenAI Responses API | Unchanged — uses `--llm_backend responses-api` pointed at your Hermes / vLLM / compatible server |
-| Deployment | No Docker target for CPU-only remote mode | `Dockerfile.remote` + `docker-compose.remote.yml` — CPU-only, no CUDA, no model weights in image |
+| Deployment | No Docker target for CPU-only remote mode | `Dockerfile` + `docker-compose.yml` — CPU-only, no CUDA, no model weights in image |
 
 See [CHANGELOG.md](CHANGELOG.md) for a full list of changes.
 
@@ -60,7 +60,7 @@ cp .env.sample .env
 # Set STT_OPENAI_BASE_URL, TTS_OPENAI_BASE_URL, LLM_BASE_URL, SERVER_API_KEY, etc.
 
 # 3. Build and run
-docker compose -f docker-compose.remote.yml --env-file .env up --build
+docker compose --env-file .env up --build
 ```
 
 The server starts on `ws://0.0.0.0:8765/v1/realtime`.
@@ -210,30 +210,30 @@ python -m pytest
 
 ---
 
-## Project Structure (additions only)
+## Project Structure
+
+This is a remote-only realtime build — there are no in-process STT/TTS/LLM model
+handlers (they were removed in 0.4.0; see the CHANGELOG).
 
 ```
 src/speech_to_speech/
-  STT/
-    remote_openai_stt_handler.py     ← new: RemoteOpenAISTTHandler
-  TTS/
-    remote_openai_tts_handler.py     ← new: RemoteOpenAITTSHandler
-    elevenlabs_tts_handler.py        ← new: ElevenLabsTTSHandler
-  arguments_classes/
-    remote_openai_stt_arguments.py   ← new: CLI args for STT handler
-    remote_openai_tts_arguments.py   ← new: CLI args for TTS handler
-    elevenlabs_tts_arguments.py      ← new: env-backed args for ElevenLabs handler
-    module_arguments.py              ← modified: added "openai-remote"/"elevenlabs" to tts Literal
-  debug.py                           ← new: DEBUG_MODE flag for verbose diagnostics
-  s2s_pipeline.py                    ← modified: handler dispatch, registration
+  api/openai_realtime/   the realtime server, service, websocket router
+  pipeline/              SessionPipeline + HandlerFactory (per-connection isolation)
+  STT/                   remote_openai_stt_handler.py (+ transcription_notifier)
+  TTS/                   remote_openai / elevenlabs / minimax handlers
+  LLM/                   responses_api_language_model.py (+ chat, tools, processor)
+  VAD/                   silero VAD + Smart Turn v3
+  audio/                 echo_canceller.py (AEC3 / speex)
+  speaker_id/            remote_speaker_client.py (identify + diarize)
+  arguments_classes/     remote handler + module/VAD/speaker-id arg dataclasses
+  s2s_pipeline.py        CLI parse + remote handler dispatch + main()
 
-Dockerfile.remote                    ← new: CPU-only Docker image
-docker-compose.remote.yml            ← new: Docker Compose for remote mode
-REMOTE_SETUP.md                      ← new: detailed runbook
-CHANGELOG.md                         ← new: change history
-
-tests/
-  test_remote_handlers.py            ← new: smoke tests for remote handlers
+Dockerfile               CPU-only image (no CUDA, no model weights)
+docker-compose.yml       the deployment (s2s-remote + optional speaker-id profile)
+docs/INSTALL_AND_CONFIGURATION.md   full setup + config guide
+REMOTE_SETUP.md          original remote-mode runbook
+LATENCY.md               latency + multi-session capacity
+CHANGELOG.md             change history
 ```
 
 ---

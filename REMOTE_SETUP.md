@@ -47,7 +47,7 @@ cp .env.sample .env
 # Edit STT_OPENAI_BASE_URL, TTS_OPENAI_BASE_URL, LLM_BASE_URL, SERVER_API_KEY, etc.
 
 # Build and start
-docker compose -f docker-compose.remote.yml --env-file .env up --build
+docker compose --env-file .env up --build
 ```
 
 The server starts on `ws://0.0.0.0:8765/v1/realtime`.

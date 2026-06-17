@@ -2,7 +2,24 @@
 
 A fork of [huggingface/speech-to-speech](https://github.com/huggingface/speech-to-speech) extended to run as a **zero-local-inference** OpenAI Realtime-compatible voice agent server.  All speech and language processing is delegated to three external HTTP services — no ML models are loaded in the server process itself.
 
+> 📖 **[Install & Configuration Guide →](docs/INSTALL_AND_CONFIGURATION.md)** — the
+> complete, step-by-step setup and configuration reference (every knob, multi-session,
+> speaker-id, AEC, Smart Turn, keepalive, troubleshooting). Start there for a real
+> deployment.
+
 > For a full description of the underlying pipeline architecture, modular handler system, VAD configuration, and the original model options, see the **[upstream README](https://github.com/huggingface/speech-to-speech/blob/main/README.md)** on the HuggingFace GitHub.
+
+---
+
+## New in 0.3.0
+
+- **Multi-session** — one process serves up to `S2S_MAX_SESSIONS` concurrent warm connections, each with its own isolated `SessionPipeline`. Defaults to `1` (unchanged single-session behavior); only valid when STT/TTS/LLM are all remote.
+- **Speaker identification & diarization** — optional, concurrent-with-STT `/v1/identify` tagging and off-hot-path conference diarization (both off by default).
+- **Acoustic echo cancellation** — WebRTC AEC3 / speex on the input path with far-aware VAD gating, so a full-duplex client can barge in without phantom triggers.
+- **Smart Turn v3 end-of-turn** — optional semantic endpointing (`TURN_DETECTION=smart_turn`) so a mid-thought pause doesn't cut the user off.
+- **Warm-connection friendly** — startup pre-warm (VAD / Smart Turn / LLM), once-per-process LLM warmup, configurable WebSocket keepalive, observability (`/v1/sessions`, `/v1/usage`).
+
+See the [Install & Configuration Guide](docs/INSTALL_AND_CONFIGURATION.md) and [CHANGELOG.md](CHANGELOG.md) for details.
 
 ---
 
@@ -71,6 +88,11 @@ speech-to-speech \
 ## Configuration Reference
 
 All options can be set via CLI flags or environment variables.  Copy `.env.sample` to `.env` and fill in your values.
+
+> The tables below cover the core STT/TTS/LLM/auth options. For the **complete**
+> reference — multi-session, speaker-id & diarization, AEC tuning, Smart Turn,
+> WebSocket keepalive, the turn-progress heartbeat, observability, and
+> troubleshooting — see the **[Install & Configuration Guide](docs/INSTALL_AND_CONFIGURATION.md)**.
 
 ### Server Authentication
 

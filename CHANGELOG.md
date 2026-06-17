@@ -4,6 +4,89 @@ All notable changes to this fork of [huggingface/speech-to-speech](https://githu
 
 ---
 
+## [0.3.0] — 2026-06-17
+
+First tagged release. Adds **multi-session** support and a set of capabilities that
+make s2s a production warm-connection backend for any OpenAI-Realtime client. All
+new behavior is **off/at-parity by default** — the shipped defaults preserve the
+prior single-session behavior. Full reference:
+[`docs/INSTALL_AND_CONFIGURATION.md`](docs/INSTALL_AND_CONFIGURATION.md).
+
+This release also folds in the previously-unreleased *thinking-gap UX* and *QC*
+work below.
+
+### Added
+
+- **Multi-session** (`S2S_MAX_SESSIONS`, default `1`). Each WebSocket connection
+  gets its own `SessionPipeline` (queues, VAD, echo canceller, cancel scope, six
+  handler threads), built at connect and torn down at disconnect. The cap governs
+  concurrent **warm connections**, not simultaneous turns. Forced to `1` when any
+  of STT/TTS/LLM is an in-process local model. `HandlerFactory.build_session_pipeline()`
+  / `build_realtime_server()`; `RealtimeServer`/`create_app` take a session factory.
+  (Phases A–D; design of record in `MULTI_SESSION_PLAN.md`.)
+- **Observability** — `GET /v1/sessions` (per-session state/age/idle/turns/usage),
+  `GET /v1/usage` (`active_sessions` + `per_session`), session-tagged handler thread
+  names.
+- **Operational hardening** — `S2S_IDLE_TIMEOUT_S` idle reaper (default off),
+  `S2S_THREAD_SUPERVISOR_S` dead-thread supervisor, parallel teardown, per-service
+  `STT/TTS/LLM_MAX_CONCURRENCY` caps (default `0` = unlimited).
+- **Speaker identification** (`SPEAKER_ID_ENABLED`, off by default) — `/v1/identify`
+  fired concurrently with STT, confident matches prefix the dialogue with a tag;
+  fail-safe to `unknown`. Plus **async diarization** (`SPEAKER_DIARIZE_ENABLED`,
+  off the hot path) driving idempotent, revision-versioned corrective events.
+- **Acoustic echo cancellation** (`AEC_ENABLED`, off by default) — WebRTC AEC3
+  (default) or speex on the input path, with far-aware VAD residual gating
+  (`VAD_INPUT_RMS_GATE`, `VAD_INPUT_RMS_GATE_FAR`, `VAD_FAR_SUSTAIN_*`).
+- **Smart Turn v3 end-of-turn** (`TURN_DETECTION=smart_turn`) — semantic
+  endpointing (int8 ONNX) so a mid-thought pause doesn't cut the user off; loaded
+  once and shared across sessions.
+- **MiniMax TTS** (`TTS_SOURCE=minimax`) — T2A v2 WebSocket, streaming pcm@16k,
+  voice cloning (~0.27 s warm TTFB).
+- **Configurable WebSocket keepalive** — `S2S_WS_PING_INTERVAL` (default `20`,
+  `0` disables) / `S2S_WS_PING_TIMEOUT` (default `60`), so warm clients can refresh
+  infrequently and a long tool turn won't trip a false `1011`.
+- **Startup pre-warm** — Silero VAD (deepcopied per session, bleed-safe), the shared
+  Smart Turn model, and a once-per-process LLM warmup (`S2S_LLM_WARMUP_PER_SESSION=0`),
+  so a session build (and any reconnect) is sub-second after startup.
+- **`docs/INSTALL_AND_CONFIGURATION.md`** — complete install + configuration guide,
+  linked from the README.
+
+### Changed
+
+- Per-connection pipeline build runs **off the asyncio event loop**
+  (`asyncio.to_thread`) so one client's connect can't freeze other sessions.
+- `S2S_LLM_WARMUP_PER_SESSION` defaults to off — the LLM warmup round-trip runs once
+  per process instead of on every (re)connect.
+
+### Fixed
+
+- **Shared speaker-id client closed on per-session teardown** — the per-session STT
+  handler's `cleanup()` closed the *shared* `RemoteSpeakerClient`, so the first
+  disconnect killed identify process-wide (`Cannot send a request, as the client has
+  been closed`) until restart. Now it closes only its own transcription client; the
+  shared client is closed once at server shutdown.
+- **Unsendable `aec3_py::Aec3` dropped on the wrong thread at teardown** — the AEC
+  object is now released on the event-loop thread that created it, not the teardown
+  worker.
+- **Over-eager speaker-id failure warning** — a transient slow/timed-out identify
+  (fail-safe → `unknown`, then recovers) no longer logs an outage line; warns only
+  after several consecutive failures.
+- **Benign disconnect noise** — a client that hangs up during connect no longer logs
+  a scary `RuntimeError` traceback.
+- Repo-wide `ruff check .` is clean.
+
+### Notes on usage
+
+- **Warm connections:** hold one WebSocket open across turns to skip the connect
+  cost and to get multi-turn memory (a new connection = a fresh, empty chat by
+  design). Keep a client-side keepalive inside the ping window, or set
+  `S2S_WS_PING_INTERVAL=0` and own liveness yourself.
+- **Capacity:** `S2S_MAX_SESSIONS` caps warm connections; size it to expected
+  clients + headroom. Concurrent *active turns* are bounded by your external
+  STT/TTS/LLM endpoints — see `LATENCY.md` §7 and the `*_MAX_CONCURRENCY` caps.
+
+---
+
 ## [Unreleased] — 2026-06-12 (thinking-gap UX)
 
 s2s is a client-agnostic realtime backend; these changes are designed for any OpenAI-Realtime-compatible client (voice assistants, smart speakers, Matrix/Element Call bridges, …), not any single one.

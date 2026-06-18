@@ -1,4 +1,6 @@
+<p align="center">
 <img src="logo.png" alt="FreeSpeech Logo" width="400">
+</div>
 
 Already have a Speech-To-Text and a preferred voice in a Test-to-Speech server you're running? Want to use your local Agent harness such as Hermes or Openclaw as an LLM? Want to utilize the OpenAI Realtime SDK in your app without the crazy cost? Now you can. A /realtime emulator ran completely on premise with tools you already have.
 A fork of [huggingface/speech-to-speech](https://github.com/huggingface/speech-to-speech) extended to run as a **bring-your-own-inference** OpenAI Realtime-compatible voice agent server.  All speech and language processing is delegated to three external HTTP services — no ML models are loaded in the server process itself.

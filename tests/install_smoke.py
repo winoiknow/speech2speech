@@ -86,7 +86,6 @@ def main() -> None:
         "numpy",
         "openai",
         "scipy",
-        "soundfile",
         "torch",
         "torchaudio",
         "transformers",

@@ -1,13 +1,13 @@
-# winoiknow/speech2speech
 
-A fork of [huggingface/speech-to-speech](https://github.com/huggingface/speech-to-speech) extended to run as a **zero-local-inference** OpenAI Realtime-compatible voice agent server.  All speech and language processing is delegated to three external HTTP services — no ML models are loaded in the server process itself.
+Already have a Speech-To-Text and a preferred voice in a Test-to-Speech server you're running? Want to use your local Agent harness such as Hermes or Openclaw as an LLM? Want to utilize the OpenAI Realtime SDK in your app without the crazy cost? Now you can. A /realtime emulator ran completely on premise with tools you already have.
+A fork of [huggingface/speech-to-speech](https://github.com/huggingface/speech-to-speech) extended to run as a **bring-your-own-inference** OpenAI Realtime-compatible voice agent server.  All speech and language processing is delegated to three external HTTP services — no ML models are loaded in the server process itself.
 
 > 📖 **[Install & Configuration Guide →](docs/INSTALL_AND_CONFIGURATION.md)** — the
 > complete, step-by-step setup and configuration reference (every knob, multi-session,
 > speaker-id, AEC, Smart Turn, keepalive, troubleshooting). Start there for a real
 > deployment.
 
-> For a full description of the underlying pipeline architecture, modular handler system, VAD configuration, and the original model options, see the **[upstream README](https://github.com/huggingface/speech-to-speech/blob/main/README.md)** on the HuggingFace GitHub.
+> For a full description of the original underlying pipeline architecture, modular handler system, VAD configuration, and the original model options, see the **[upstream README](https://github.com/huggingface/speech-to-speech/blob/main/README.md)** on the HuggingFace GitHub.
 
 ---
 
